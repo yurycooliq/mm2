@@ -1,0 +1,1 @@
+{"name":"mm2-research-reference","private":true,"type":"module","scripts":{"test":"node --experimental-transform-types --test *.test.ts"},"engines":{"node":">=22.18.0"}}

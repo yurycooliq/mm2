@@ -1,0 +1,13 @@
+{
+  "name": "replacement coalesces while cancellation travels",
+  "latency": {"post_ms": 10, "cancel_ms": 20, "ack_ms": 0, "fill_ms": 0, "timeout_ms": 500},
+  "steps": [
+    {"at_ms": 0, "op": "book", "outcome": "up", "book": {"bid": 500000, "ask": 600000, "bid_levels": []}},
+    {"at_ms": 0, "op": "quote", "quotes": [{"slot": "up:lot", "outcome": "up", "price_micros": 500000, "quantity_micros": 5000000}]},
+    {"at_ms": 10, "op": "advance"},
+    {"at_ms": 11, "op": "quote", "quotes": [{"slot": "up:lot", "outcome": "up", "price_micros": 490000, "quantity_micros": 5000000}]},
+    {"at_ms": 12, "op": "quote", "quotes": [{"slot": "up:lot", "outcome": "up", "price_micros": 480000, "quantity_micros": 5000000}]},
+    {"at_ms": 41, "op": "advance"}
+  ],
+  "expected": {"up_inventory_micros": 0, "down_inventory_micros": 0, "spent_pico": "0", "reserved_pico": "2400000000000", "available_pico": "97600000000000", "accepted_posts": 2, "cancelled_orders": 1, "rejected_posts": 0}
+}

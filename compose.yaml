@@ -1,0 +1,67 @@
+name: mm2
+services:
+  engine:
+    image: mm2-engine:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports: ["127.0.0.1:8088:8088"]
+    environment:
+      MM2_ENGINE_API_TOKEN: ${MM2_ENGINE_API_TOKEN:?Run scripts/bootstrap.ps1}
+    volumes:
+      - type: bind
+        source: ${MM2_ENGINE_CONFIG:-./config/demo.toml}
+        target: /app/config.toml
+        read_only: true
+        bind: {create_host_path: false}
+      - engine-data:/data
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    pids_limit: 64
+    cpus: 1
+    mem_limit: 512m
+    stop_grace_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  console:
+    image: mm2-console:local
+    build:
+      context: .
+      dockerfile: Dockerfile.console
+    init: true
+    user: "10002:10002"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      engine: {condition: service_healthy}
+    ports: ["127.0.0.1:8080:8080"]
+    environment:
+      MM2_ENGINE_URL: http://engine:8088
+      MM2_ENGINE_API_TOKEN: ${MM2_ENGINE_API_TOKEN:?Run scripts/bootstrap.ps1}
+      MM2_CONSOLE_TOKEN: ${MM2_CONSOLE_TOKEN:?Run scripts/bootstrap.ps1}
+      MM2_TELEGRAM_BOT_TOKEN: ${MM2_TELEGRAM_BOT_TOKEN:-}
+      MM2_TELEGRAM_OWNER_ID: ${MM2_TELEGRAM_OWNER_ID:-}
+      MM2_MINIAPP_URL: ${MM2_MINIAPP_URL:-}
+      MM2_ALLOWED_ORIGINS: ${MM2_ALLOWED_ORIGINS:-http://127.0.0.1:8080,http://localhost:8080}
+      MM2_CONSOLE_STATE_DIR: /data
+      MM2_CONSOLE_STATIC_DIR: /app/dashboard
+    volumes: [console-data:/data]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    pids_limit: 48
+    cpus: 0.25
+    mem_limit: 128m
+    stop_grace_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+volumes:
+  engine-data:
+  console-data:

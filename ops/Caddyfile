@@ -1,0 +1,10 @@
+# Optional future HTTPS edge. Set MM2_DOMAIN and MM2_CONSOLE_UPSTREAM on the chosen host.
+{$MM2_DOMAIN} {
+    reverse_proxy {$MM2_CONSOLE_UPSTREAM:127.0.0.1:8080}
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        Cache-Control no-store
+    }
+    # Request logging intentionally disabled: initData/session material is private.
+}

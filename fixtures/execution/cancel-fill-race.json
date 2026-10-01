@@ -1,0 +1,14 @@
+{
+  "name": "fill arrives before cancel but notification arrives later",
+  "latency": {"post_ms": 10, "cancel_ms": 20, "ack_ms": 0, "fill_ms": 100, "timeout_ms": 500},
+  "steps": [
+    {"at_ms": 0, "op": "book", "outcome": "up", "book": {"bid": 500000, "ask": 600000, "bid_levels": []}},
+    {"at_ms": 0, "op": "quote", "quotes": [{"slot": "up:lot", "outcome": "up", "price_micros": 500000, "quantity_micros": 5000000}]},
+    {"at_ms": 10, "op": "advance"},
+    {"at_ms": 11, "op": "cancel_all"},
+    {"at_ms": 20, "op": "trade", "outcome": "up", "worst_price_micros": 500000, "quantity_micros": 2000000},
+    {"at_ms": 21, "op": "restart"},
+    {"at_ms": 150, "op": "advance"}
+  ],
+  "expected": {"up_inventory_micros": 2000000, "down_inventory_micros": 0, "spent_pico": "1000000000000", "reserved_pico": "0", "available_pico": "99000000000000", "accepted_posts": 1, "cancelled_orders": 1, "rejected_posts": 0}
+}

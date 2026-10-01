@@ -1,0 +1,13 @@
+{
+  "name": "finite collateral clips quote without acknowledgement churn",
+  "limits": {"initial_cash_micros": 3000000, "max_imbalance_micros": 20000000, "min_order_micros": 5000000, "tick_micros": 10000, "max_orders": 16},
+  "latency": {"post_ms": 10, "cancel_ms": 20, "ack_ms": 0, "fill_ms": 0, "timeout_ms": 500},
+  "steps": [
+    {"at_ms": 0, "op": "book", "outcome": "up", "book": {"bid": 500000, "ask": 600000, "bid_levels": []}},
+    {"at_ms": 0, "op": "quote", "quotes": [{"slot": "up:lot", "outcome": "up", "price_micros": 500000, "quantity_micros": 20000000}]},
+    {"at_ms": 10, "op": "advance"},
+    {"at_ms": 11, "op": "quote", "quotes": [{"slot": "up:lot", "outcome": "up", "price_micros": 500000, "quantity_micros": 20000000}]},
+    {"at_ms": 100, "op": "advance"}
+  ],
+  "expected": {"up_inventory_micros": 0, "down_inventory_micros": 0, "spent_pico": "0", "reserved_pico": "3000000000000", "available_pico": "0", "accepted_posts": 1, "cancelled_orders": 0, "rejected_posts": 0}
+}

@@ -1,0 +1,17 @@
+{
+  "hour": "2026-09-28/20",
+  "file": "2026-09-28T20.parquet",
+  "bytes": 24,
+  "row_count": 1,
+  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "merger_git_sha": "fixture-only",
+  "products": {
+    "last_trade_price": {
+      "byte_range": [4, 12],
+      "row_groups": [0, 0],
+      "row_count": 1,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "columns": ["market", "timestamp", "timestamp_received", "sequence", "source_witness", "price", "size"]
+    }
+  }
+}

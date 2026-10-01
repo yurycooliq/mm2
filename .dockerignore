@@ -1,0 +1,17 @@
+.git
+.env
+.env.*
+target
+data
+output
+**/node_modules
+**/dist
+**/.test-build
+**/*.tsbuildinfo
+**/__pycache__
+**/*.pyc
+**/*.sqlite*
+**/*.log
+**/*.pem
+**/*.key
+docs/design

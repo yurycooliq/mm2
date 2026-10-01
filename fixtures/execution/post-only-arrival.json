@@ -1,0 +1,11 @@
+{
+  "name": "post-only crossing is checked when post arrives",
+  "latency": {"post_ms": 10, "cancel_ms": 20, "ack_ms": 0, "fill_ms": 0, "timeout_ms": 500},
+  "steps": [
+    {"at_ms": 0, "op": "book", "outcome": "up", "book": {"bid": 500000, "ask": 600000, "bid_levels": []}},
+    {"at_ms": 0, "op": "quote", "quotes": [{"slot": "up:lot", "outcome": "up", "price_micros": 500000, "quantity_micros": 5000000}]},
+    {"at_ms": 5, "op": "book", "outcome": "up", "book": {"bid": 480000, "ask": 490000, "bid_levels": []}},
+    {"at_ms": 20, "op": "advance"}
+  ],
+  "expected": {"up_inventory_micros": 0, "down_inventory_micros": 0, "spent_pico": "0", "reserved_pico": "0", "available_pico": "100000000000000", "accepted_posts": 0, "cancelled_orders": 0, "rejected_posts": 1}
+}

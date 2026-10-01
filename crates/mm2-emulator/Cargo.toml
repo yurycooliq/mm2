@@ -1,0 +1,9 @@
+[package]
+name = "mm2-emulator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mm2-core = { path = "../mm2-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

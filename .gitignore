@@ -1,0 +1,17 @@
+/target/
+/.env
+/.env.*
+!/.env.example
+/data/
+/output/
+**/node_modules/
+**/dist/
+*.tsbuildinfo
+**/.test-build/
+**/__pycache__/
+*.pyc
+*.sqlite*
+*.log
+*.pem
+*.key
+*.har

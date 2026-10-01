@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS frontend
+WORKDIR /build
+COPY apps/dashboard/package.json apps/dashboard/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY apps/dashboard ./
+RUN npm test && npm run build
+
+FROM python:3.13-slim-bookworm@sha256:2325bb286ec344af3e5898cc224b5844e2707ac6e26b1632516fd3edc84a5e26
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/console
+WORKDIR /app
+COPY apps/console ./console
+COPY --from=frontend /build/dist ./dashboard
+RUN python -m unittest discover -s console/tests -p 'test_*.py' \
+    && mkdir /data && chown 10002:10002 /data
+USER 10002:10002
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=2).read()"]
+CMD ["python","-m","mm2_console"]
