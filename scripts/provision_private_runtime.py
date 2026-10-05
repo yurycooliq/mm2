@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Owner-entered credentials over verified SSH stdin; no secret files on the client."""
 import argparse
+import base64
 import getpass
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -12,7 +14,9 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import uuid
 import warnings
+from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
@@ -24,6 +28,10 @@ MAX_REPLY = 16384
 CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 TOKEN = re.compile(r"([1-9][0-9]{4,19}):[A-Za-z0-9_-]{30,128}")
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
+FIELDS = {"telegram": {"token", "owner_id"}, "wallet": {"private_key"},
+          "clob": {"api_key", "api_secret", "api_passphrase"},
+          "relayer": {"api_key", "key_address"}, "rpc": {"url"}}
+INACTIVE = "none; funded configuration remains a separate gate"
 
 
 class ProvisionError(Exception):
@@ -34,7 +42,7 @@ class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         # A mistakenly pasted credential in argv must not be echoed by argparse.
         self.print_usage(sys.stderr)
-        self.exit(2, "Invalid arguments. Choose telegram or wallet; credentials belong only in the hidden prompt.\n")
+        self.exit(2, "Invalid arguments. Choose telegram, wallet, clob, relayer or rpc; credentials belong only in the hidden prompt.\n")
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -42,12 +50,48 @@ class NoRedirect(HTTPRedirectHandler):
         raise ProvisionError("Telegram redirects are refused.")
 
 
+def literal_credential(value, maximum):
+    """Accept bounded ASCII runtime literals, never shell/Compose interpolation."""
+    return (isinstance(value, str) and 1 <= len(value) <= maximum
+            and all(33 <= ord(char) <= 126 and char not in "$'\"\\`" for char in value))
+
+
+def rpc_url(value):
+    """Validate a secret-bearing endpoint locally; do not fetch or print it."""
+    if not literal_credential(value, 2048):
+        raise ProvisionError("Enter one bounded HTTPS Polygon RPC URL without whitespace or interpolation.")
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        if (not value.startswith("https://") or parsed.scheme != "https" or not host or parsed.username is not None or parsed.password is not None
+                or "#" in value or parsed.netloc.endswith(":") or (parsed.port is not None and not 1 <= parsed.port <= 65535)
+                or re.search(r"%(?![0-9a-fA-F]{2})|%(?:0[0-9a-fA-F]|1[0-9a-fA-F]|20|7[fF])", value)):
+            raise ValueError("invalid endpoint")
+        if ":" in host or re.fullmatch(r"[0-9.]+", host):
+            ipaddress.ip_address(host)
+        elif not re.fullmatch(r"(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", host):
+            raise ValueError("invalid hostname")
+    except (ValueError, TypeError):
+        raise ProvisionError("Polygon RPC must be a valid HTTPS endpoint without userinfo, fragment or encoded whitespace.") from None
+    return value
+
+
+def canonical_clob_secret(secret):
+    """Retain the HMAC key bytes and supply canonical padding required by the pinned SDK."""
+    if not isinstance(secret, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,512}={0,2}", secret):
+        raise ValueError("invalid base64")
+    decoded = base64.b64decode(secret + "=" * (-len(secret) % 4), altchars=b"-_", validate=True)
+    canonical = base64.urlsafe_b64encode(decoded).decode("ascii")
+    if not 16 <= len(decoded) <= 256 or canonical.rstrip("=") != secret.rstrip("="):
+        raise ValueError("invalid base64 size or encoding")
+    return canonical
+
+
 def validate_payload(payload):
     if not isinstance(payload, dict) or type(payload.get("schema")) is not int or payload.get("schema") != 1:
         raise ProvisionError("Unsupported credential request.")
     kind = payload.get("kind")
-    keys = {"schema", "kind", "token", "owner_id"} if kind == "telegram" else {"schema", "kind", "private_key"}
-    if kind not in {"telegram", "wallet"} or set(payload) != keys:
+    if not isinstance(kind, str) or kind not in FIELDS or set(payload) != {"schema", "kind"} | FIELDS[kind]:
         raise ProvisionError("Unexpected credential fields.")
     if kind == "telegram":
         token, owner = payload["token"], payload["owner_id"]
@@ -55,28 +99,47 @@ def validate_payload(payload):
             raise ProvisionError("Invalid Telegram bot-token format.")
         if type(owner) is not int or not 0 < owner < 2**52:
             raise ProvisionError("Enter the complete numeric Telegram user ID.")
-    else:
+    elif kind == "wallet":
         key = payload["private_key"]
         if not isinstance(key, str) or not re.fullmatch(r"(?:0x)?[0-9a-fA-F]{64}", key):
             raise ProvisionError("Enter one 32-byte hex signing key; seed phrases are refused.")
         scalar = int(key.removeprefix("0x"), 16)
         if not 0 < scalar < CURVE_ORDER:
             raise ProvisionError("Signing key is outside the secp256k1 range.")
+    elif kind == "clob":
+        key, secret, passphrase = payload["api_key"], payload["api_secret"], payload["api_passphrase"]
+        try:
+            if not isinstance(key, str) or len(key) != 36 or str(uuid.UUID(key)) != key.lower() or uuid.UUID(key).int == 0:
+                raise ValueError("invalid UUID")
+            canonical_clob_secret(secret)
+            if not literal_credential(passphrase, 256):
+                raise ValueError("invalid passphrase")
+        except (ValueError, TypeError):
+            raise ProvisionError("Enter an existing CLOB UUID API key, URL-safe base64 secret and bounded literal passphrase.") from None
+    elif kind == "relayer":
+        if not literal_credential(payload["api_key"], 1024):
+            raise ProvisionError("Relayer API key must be a bounded literal header value.")
+        owner = payload["key_address"]
+        if not isinstance(owner, str) or not ADDRESS.fullmatch(owner) or int(owner[2:], 16) == 0:
+            raise ProvisionError("Enter the complete nonzero Relayer key-owner address.")
+    elif kind == "rpc":
+        rpc_url(payload["url"])
     return payload
+
+
+def unique_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProvisionError("Duplicate credential fields are refused.")
+        result[key] = value
+    return result
 
 
 def decode_payload(raw):
     """Reject ambiguous JSON and non-ASCII/oversized stdin before any effect."""
     if not isinstance(raw, bytes) or len(raw) > MAX_INPUT:
         raise ProvisionError("Credential request exceeds the supported bound.")
-
-    def unique_fields(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ProvisionError("Duplicate credential fields are refused.")
-            result[key] = value
-        return result
 
     try:
         return validate_payload(json.loads(raw.decode("ascii"), object_pairs_hook=unique_fields))
@@ -215,13 +278,29 @@ def apply_update(payload, config=Path("/etc/mm2"), profile=Path("/opt/mm2/curren
             values["MM2_TELEGRAM_OWNER_ID"] = str(payload["owner_id"])
             result = {"kind": "telegram", "username": identity["username"], "bot_id": identity["bot_id"],
                       "owner_id": payload["owner_id"], "restart_required": "console"}
-        else:
+        elif payload["kind"] == "wallet":
             address = derive_address(payload["private_key"])
             if address.lower() != expected_signer(profile):
                 raise ProvisionError("Signing key does not match the reviewed controlling EOA; nothing was changed.")
             values["MM2_POLY_PRIVATE_KEY"] = "0x" + payload["private_key"].removeprefix("0x").lower()
             result = {"kind": "wallet", "signer_address": address, "activation": "unchanged",
-                      "restart_required": "none; funded configuration remains a separate gate"}
+                      "restart_required": INACTIVE}
+        elif payload["kind"] == "clob":
+            values["MM2_POLY_API_KEY"] = payload["api_key"]
+            values["MM2_POLY_API_SECRET"] = canonical_clob_secret(payload["api_secret"])
+            values["MM2_POLY_API_PASSPHRASE"] = payload["api_passphrase"]
+            result = {"kind": "clob", "activation": "unchanged", "restart_required": INACTIVE}
+        elif payload["kind"] == "relayer":
+            owner = payload["key_address"].lower()
+            if owner != expected_signer(profile):
+                raise ProvisionError("Relayer key owner does not match the reviewed controlling EOA; nothing was changed.")
+            values["MM2_POLY_RELAYER_API_KEY"] = payload["api_key"]
+            values["MM2_POLY_RELAYER_API_KEY_ADDRESS"] = owner
+            result = {"kind": "relayer", "signer_address": owner, "activation": "unchanged",
+                      "restart_required": INACTIVE}
+        else:
+            values["MM2_POLYGON_RPC_URL"] = payload["url"]
+            result = {"kind": "rpc", "activation": "unchanged", "restart_required": INACTIVE}
         text = "".join(key + "=" + value + "\n" for key, value in values.items())
         if len(text.encode("ascii")) > 16384:
             raise ProvisionError("Runtime credentials exceed the supported bound.")
@@ -307,8 +386,19 @@ def local_main(args, run=subprocess.run):
             raise ProvisionError("Enter the complete numeric Telegram user ID.")
         payload = {"schema": 1, "kind": "telegram", "owner_id": int(raw_owner),
                    "token": hidden_input("@mm2b_bot token (hidden): ")}
-    else:
+    elif args.kind == "wallet":
         payload = {"schema": 1, "kind": "wallet", "private_key": hidden_input("Controlling EOA signing key, hex (hidden): ")}
+    elif args.kind == "clob":
+        payload = {"schema": 1, "kind": "clob", "api_key": hidden_input("Existing CLOB API key, UUID (hidden): "),
+                   "api_secret": hidden_input("Existing CLOB API secret, URL-safe base64 (hidden): "),
+                   "api_passphrase": hidden_input("Existing CLOB API passphrase (hidden): ")}
+    elif args.kind == "relayer":
+        payload = {"schema": 1, "kind": "relayer", "api_key": hidden_input("Owner Relayer API key (hidden): "),
+                   "key_address": hidden_input("Relayer key Signer Address (hidden): ")}
+    elif args.kind == "rpc":
+        payload = {"schema": 1, "kind": "rpc", "url": hidden_input("Polygon HTTPS RPC URL, including provider API key (hidden): ")}
+    else:
+        raise ProvisionError("Unsupported credential operation.")
     validate_payload(payload)
     # Unrelated mm2 credentials from an operator's shell never become child env.
     environment = {key: value for key, value in os.environ.items() if not key.startswith("MM2_")}
@@ -322,27 +412,38 @@ def local_main(args, run=subprocess.run):
         if reply.returncode != 0 or len(reply.stdout) > MAX_REPLY:
             raise ValueError("ssh failed")
         # SSM may print public session preamble before the last JSON result.
-        result = json.loads(reply.stdout.decode("ascii").strip().splitlines()[-1])
-        allowed = {"ok", "kind", "username", "bot_id", "owner_id", "signer_address", "activation", "restart_required"}
-        if not isinstance(result, dict) or result.get("ok") is not True or set(result) - allowed or result.get("kind") != args.kind:
+        result = json.loads(reply.stdout.decode("ascii").strip().splitlines()[-1], object_pairs_hook=unique_fields)
+        expected = {"ok", "kind", "activation", "restart_required"}
+        if args.kind == "telegram":
+            expected = {"ok", "kind", "username", "bot_id", "owner_id", "restart_required"}
+        elif args.kind in {"wallet", "relayer"}:
+            expected.add("signer_address")
+        if not isinstance(result, dict) or result.get("ok") is not True or set(result) != expected or result.get("kind") != args.kind:
             raise ValueError("invalid result")
         if args.kind == "telegram":
             if result.get("username") != EXPECTED_BOT or result.get("bot_id") != int(payload["token"].split(":", 1)[0]) or result.get("owner_id") != payload["owner_id"]:
                 raise ValueError("wrong public identity")
-        elif not isinstance(result.get("signer_address"), str) or not ADDRESS.fullmatch(result["signer_address"]):
-            raise ValueError("invalid public address")
+        elif args.kind in {"wallet", "relayer"}:
+            if not isinstance(result.get("signer_address"), str) or not ADDRESS.fullmatch(result["signer_address"]):
+                raise ValueError("invalid public address")
+            if args.kind == "relayer" and result["signer_address"].lower() != payload["key_address"].lower():
+                raise ValueError("wrong Relayer owner")
+        if args.kind != "telegram" and (result.get("activation") != "unchanged" or result.get("restart_required") != INACTIVE):
+            raise ValueError("unexpected activation")
     except Exception:
         raise ProvisionError("Verified SSH provisioning failed. Check AWS session, pinned host key and installed helper; no secret was printed.") from None
     print("Credentials stored in root-owned /etc/mm2/runtime.env. Existing console/engine tokens were preserved.")
     if args.kind == "telegram":
         print("Verified bot: @mm2b_bot; owner: " + str(payload["owner_id"]) + ". Recreate only the console to apply it.")
-    else:
+    elif args.kind in {"wallet", "relayer"}:
         print("Verified controlling EOA: " + result["signer_address"] + ". Trading remains paused and gated.")
+    else:
+        print("Credential format checked; authenticated venue/RPC acceptance remains unverified. Trading remains paused and gated.")
 
 
 def main(argv=None):
     parser = SafeArgumentParser(description=__doc__)
-    parser.add_argument("kind", nargs="?", choices=("telegram", "wallet"))
+    parser.add_argument("kind", nargs="?", choices=tuple(FIELDS))
     parser.add_argument("--ssh-config", type=Path, default=ROOT / "output/deployment-access/ssh-config")
     parser.add_argument("--host", default="mm2-aws")
     parser.add_argument("--ssh-executable", default="ssh")
@@ -355,7 +456,7 @@ def main(argv=None):
             remote_main()
         else:
             if args.kind is None:
-                parser.error("choose telegram or wallet")
+                parser.error("choose a credential operation")
             local_main(args)
         return 0
     except (ProvisionError, OSError):

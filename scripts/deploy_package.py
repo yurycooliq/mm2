@@ -17,6 +17,7 @@ PUBLIC_FILES = (
     "scripts/ledger_ops.py", "scripts/soak.py", "scripts/bootstrap.sh", "scripts/provision_private_runtime.py",
     "config/demo.toml", "config/simulation.toml", "config/public.toml",
     "config/trading.toml", "config/both.toml", "docs/AWS_DEPLOY.md", "docs/TELEGRAM_SETUP.md",
+    "docs/POLYMARKET_ACCESS.md",
 )
 MAX_IMAGE_ARCHIVE = 8 * 1024**3
 

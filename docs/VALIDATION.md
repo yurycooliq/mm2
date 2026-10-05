@@ -1,6 +1,46 @@
 # Validation evidence
 
-## Current checkpoint: October 5, 2026 — Telegram owner Mini App
+## Current checkpoint: October 5, 2026 — public feed access and private venue setup
+
+The public source previously stopped before Gamma discovery whenever the
+order-placement geoblock endpoint was negative or unavailable. Public read-only
+discovery now proceeds independently. Current-market identity/rules, HTTPS,
+response bounds, book freshness, connection recovery and every funded SDK gate
+remain enforced. Fresh public books cannot grant permission to submit orders.
+
+The actual eu-west-1 host returned `blocked=true`, country `IE`, while Gamma,
+CLOB V2 REST and the market WebSocket supplied current market data. Both outcome
+WebSocket snapshots were observed at 20 ms exchange age in a stateless probe.
+These are public connectivity observations, not matching latency or trading
+eligibility. The official documents and endpoint disagree; see
+[POLYMARKET_ACCESS.md](POLYMARKET_ACCESS.md) for exact evidence and an unsent
+support/co-location draft.
+
+The owner privately provisioned the wallet key. Server-side public-key derivation
+confirmed the reviewed controlling EOA `0xa2300f310b59df6d0dec94576776ce5435bd0b3f`;
+no key value was returned, no authentication signature or transaction was sent,
+and the selected profile remained simulation. CLOB/Relayer/RPC credentials remain
+absent at this checkpoint. The helper now accepts those existing settings through
+hidden prompts and pinned SSH/SSM stdin without activation or network validation.
+CLOB secret padding is normalized without changing its decoded HMAC bytes.
+
+| Check | Confirmed scope |
+| --- | --- |
+| Rust | **218 workspace tests passed** on pinned Rust 1.98.1; includes two new regressions for read-only discovery and independent funded refusal. Locked optimized workspace build, format and Clippy workspace/all-targets `-D warnings` passed. |
+| Console | **77 tests passed** in the production Linux container and again during image construction. |
+| Operations/private setup | **89 Linux tests passed, no skips**, including 28 helper tests for hidden inputs, identity, atomic preservation, strict reply schemas, new credential modes and 31/32-byte CLOB padding. |
+| Data/latency | **55 tests passed**, with pyarrow 25.0.0 and websockets 15.0.1. |
+| Strategy parity | **6 TypeScript vectors passed**; the corresponding Rust parity test passed in the workspace run. |
+| Production containers | **13 checks passed**, including offline funded refusal, isolated console outage, durable command/crash recovery, ownership fence and read-only non-root images; zero live orders. Observed total 23,750 ms and graceful engine stop 828 ms are local observations, not an SLA. |
+
+An additional Windows console run under local load had one socket timeout and
+one time-sensitive fixture become stale (75 passed, one error, one failure).
+The unchanged console source then passed all 77 tests in its production Linux
+container and its image build. No production freshness threshold was relaxed.
+Deployment and public-feed acceptance of this new release are checked after
+image construction; the existing simulation remains paused until then.
+
+## Previous checkpoint: October 5, 2026 — Telegram owner Mini App
 
 The current changes implement automatic signed Telegram owner access, neutral 404
 denial, hidden credential provisioning, private-chat reports and bounded fill

@@ -40,22 +40,20 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|_| "metadata schema is not JSON".into())
 }
 
-pub async fn geoblock(client: &reqwest::Client) -> Result<(), String> {
-    let value = get(client, "https://polymarket.com/api/geoblock").await?;
-    if value.get("blocked").and_then(Value::as_bool) != Some(false) {
-        return Err("public-source IP is blocked or eligibility is unknown".into());
-    }
-    Ok(())
+/// Read-only market metadata is independent of order-placement eligibility.
+/// The funded venue performs its own fail-closed host/account checks.
+pub async fn current_btc(client: &reqwest::Client, now_wall_ms: u64) -> Result<Market, String> {
+    current_btc_from(client, now_wall_ms, "https://gamma-api.polymarket.com").await
 }
 
-pub async fn current_btc(client: &reqwest::Client, now_wall_ms: u64) -> Result<Market, String> {
+async fn current_btc_from(
+    client: &reqwest::Client,
+    now_wall_ms: u64,
+    gamma_origin: &str,
+) -> Result<Market, String> {
     let start = now_wall_ms / 300_000 * 300_000;
     let slug = format!("btc-updown-5m-{}", start / 1000);
-    let raw = get(
-        client,
-        &format!("https://gamma-api.polymarket.com/markets/slug/{slug}"),
-    )
-    .await?;
+    let raw = get(client, &format!("{gamma_origin}/markets/slug/{slug}")).await?;
     parse_market(&raw, start)
 }
 
@@ -162,12 +160,75 @@ pub fn parse_market(raw: &Value, window_start_ms: u64) -> Result<Market, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn discovery_pins_rules_tokens_outcome_order_and_window() {
-        let mut raw = serde_json::json!({"slug":"btc-updown-5m-1790712600", "active":true,"closed":false,"acceptingOrders":true,
+    use axum::{Json, Router, http::StatusCode, routing::get};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn supported_market() -> Value {
+        serde_json::json!({"slug":"btc-updown-5m-1790712600", "active":true,"closed":false,"acceptingOrders":true,
             "eventStartTime":"2026-09-29T20:10:00Z","endDate":"2026-09-29T20:15:00Z","conditionId":format!("0x{}", "a".repeat(64)),
             "clobTokenIds":"[\"1\",\"2\"]","outcomes":"[\"Up\",\"Down\"]","orderPriceMinTickSize":0.01,
-            "cryptoMarketConfig":{"asset":"btc","duration":"5m","twapEnabled":true,"twapLookbackSeconds":60}});
+            "cryptoMarketConfig":{"asset":"btc","duration":"5m","twapEnabled":true,"twapLookbackSeconds":60}})
+    }
+
+    #[tokio::test]
+    async fn blocked_or_unavailable_order_eligibility_does_not_gate_read_only_discovery() {
+        for geo_status in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+            let geo_calls = Arc::new(AtomicUsize::new(0));
+            let market_calls = Arc::new(AtomicUsize::new(0));
+            let geo_count = geo_calls.clone();
+            let market_count = market_calls.clone();
+            let routes = Router::new()
+                .route(
+                    "/api/geoblock",
+                    get(move || {
+                        geo_count.fetch_add(1, Ordering::Relaxed);
+                        async move {
+                            (
+                                geo_status,
+                                Json(serde_json::json!({"blocked":true,"country":"IE"})),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/markets/slug/btc-updown-5m-1790712600",
+                    get(move || {
+                        market_count.fetch_add(1, Ordering::Relaxed);
+                        async { Json(supported_market()) }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+            // Only this loopback fixture allows HTTP; the production client remains HTTPS-only.
+            let fixture_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let geo_response = fixture_client
+                .get(format!("{origin}/api/geoblock"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(geo_response.status().as_u16(), geo_status.as_u16());
+            assert_eq!(geo_calls.load(Ordering::Relaxed), 1);
+            let market = current_btc_from(&fixture_client, 1_790_712_601_234, &origin)
+                .await
+                .unwrap();
+            assert_eq!(market.slug, "btc-updown-5m-1790712600");
+            assert_eq!(market_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(geo_calls.load(Ordering::Relaxed), 1);
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[test]
+    fn discovery_pins_rules_tokens_outcome_order_and_window() {
+        let mut raw = supported_market();
         assert!(parse_market(&raw, 1790712600000).is_ok());
         raw["outcomes"] = serde_json::json!(["Down", "Up"]);
         assert!(parse_market(&raw, 1790712600000).is_err());

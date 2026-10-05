@@ -1,6 +1,6 @@
 # AWS single-host deployment package
 
-The initial ordinary deployment candidate is **Ireland, `eu-west-1`**. Polymarket's API geoblock reference currently lists Ireland as API-unrestricted (the frontend is close-only) and the closest eligible API region; London `eu-west-2` hosts the matching engine. Direct London co-location is a separate eligibility/KYC acceptance arrangement. Recheck the actual instance's IP/API eligibility, owner/account and supported protocol before any funded resume; a region name is not approval. [Polymarket API geoblock reference](https://docs.polymarket.com/api-reference/geoblock)
+The deployed host is in **Ireland, `eu-west-1`**. Its public Polymarket requests succeed, but on **2026-10-05** the published geoblock endpoint reports static IP `34.251.210.30` as `blocked=true`, `country=IE`. The official API reference and Help Center give inconsistent Ireland restrictions; funded eligibility remains unresolved. London `eu-west-2` is a separate approved co-location/KYC arrangement. See [Polymarket access evidence and prepared support questions](POLYMARKET_ACCESS.md) before changing eligibility handling or funded deployment. A region name or successful public request is not trading approval.
 
 This package prepares one host for `simulation`, `trading` or `both`, with optional `shadow` and offline `demo`. Every process starts paused. The package never sends Resume, creates an AWS resource, contacts a funded account or supplies trading credentials by itself.
 
