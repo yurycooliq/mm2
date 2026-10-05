@@ -68,7 +68,7 @@ Persistent directories are `/srv/mm2/engine` (UID 10001), `/srv/mm2/console` (UI
 Create `/etc/mm2/runtime.env` privately as Linux root with mode **0600**. The bootstrap creates independent random tokens without printing them and preserves an existing file:
 
 ```sh
-sudo python3 scripts/deploy_host.py bootstrap --domain your.exact.public.domain
+sudo python3 -B scripts/deploy_host.py bootstrap --domain your.exact.public.domain
 sudoedit /etc/mm2/runtime.env
 ```
 
@@ -93,11 +93,15 @@ The private signing key, CLOB L2 key/secret/passphrase and `MM2_POLYGON_RPC_URL`
 
 The RPC endpoint is private runtime material: an HTTPS URL can contain a provider credential in its query/path and must not be logged or placed in a public profile. Never paste keys into chat, CloudFormation, reports or recorded shell commands, and never copy these placeholders as actual tokens. Secret values remain only in the ignored/private runtime file and container runtime. Avoid `docker inspect`, full `docker compose config` and host environment dumps: root/Docker access can inspect process environment. Use `config --quiet` for validation. Telegram needs both token and actual owner ID; empty values keep it disabled. Exact HTTPS origin and Mini App URL are derived from `MM2_DOMAIN`.
 
+The AWS console requires Telegram authentication even while bot credentials are empty: token login and unauthenticated API access return 404. Provision the exact `@mm2b_bot` identity and complete owner ID using the hidden-input helper in [TELEGRAM_SETUP.md](TELEGRAM_SETUP.md). Keep Python bytecode disabled (`-B`) when importing or validating immutable release scripts; the systemd unit also sets `PYTHONDONTWRITEBYTECODE=1`.
+
+Caddy overwrites `X-MM2-Client-IP` with its remote socket IP. AWS alone enables the console's explicit trusted-header flag for rate-limit buckets on the unpublished private backend. This avoids placing all internet clients in the proxy's shared login bucket. Arbitrary `X-Forwarded-For` is ignored; this header never authorizes a user. The boundary assumes DNS only/direct Caddy and the existing isolated service networks; review it before adding a CDN or public backend port.
+
 Import verified images, then select a profile while the previous service is stopped:
 
 ```sh
-sudo python3 scripts/deploy_host.py import --source /PRIVATE_UPLOAD_PATH/RELEASE
-sudo python3 /opt/mm2/releases/COMMIT/scripts/deploy_host.py activate \
+sudo python3 -B scripts/deploy_host.py import --source /PRIVATE_UPLOAD_PATH/RELEASE
+sudo python3 -B /opt/mm2/releases/COMMIT/scripts/deploy_host.py activate \
   --release /opt/mm2/releases/COMMIT --mode simulation
 ```
 

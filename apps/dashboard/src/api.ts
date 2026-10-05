@@ -30,17 +30,28 @@ export const api = {
 };
 
 declare global { interface Window { Telegram?: { WebApp?: { initData: string; ready?: () => void; expand?: () => void } } } }
+let telegramScript: Promise<void> | null = null;
 export async function telegramInitData(): Promise<string | null> {
-  if (!new URLSearchParams(location.hash.slice(1)).has('tgWebAppData')) return null;
+  const launch = new URLSearchParams(location.hash.slice(1)).has('tgWebAppData');
+  if (!launch && !window.Telegram?.WebApp?.initData) return null;
   if (!window.Telegram?.WebApp) {
-    await new Promise<void>((resolve, reject) => {
+    telegramScript ??= new Promise<void>((resolve, reject) => {
       const script = document.createElement('script');
       script.src = 'https://telegram.org/js/telegram-web-app.js?63';
-      script.onload = () => resolve(); script.onerror = () => reject(new Error('Telegram integration unavailable'));
+      const finish = (failed: boolean) => {
+        window.clearTimeout(timer);
+        script.onload = null; script.onerror = null;
+        if (failed) { script.remove(); telegramScript = null; reject(new Error('Telegram integration unavailable')); }
+        else resolve();
+      };
+      const timer = window.setTimeout(() => finish(true), 4000);
+      script.onload = () => finish(false); script.onerror = () => finish(true);
       document.head.append(script);
     });
+    await telegramScript;
   }
   const app = window.Telegram?.WebApp;
+  if (!app?.initData) throw new Error('Telegram launch data unavailable');
   app?.ready?.(); app?.expand?.();
-  return app?.initData || null;
+  return app.initData;
 }

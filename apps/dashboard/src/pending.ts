@@ -36,5 +36,5 @@ export function matchingReceipt(reply: CommandReply, command: Command): boolean 
 }
 export function definitiveRejection(status: number, kind: string): boolean {
   // Authentication, Origin and rate rejection do not settle an earlier dispatch.
-  return status >= 400 && status < 500 && ![401, 403, 408, 429].includes(status) && kind !== 'outcome_unknown';
+  return status >= 400 && status < 500 && ![401, 403, 404, 408, 429].includes(status) && kind !== 'outcome_unknown';
 }

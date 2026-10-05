@@ -49,6 +49,9 @@ services:
       MM2_ENGINE_URL: http://engine:8088
       MM2_ENGINE_API_TOKEN: ${MM2_ENGINE_API_TOKEN:?Private runtime token required}
       MM2_CONSOLE_TOKEN: ${MM2_CONSOLE_TOKEN:?Private runtime token required}
+      MM2_TELEGRAM_ONLY: "true"
+      # Only Caddy and this owner's private services reach this unpublished port.
+      MM2_TRUSTED_PROXY_HEADER: "true"
       MM2_TELEGRAM_BOT_TOKEN: ${MM2_TELEGRAM_BOT_TOKEN:-}
       MM2_TELEGRAM_OWNER_ID: ${MM2_TELEGRAM_OWNER_ID:-}
       MM2_MINIAPP_URL: https://${MM2_DOMAIN:?Exact HTTPS domain required}/

@@ -295,6 +295,7 @@ class DeployTests(unittest.TestCase):
         compose = (deploy_package.ROOT / "infra/aws/compose.yaml").read_text()
         self.assertIn("Type=simple", unit)
         self.assertIn("Restart=on-failure", unit)
+        self.assertIn("Environment=PYTHONDONTWRITEBYTECODE=1", unit)
         self.assertIn("ExecStart=/usr/bin/python3 scripts/deploy_supervisor.py run", unit)
         self.assertIn("ExecStopPost=/usr/bin/python3 scripts/deploy_supervisor.py stop", unit)
         self.assertIn("WantedBy=multi-user.target docker.service", unit)

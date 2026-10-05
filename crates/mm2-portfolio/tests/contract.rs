@@ -294,10 +294,42 @@ fn no_inventory_windows_do_not_consume_unresolved_capacity() {
     let summary = p.compact_snapshot(3);
     assert_eq!(summary.position_count, 288);
     assert_eq!(summary.positions_truncated, 285);
+    assert_eq!(summary.held_market_count, Some(0));
     assert_eq!(summary.positions.len(), 3);
     assert_eq!(summary.positions[0].market.id, "empty-287");
     assert_eq!(summary.cash_pico, p.snapshot().cash_pico);
     assert!(p.compact_snapshot(0).positions.is_empty());
+    assert_eq!(p.compact_snapshot(0).held_market_count, Some(0));
+}
+
+#[test]
+fn compact_telemetry_counts_all_held_markets_including_omitted_inventory() {
+    let mut p = portfolio();
+    p.apply_fill(fill("held-up", Outcome::Up, 490_000, SCALE, 0), 1)
+        .unwrap();
+    p.apply_fill(fill("held-down", Outcome::Down, 510_000, SCALE, 0), 2)
+        .unwrap();
+    for window in 1..70_u64 {
+        p.register_market(Market {
+            id: format!("empty-{window}"),
+            start_ms: window * 300_000,
+            end_ms: (window + 1) * 300_000,
+        })
+        .unwrap();
+    }
+    let compact = p.compact_snapshot(64);
+    assert_eq!(compact.position_count, 70);
+    assert_eq!(compact.positions_truncated, 6);
+    assert_eq!(compact.held_market_count, Some(1)); // One market, two outcomes.
+    assert!(compact.positions.iter().all(|position| {
+        position.up.quantity_micros == 0 && position.down.quantity_micros == 0
+    }));
+    assert_eq!(p.snapshot().held_market_count, Some(1));
+
+    let mut legacy = serde_json::to_value(&compact).unwrap();
+    legacy.as_object_mut().unwrap().remove("held_market_count");
+    let decoded: mm2_portfolio::Snapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.held_market_count, None);
 }
 
 #[test]

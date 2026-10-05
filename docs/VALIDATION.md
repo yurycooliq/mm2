@@ -1,6 +1,38 @@
 # Validation evidence
 
-## Current checkpoint: October 5, 2026 — closeout and AWS package
+## Current checkpoint: October 5, 2026 — Telegram owner Mini App
+
+The current changes implement automatic signed Telegram owner access, neutral 404
+denial, hidden credential provisioning, private-chat reports and bounded fill
+notifications. Production requires Telegram even before credentials exist; a
+rejected Telegram account switch revokes the prior cookie. Masked auth 404 never
+discards an unresolved browser command identity. Funded gates remain unchanged.
+
+| Check | Confirmed scope |
+| --- | --- |
+| Console | **77 tests passed**, including real HTTP owner/non-owner/expired/replay/cookie/Origin boundaries, proxy trust, reports, minute-history retention/restart/gaps and notification cursor/cooldown behavior. |
+| Operations/private setup | **78 tests passed on isolated Linux/Python 3.13, no skips**, including 17 hidden-input/secret transport, identity and atomic storage cases. No real key or Bot API credential was supplied. |
+| Frontend | **16 tests passed**; TypeScript and production Vite build passed. Auth denial and unknown-command identity retention are covered. |
+| Rust | **216 workspace tests passed**, locked optimized workspace build, Rust format and Clippy workspace/all-targets `-D warnings` passed. The only Rust change is an allocation-free aggregate held-market count in the bounded public snapshot; old snapshots deserialize it as unknown. Execution and private ledger types are unchanged. |
+| Rendered frontend | Playwright 1.62.1, synthetic localhost console: desktop 1440x900 and mobile 393x852 owner entry/reload/logout, forged client owner ignored, signed foreign-owner denial, no token fallback and masked-auth retry retaining ID/CAS. No runtime errors or framework overlay. Browser plugin was unavailable; bundled Playwright was used. |
+| Caddy boundary | Actual pinned Caddy and an isolated echo backend: verified fixture TLS and missing/forged/duplicate/malformed client-IP header replacement all passed; no external network or real credentials. |
+
+The deposit curve stores one compact point/minute, up to 10,080 points/seven days;
+the chart reads the latest 24 hours. It estimates cash plus complete positions at
+fresh best bids without depth/fees; missing evidence produces gaps. A retained
+aggregate proves an empty paper account even when older flat markets are omitted.
+Telegram work stays in the separate capped console and adds no engine request.
+Notifications sample execution evidence; restart baselines avoid historical
+floods, and unknown send outcomes are not retried blindly. The engine journal is
+the durable execution record.
+
+The prior simulation release has been verified on AWS eu-west-1 with retained
+EBS state, reboot recovery, DNS and strict public HTTPS at mm2.vstage.site. Its
+Polymarket geoblock probe returned blocked=true. Real owner Telegram embedding,
+message delivery and private funded credentials remain separate acceptance
+checks; fixtures do not establish them. Deployment does not Resume execution.
+
+## Previous checkpoint: October 5, 2026 — closeout and AWS package
 
 This is local verification of the implemented package. No funded venue order,
 real Polygon transaction, actual Telegram recipient or AWS deployment was used.

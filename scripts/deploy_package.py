@@ -14,9 +14,9 @@ PUBLIC_FILES = (
     "infra/aws/host.cloudformation.json", "infra/aws/compose.yaml", "infra/aws/Caddyfile",
     "infra/aws/mm2.service", "infra/aws/install_runtime.sh", "infra/aws/mount_state.sh",
     "scripts/deploy_package.py", "scripts/deploy_host.py", "scripts/deploy_supervisor.py", "scripts/deploy_verify_proxy.py", "scripts/start.py",
-    "scripts/ledger_ops.py", "scripts/soak.py", "scripts/bootstrap.sh",
+    "scripts/ledger_ops.py", "scripts/soak.py", "scripts/bootstrap.sh", "scripts/provision_private_runtime.py",
     "config/demo.toml", "config/simulation.toml", "config/public.toml",
-    "config/trading.toml", "config/both.toml", "docs/AWS_DEPLOY.md",
+    "config/trading.toml", "config/both.toml", "docs/AWS_DEPLOY.md", "docs/TELEGRAM_SETUP.md",
 )
 MAX_IMAGE_ARCHIVE = 8 * 1024**3
 

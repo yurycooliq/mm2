@@ -1,4 +1,5 @@
 import json
+import secrets
 import ssl
 import threading
 import time
@@ -6,6 +7,7 @@ from urllib.request import build_opener, HTTPSHandler, Request
 
 from .engine import NoRedirect, redact
 from .observability import execution_summary
+from .telegram_reports import active_text, deposit_chart, notification_delta, stats_text
 
 
 class TelegramTransport:
@@ -14,10 +16,27 @@ class TelegramTransport:
         self._opener = build_opener(NoRedirect(), HTTPSHandler(context=ssl.create_default_context()))
 
     def call(self, method, payload):
-        if method not in {"getUpdates", "sendMessage"}:
+        if method not in {"getUpdates", "sendMessage", "sendPhoto", "setChatMenuButton", "setMyCommands", "getMe"}:
             raise ValueError("unsupported Telegram method")
-        request = Request(self._base + method, data=json.dumps(payload).encode(),
-                          headers={"Content-Type": "application/json"}, method="POST")
+        if method == "sendPhoto":
+            photo = payload.get("photo")
+            if not isinstance(photo, bytes) or not 0 < len(photo) <= 1_048_576 or not photo.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ValueError("Telegram photo must be a bounded generated PNG")
+            fields = {key: value for key, value in payload.items() if key != "photo"}
+            if set(fields) - {"chat_id", "caption", "disable_notification", "protect_content"}:
+                raise ValueError("unsupported Telegram photo fields")
+            boundary = "mm2-" + secrets.token_hex(16)
+            parts = []
+            for key, value in fields.items():
+                value = json.dumps(value) if not isinstance(value, str) else value
+                parts.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n").encode())
+            parts.extend([(f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"deposit.png\"\r\nContent-Type: image/png\r\n\r\n").encode(), photo,
+                          (f"\r\n--{boundary}--\r\n").encode()])
+            data, content_type = b"".join(parts), "multipart/form-data; boundary=" + boundary
+        else:
+            data, content_type = json.dumps(payload).encode(), "application/json"
+        request = Request(self._base + method, data=data,
+                          headers={"Content-Type": content_type}, method="POST")
         try:
             with self._opener.open(request, timeout=7) as response:
                 raw = response.read(262_145)
@@ -40,6 +59,7 @@ class TelegramBot:
         self.stop = threading.Event()
         self._thread = None
         self._last_failure_log = 0
+        self._last_notification_sample = None
 
     def start(self):
         if self.enabled and self._thread is None:
@@ -101,7 +121,7 @@ class TelegramBot:
         if not isinstance(text, str) or len(text) > 256:
             return None
         command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
-        result = {"chat_id": owner, "text": "Commands: /start /status /pause /resume /kill /reset /logs"}
+        result = {"chat_id": owner, "text": "Команды: /start /status /stats /active /pause /resume /kill /reset /logs"}
         if command in {"/start", "/status"}:
             result["text"] = self._status()
             if command == "/start" and self.app.config.miniapp_url:
@@ -109,6 +129,16 @@ class TelegramBot:
         elif command == "/logs":
             lines = self.app.store.logs(10)
             result["text"] = "Secondary logs (not the trading ledger):\n" + ("\n".join(f"{row['level']}: {row['message']}" for row in reversed(lines)) or "No logs sampled.")
+        elif command in {"/stats", "/active"}:
+            if not self.app.command_rate.allow("telegram-report"):
+                result["text"] = "Слишком много запросов статистики; повтори позже."
+                return result
+            envelope = self.app.state()
+            if command == "/active":
+                result["text"] = active_text(envelope)
+            else:
+                result["text"] = stats_text(envelope)
+                result["_photo"] = deposit_chart(self.app.store.equity_history())
         elif command in {"/pause", "/resume", "/kill", "/reset"}:
             message_date = message.get("date")
             if type(message_date) is not int or not -5 <= int(time.time()) - message_date <= 300:
@@ -157,12 +187,74 @@ class TelegramBot:
         result["text"] = redact(result["text"][:3500], self.app.config.secret_values)
         return result
 
+    def configure_owner_menu(self):
+        """Only the configured owner's private chat gets a Mini App menu."""
+        if not self.enabled:
+            return
+        if self.app.config.miniapp_url:
+            self.transport.call("setChatMenuButton", {"chat_id": self.app.config.telegram_owner,
+                "menu_button": {"type": "web_app", "text": "mm2", "web_app": {"url": self.app.config.miniapp_url}}})
+        self.transport.call("setMyCommands", {"scope": {"type": "chat", "chat_id": self.app.config.telegram_owner},
+            "commands": [{"command": command, "description": description} for command, description in (
+                ("start", "Открыть Mini App"), ("status", "Состояние движка"),
+                ("stats", "Статистика и стоимость депозита"), ("active", "Активные позиции и ордера"),
+                ("pause", "Приостановить"), ("kill", "Остановить исполнение"), ("logs", "Вторичные логи"))]})
+
+    def notify_once(self):
+        """Secondary sampled notifications; no engine request or unbounded outbox."""
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if self._last_notification_sample is not None and now - self._last_notification_sample < 5:
+            return
+        # Keep this bound inside the method: even immediate queued updates cannot
+        # increase snapshot/cursor/network work. A suppressed call advances nothing.
+        self._last_notification_sample = now
+        envelope = self.app.state()
+        if not envelope.get("connected") or not envelope.get("state"):
+            return
+        raw = self.app.store.get_meta("telegram_notification_cursor", "null")
+        if len(raw) > 196_608:
+            raise ValueError("Telegram notification cursor exceeds limit")
+        previous = json.loads(raw)
+        if previous is not None and (not isinstance(previous, dict) or previous.get("version") != 1):
+            raise ValueError("Telegram notification cursor is invalid")
+        cursor, messages, warnings = notification_delta(envelope["state"], previous)
+        encoded = json.dumps(cursor, separators=(",", ":"), allow_nan=False)
+        if len(encoded.encode()) > 196_608:
+            raise ValueError("Telegram notification cursor exceeds limit")
+        if encoded != raw:
+            # Telegram sendMessage has no idempotency key. Persist before sending:
+            # a crash or an uncertain response can omit a secondary notification,
+            # but never re-send historic fills in an unlimited restart loop.
+            self.app.store.set_meta("telegram_notification_cursor", encoded)
+        for warning in warnings[:3]:
+            self.app.log("WARN", warning)
+        if messages and not self.stop.is_set():
+            text = redact(("\n\n".join(messages) + "\n\nВторичное наблюдение; журнал движка — источник исполнения.")[:3500], self.app.config.secret_values)
+            try:
+                self.transport.call("sendMessage", {"chat_id": self.app.config.telegram_owner, "text": text, "protect_content": True})
+            except Exception:
+                self.app.log("WARN", "Telegram execution notification delivery unknown; cursor retained, no blind resend")
+
+    def send_reply(self, reply):
+        photo = reply.pop("_photo", None)
+        self.transport.call("sendMessage", reply)
+        if photo is not None and not self.stop.is_set():
+            self.transport.call("sendPhoto", {"chat_id": self.app.config.telegram_owner, "photo": photo,
+                "caption": "Стоимость депозита USD за последние 24 ч: 1 снимок/мин, оценка по best bid без глубины/комиссий. REAL и VIRTUAL разделены. Пробелы — неизвестная стоимость. История начинается с включения сбора; виртуальные сделки синтетические.",
+                "protect_content": True})
+
     def _loop(self):
         try:
             offset = int(self.app.store.get_meta("telegram_offset", "0"))
         except (ValueError, OSError):
             self.app.log("ERROR", "Telegram offset recovery failed; polling disabled")
             return
+        try:
+            self.configure_owner_menu()
+        except Exception:
+            self.app.log("WARN", "Telegram owner menu unavailable; private /start link remains available")
         while not self.stop.is_set():
             try:
                 updates = self.transport.call("getUpdates", {"offset": offset, "timeout": 5, "limit": 20, "allowed_updates": ["message"]})
@@ -175,10 +267,14 @@ class TelegramBot:
                     if type(update_id) is not int or update_id < offset:
                         continue
                     reply = self.handle_update(update)
-                    if reply:
-                        self.transport.call("sendMessage", reply)
                     offset = update_id + 1
                     self.app.store.set_meta("telegram_offset", offset)
+                    # Advance before the non-idempotent reply. Control commands
+                    # already retained their durable identity in handle_update.
+                    if reply and not self.stop.is_set():
+                        self.send_reply(reply)
+                if not self.stop.is_set():
+                    self.notify_once()
             except Exception:
                 if time.monotonic() - self._last_failure_log > 60:
                     self.app.log("WARN", "Telegram polling unavailable; no raw provider data logged")
