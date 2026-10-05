@@ -302,6 +302,8 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(compose.count('restart: "no"'), 3)
         self.assertNotIn("service_healthy", compose)
         self.assertIn("scripts/deploy_supervisor.py", deploy_package.PUBLIC_FILES)
+        self.assertIn('MM2_TELEGRAM_ONLY: "true"', compose)
+        self.assertIn('MM2_TRUSTED_PROXY_HEADER: "true"', compose)
 
 
 class SupervisorTests(unittest.TestCase):

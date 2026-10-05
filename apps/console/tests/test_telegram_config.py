@@ -1,6 +1,5 @@
 """Production Telegram policy cannot fall back to owner-token login."""
 import os
-from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -22,8 +21,6 @@ class TelegramConfigTests(unittest.TestCase):
         self.assertTrue(config.telegram_only)
         self.assertEqual(config.telegram_token, "")
         self.assertIsNone(config.telegram_owner)
-        compose = (Path(__file__).resolve().parents[3] / "infra/aws/compose.yaml").read_text()
-        self.assertIn('MM2_TELEGRAM_ONLY: "true"', compose)
 
     def test_configured_bot_cannot_be_downgraded_to_token_login(self):
         for policy in ("true", "false"):
