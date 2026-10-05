@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -64,7 +64,7 @@ impl Command {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Receipt {
     pub command_id: String,
@@ -97,17 +97,134 @@ struct Record {
     entry: Entry,
 }
 
+/// All budgets include retained audit evidence. Rotation never deletes a record.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JournalOptions {
+    pub segment_max_bytes: u64,
+    pub total_max_bytes: u64,
+    pub max_segments: usize,
+    pub max_commands: usize,
+    pub max_execution_operations: usize,
+}
+
+impl Default for JournalOptions {
+    fn default() -> Self {
+        Self {
+            segment_max_bytes: 8 * 1024 * 1024,
+            total_max_bytes: 128 * 1024 * 1024,
+            max_segments: 128,
+            max_commands: 100_000,
+            max_execution_operations: 250_000,
+        }
+    }
+}
+
+impl JournalOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1024..=64 * 1024 * 1024).contains(&self.segment_max_bytes)
+            || !(self.segment_max_bytes..=1024 * 1024 * 1024).contains(&self.total_max_bytes)
+            || !(1..=4096).contains(&self.max_segments)
+            || !(1..=1_000_000).contains(&self.max_commands)
+            || !(1..=1_000_000).contains(&self.max_execution_operations)
+        {
+            return Err("journal options exceed supported finite resource bounds".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct JournalMetrics {
+    pub total_bytes: u64,
+    pub active_bytes: u64,
+    pub manifest_bytes: u64,
+    pub archive_segments: usize,
+    pub record_count: u64,
+    pub owner_commands: usize,
+    pub execution_operations: usize,
+    pub segment_max_bytes: u64,
+    pub total_max_bytes: u64,
+    pub max_segments: usize,
+    pub max_commands: usize,
+    pub max_execution_operations: usize,
+}
+
+/// Append-only rotation intents are synced before renaming an acknowledged segment.
+/// A complete last intent with its segment still active is safely finished on restart.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Seal {
+    segment: usize,
+    bytes: u64,
+    next_sequence: u64,
+    last_hash: String,
+    hash: String,
+}
+
+impl Seal {
+    fn digest(&self) -> Result<String, String> {
+        Ok(hex::encode(Sha256::digest(
+            serde_json::to_vec(&(
+                self.segment,
+                self.bytes,
+                self.next_sequence,
+                &self.last_hash,
+            ))
+            .map_err(|_| "cannot encode segment seal")?,
+        )))
+    }
+}
+
 pub struct Journal {
     _fence: File,
+    directory: PathBuf,
     file: File,
+    manifest: File,
     bytes: u64,
-    max_bytes: u64,
+    active_bytes: u64,
+    manifest_bytes: u64,
+    archives: usize,
+    options: JournalOptions,
     sequence: u64,
     previous_hash: String,
     bootstrap: Limits,
     history: Vec<(Command, Receipt)>,
     commands: BTreeMap<String, (String, Receipt)>,
     execution: Vec<serde_json::Value>,
+    execution_operations: usize,
+    retain_replay_buffer: bool,
+    poisoned: bool,
+}
+
+fn open_file(path: &Path) -> Result<File, String> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err("journal paths must not be symbolic links".into());
+    }
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|_| "cannot open durable journal file".into())
+}
+
+fn sync_directory(directory: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    File::open(directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "cannot sync state directory")?;
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
+}
+
+fn segment_name(index: usize) -> String {
+    format!("commands-{index:08}.jsonl")
 }
 
 fn digest(sequence: u64, previous: &str, entry: &Entry) -> Result<String, String> {
@@ -122,48 +239,196 @@ fn command_hash(command: &Command) -> Result<String, String> {
 }
 
 impl Journal {
-    /// A retained OS lock fences one host's processes on the canonical shared state directory.
-    /// Corrupt or partial records refuse startup; acknowledgement follows append + sync_all.
+    /// Compatibility entry point: the old byte setting is now the active segment size.
+    /// The retained budget is explicit in metrics and remains finite (at most 1 GiB).
     pub fn open(directory: &Path, max_bytes: u64, limits: Limits) -> Result<Self, String> {
+        Self::open_with_options(
+            directory,
+            JournalOptions {
+                segment_max_bytes: max_bytes,
+                total_max_bytes: max_bytes.saturating_mul(16).min(1024 * 1024 * 1024),
+                ..JournalOptions::default()
+            },
+            limits,
+        )
+    }
+
+    /// A retained OS lock fences one host's processes on the canonical shared directory.
+    /// Partial records/seals and missing archives refuse startup. All old single-file
+    /// journals remain byte-for-byte valid and rotate on their next complete append.
+    pub fn open_with_options(
+        directory: &Path,
+        options: JournalOptions,
+        limits: Limits,
+    ) -> Result<Self, String> {
+        Self::open_internal(directory, options, limits, true)
+    }
+
+    /// Validate retained evidence without constructing an in-memory execution tape.
+    /// Recover execution state with visit_execution() after applying owner history.
+    pub fn open_streaming(
+        directory: &Path,
+        options: JournalOptions,
+        limits: Limits,
+    ) -> Result<Self, String> {
+        Self::open_internal(directory, options, limits, false)
+    }
+
+    fn open_internal(
+        directory: &Path,
+        options: JournalOptions,
+        limits: Limits,
+        retain_replay_buffer: bool,
+    ) -> Result<Self, String> {
         limits.core()?;
+        options.validate()?;
         std::fs::create_dir_all(directory).map_err(|_| "cannot create state directory")?;
         let directory =
             std::fs::canonicalize(directory).map_err(|_| "cannot resolve state directory")?;
-        let fence = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(directory.join("engine.lock"))
-            .map_err(|_| "cannot open process fence")?;
+        let fence = open_file(&directory.join("engine.lock"))?;
         fence
             .try_lock_exclusive()
             .map_err(|_| "another process owns this state directory")?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(directory.join("commands.jsonl"))
-            .map_err(|_| "cannot open command journal")?;
-        #[cfg(unix)]
-        File::open(&directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| "cannot sync state directory")?;
-        let bytes = file
+        let mut manifest = open_file(&directory.join("journal-manifest.jsonl"))?;
+        let manifest_bytes = manifest
             .metadata()
-            .map_err(|_| "cannot inspect command journal")?
+            .map_err(|_| "cannot inspect journal manifest")?
             .len();
-        if bytes > max_bytes {
-            return Err("journal exceeds configured byte bound".into());
+        if manifest_bytes > 2 * 1024 * 1024 || manifest_bytes > options.total_max_bytes {
+            return Err("journal manifest exceeds configured bound".into());
         }
-        let mut sequence = 0;
-        let mut previous_hash = "0".repeat(64);
-        let mut bootstrap = None;
-        let mut history = Vec::new();
-        let mut commands = BTreeMap::new();
-        let mut execution = Vec::new();
-        let mut reader = BufReader::new(&file);
+        let mut seals = Vec::new();
+        let mut reader = BufReader::new(&manifest);
+        let mut line = Vec::new();
+        while (&mut reader)
+            .take(1025)
+            .read_until(b'\n', &mut line)
+            .map_err(|_| "cannot read journal manifest")?
+            != 0
+        {
+            if line.len() > 1024 || !line.ends_with(b"\n") {
+                return Err("partial or oversized journal segment seal".into());
+            }
+            let seal: Seal =
+                serde_json::from_slice(&line).map_err(|_| "corrupt journal segment seal")?;
+            if seal.segment != seals.len()
+                || seals.len() >= options.max_segments
+                || seal.bytes == 0
+                || seal.next_sequence == 0
+                || seal.last_hash.len() != 64
+                || seal.hash != seal.digest()?
+            {
+                return Err("invalid journal segment seal".into());
+            }
+            seals.push(seal);
+            line.clear();
+        }
+        drop(reader);
+        manifest
+            .seek(SeekFrom::End(0))
+            .map_err(|_| "cannot seek journal manifest")?;
+        // Reject extra or misnamed evidence; accepting a prefix could forget acknowledged work.
+        for entry in std::fs::read_dir(&directory).map_err(|_| "cannot list state directory")? {
+            let entry = entry.map_err(|_| "cannot inspect state directory entry")?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("commands-") {
+                let found = (0..seals.len()).any(|index| name == segment_name(index));
+                if !found
+                    || !entry
+                        .file_type()
+                        .map_err(|_| "cannot inspect segment")?
+                        .is_file()
+                {
+                    return Err("unsealed, unexpected or linked journal archive".into());
+                }
+            }
+        }
+        let active_path = directory.join("commands.jsonl");
+        let mut journal = Self {
+            _fence: fence,
+            directory: directory.clone(),
+            file: open_file(&active_path)?,
+            manifest,
+            bytes: 0,
+            active_bytes: 0,
+            manifest_bytes,
+            archives: 0,
+            options,
+            sequence: 0,
+            previous_hash: "0".repeat(64),
+            bootstrap: limits.clone(),
+            history: Vec::new(),
+            commands: BTreeMap::new(),
+            execution: Vec::new(),
+            execution_operations: 0,
+            retain_replay_buffer,
+            poisoned: false,
+        };
+        for seal in &seals {
+            let path = directory.join(segment_name(seal.segment));
+            if !path.exists() {
+                // An fsynced last seal is the rename intent. Only the matching complete
+                // active segment can finish it; missing historical evidence is not guessed.
+                if seal.segment + 1 != seals.len() {
+                    return Err("journal archive is missing".into());
+                }
+                journal.read_records(&active_path)?;
+                if journal.active_bytes != seal.bytes
+                    || journal.sequence != seal.next_sequence
+                    || journal.previous_hash != seal.last_hash
+                {
+                    return Err("incomplete journal rotation cannot be reconciled".into());
+                }
+                std::fs::rename(&active_path, &path)
+                    .map_err(|_| "cannot finish journal rotation")?;
+                sync_directory(&directory)?;
+                journal.file = open_file(&active_path)?;
+                sync_directory(&directory)?;
+            } else {
+                journal.read_records(&path)?;
+                if journal.active_bytes != seal.bytes
+                    || journal.sequence != seal.next_sequence
+                    || journal.previous_hash != seal.last_hash
+                {
+                    return Err("journal archive does not match its durable seal".into());
+                }
+            }
+            journal.archives += 1;
+            journal.active_bytes = 0;
+        }
+        journal.read_records(&active_path)?;
+        if journal.bytes() > journal.options.total_max_bytes {
+            return Err("retained journal exceeds configured total byte bound".into());
+        }
+        journal
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|_| "cannot seek journal")?;
+        sync_directory(&directory)?;
+        if journal.sequence == 0 {
+            journal.append(Entry::Bootstrap { limits })?;
+        }
+        Ok(journal)
+    }
+
+    fn read_records(&mut self, path: &Path) -> Result<(), String> {
+        if path
+            .symlink_metadata()
+            .map_err(|_| "cannot inspect journal segment")?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("journal segment must not be a symbolic link".into());
+        }
+        let file = File::open(path).map_err(|_| "cannot read journal segment")?;
+        let length = file
+            .metadata()
+            .map_err(|_| "cannot inspect journal segment")?
+            .len();
+        if self.bytes().saturating_add(length) > self.options.total_max_bytes {
+            return Err("retained journal exceeds configured total byte bound".into());
+        }
+        let mut reader = BufReader::new(file);
         let mut line = Vec::new();
         while (&mut reader)
             .take(65_537)
@@ -176,70 +441,161 @@ impl Journal {
             }
             let record: Record =
                 serde_json::from_slice(&line).map_err(|_| "corrupt journal record")?;
-            if record.sequence != sequence
-                || record.previous_hash != previous_hash
-                || record.hash != digest(sequence, &previous_hash, &record.entry)?
+            if record.sequence != self.sequence
+                || record.previous_hash != self.previous_hash
+                || record.hash != digest(self.sequence, &self.previous_hash, &record.entry)?
             {
                 return Err("journal sequence or hash chain mismatch".into());
             }
             match record.entry {
-                Entry::Bootstrap { limits } if sequence == 0 => {
+                Entry::Bootstrap { limits } if self.sequence == 0 => {
                     limits.core()?;
-                    bootstrap = Some(limits);
+                    self.bootstrap = limits;
                 }
                 Entry::Command {
                     command,
                     receipt,
                     operations,
-                } if sequence > 0 => {
+                } if self.sequence > 0 => {
                     command.validate()?;
-                    if history.len() >= 10_000
+                    if self.history.len() >= self.options.max_commands
                         || operations.len() > 32
                         || command.id() != receipt.command_id
-                        || receipt.applied_version != history.len() as u64 + 1
-                        || command.expected_version() != history.len() as u64
-                        || !["paused", "shadow", "killed"].contains(&receipt.mode_at_ack.as_str())
-                        || commands.contains_key(command.id())
+                        || receipt.applied_version != self.history.len() as u64 + 1
+                        || command.expected_version() != self.history.len() as u64
+                        || ![
+                            "paused",
+                            "shadow",
+                            "killed",
+                            "simulation",
+                            "trading",
+                            "both",
+                            "live",
+                        ]
+                        .contains(&receipt.mode_at_ack.as_str())
+                        || self.commands.contains_key(command.id())
                     {
                         return Err("invalid or duplicate durable command".into());
                     }
-                    commands.insert(
+                    self.add_operations(operations)?;
+                    self.commands.insert(
                         command.id().to_owned(),
                         (command_hash(&command)?, receipt.clone()),
                     );
-                    history.push((command, receipt));
-                    execution.extend(operations);
+                    self.history.push((command, receipt));
                 }
                 Entry::Execution { operations }
-                    if sequence > 0 && !operations.is_empty() && operations.len() <= 32 =>
+                    if self.sequence > 0 && !operations.is_empty() && operations.len() <= 32 =>
                 {
-                    execution.extend(operations)
+                    self.add_operations(operations)?;
                 }
                 _ => return Err("invalid journal bootstrap order".into()),
             }
-            sequence += 1;
-            previous_hash = record.hash;
+            self.sequence += 1;
+            self.previous_hash = record.hash;
             line.clear();
         }
-        drop(reader);
-        file.seek(SeekFrom::End(0))
-            .map_err(|_| "cannot seek command journal")?;
-        let mut journal = Self {
-            _fence: fence,
-            file,
-            bytes,
-            max_bytes,
-            sequence,
-            previous_hash,
-            bootstrap: bootstrap.unwrap_or_else(|| limits.clone()),
-            history,
-            commands,
-            execution,
-        };
-        if sequence == 0 {
-            journal.append(Entry::Bootstrap { limits })?;
+        self.bytes += length;
+        self.active_bytes = length;
+        Ok(())
+    }
+
+    fn add_operations(&mut self, operations: Vec<serde_json::Value>) -> Result<(), String> {
+        if self.execution_operations.saturating_add(operations.len())
+            > self.options.max_execution_operations
+        {
+            return Err("retained execution operation capacity reached".into());
         }
-        Ok(journal)
+        self.execution_operations += operations.len();
+        if self.retain_replay_buffer {
+            self.execution.extend(operations);
+        }
+        Ok(())
+    }
+
+    /// Call only after recovery has consumed execution(). Future records remain on disk.
+    /// This frees the startup tape and stops duplicating the audit ledger in actor memory.
+    pub fn release_replay_buffer(&mut self) {
+        self.execution = Vec::new();
+        self.retain_replay_buffer = false;
+    }
+
+    /// Ordered, bounded recovery callback. The process fence is retained throughout.
+    /// Each ≤64 KiB record is decoded once for this pass; the complete chain is checked
+    /// again before accepting the recovered state. Callbacks must not perform IO actions.
+    pub fn visit_execution(
+        &self,
+        mut visitor: impl FnMut(&[serde_json::Value]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut sequence = 0;
+        let mut previous = "0".repeat(64);
+        let paths = (0..self.archives)
+            .map(|index| self.directory.join(segment_name(index)))
+            .chain(std::iter::once(self.directory.join("commands.jsonl")));
+        for path in paths {
+            if path
+                .symlink_metadata()
+                .map_err(|_| "cannot inspect replay segment")?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("replay segment must not be linked".into());
+            }
+            let mut reader =
+                BufReader::new(File::open(path).map_err(|_| "cannot open replay segment")?);
+            let mut line = Vec::new();
+            while (&mut reader)
+                .take(65_537)
+                .read_until(b'\n', &mut line)
+                .map_err(|_| "cannot read replay segment")?
+                != 0
+            {
+                if line.len() > 65_536 || !line.ends_with(b"\n") {
+                    return Err("partial or oversized replay record".into());
+                }
+                let record: Record =
+                    serde_json::from_slice(&line).map_err(|_| "corrupt replay record")?;
+                if record.sequence != sequence
+                    || record.previous_hash != previous
+                    || record.hash != digest(sequence, &previous, &record.entry)?
+                {
+                    return Err("replay sequence or hash chain mismatch".into());
+                }
+                match &record.entry {
+                    Entry::Bootstrap { .. } if sequence == 0 => {}
+                    Entry::Execution { operations } | Entry::Command { operations, .. }
+                        if sequence > 0 =>
+                    {
+                        visitor(operations)?
+                    }
+                    _ => return Err("invalid replay bootstrap order".into()),
+                }
+                sequence += 1;
+                previous = record.hash;
+                line.clear();
+            }
+        }
+        if sequence != self.sequence || previous != self.previous_hash {
+            return Err("retained evidence changed during replay".into());
+        }
+        Ok(())
+    }
+
+    pub fn metrics(&self) -> JournalMetrics {
+        JournalMetrics {
+            total_bytes: self.bytes(),
+            active_bytes: self.active_bytes,
+            manifest_bytes: self.manifest_bytes,
+            archive_segments: self.archives,
+            record_count: self.sequence,
+            owner_commands: self.history.len(),
+            execution_operations: self.execution_operations,
+            segment_max_bytes: self.options.segment_max_bytes,
+            total_max_bytes: self.options.total_max_bytes,
+            max_segments: self.options.max_segments,
+            max_commands: self.options.max_commands,
+            max_execution_operations: self.options.max_execution_operations,
+        }
     }
 
     pub fn bootstrap(&self) -> &Limits {
@@ -252,7 +608,7 @@ impl Journal {
         self.history.len() as u64
     }
     pub fn bytes(&self) -> u64 {
-        self.bytes
+        self.bytes + self.manifest_bytes
     }
     pub fn execution(&self) -> &[serde_json::Value] {
         &self.execution
@@ -261,11 +617,15 @@ impl Journal {
         if operations.is_empty() || operations.len() > 32 {
             return Err("invalid execution transaction".into());
         }
+        if self.execution_operations.saturating_add(operations.len())
+            > self.options.max_execution_operations
+        {
+            return Err("retained execution operation capacity reached".into());
+        }
         self.append(Entry::Execution {
             operations: operations.clone(),
         })?;
-        self.execution.extend(operations);
-        Ok(())
+        self.add_operations(operations)
     }
     pub fn existing(&self, command: &Command) -> Result<Option<Receipt>, String> {
         match self.commands.get(command.id()) {
@@ -284,12 +644,24 @@ impl Journal {
         operations: Vec<serde_json::Value>,
     ) -> Result<(), String> {
         command.validate()?;
-        if self.commands.len() >= 10_000
+        if self.commands.len() >= self.options.max_commands
             || self.existing(&command)?.is_some()
             || command.expected_version() != self.version()
             || receipt.applied_version != self.version() + 1
             || receipt.command_id != command.id()
             || operations.len() > 32
+            || self.execution_operations.saturating_add(operations.len())
+                > self.options.max_execution_operations
+            || ![
+                "paused",
+                "shadow",
+                "killed",
+                "simulation",
+                "trading",
+                "both",
+                "live",
+            ]
+            .contains(&receipt.mode_at_ack.as_str())
         {
             return Err("invalid journal command commit".into());
         }
@@ -303,10 +675,12 @@ impl Journal {
             (command_hash(&command)?, receipt.clone()),
         );
         self.history.push((command, receipt));
-        self.execution.extend(operations);
-        Ok(())
+        self.add_operations(operations)
     }
     fn append(&mut self, entry: Entry) -> Result<(), String> {
+        if self.poisoned {
+            return Err("journal writer failed; restart and reconcile before retry".into());
+        }
         let hash = digest(self.sequence, &self.previous_hash, &entry)?;
         let mut bytes = serde_json::to_vec(&Record {
             sequence: self.sequence,
@@ -316,16 +690,82 @@ impl Journal {
         })
         .map_err(|_| "cannot encode journal record")?;
         bytes.push(b'\n');
-        if bytes.len() > 65_536 || self.bytes + bytes.len() as u64 > self.max_bytes {
-            return Err("journal capacity reached; expand bound before restart".into());
+        if bytes.len() > 65_536 || bytes.len() as u64 > self.options.segment_max_bytes {
+            return Err("journal record exceeds segment or record bound".into());
         }
-        self.file
+        let rotation = self.active_bytes + bytes.len() as u64 > self.options.segment_max_bytes;
+        let seal_bytes = if rotation {
+            if self.archives >= self.options.max_segments {
+                return Err(
+                    "journal archive segment capacity reached; retained evidence was preserved"
+                        .into(),
+                );
+            }
+            let mut seal = Seal {
+                segment: self.archives,
+                bytes: self.active_bytes,
+                next_sequence: self.sequence,
+                last_hash: self.previous_hash.clone(),
+                hash: String::new(),
+            };
+            seal.hash = seal.digest()?;
+            let mut encoded =
+                serde_json::to_vec(&seal).map_err(|_| "cannot encode segment seal")?;
+            encoded.push(b'\n');
+            Some(encoded)
+        } else {
+            None
+        };
+        let added = bytes.len() as u64 + seal_bytes.as_ref().map_or(0, |seal| seal.len() as u64);
+        if self.bytes().saturating_add(added) > self.options.total_max_bytes {
+            return Err("retained journal capacity reached; evidence was preserved".into());
+        }
+        if let Some(seal_bytes) = seal_bytes
+            && self.rotate(&seal_bytes).is_err()
+        {
+            self.poisoned = true;
+            return Err("durable journal rotation failed; reconcile on restart".into());
+        }
+        if self
+            .file
             .write_all(&bytes)
             .and_then(|()| self.file.sync_all())
-            .map_err(|_| "durable journal write failed; outcome must be reconciled on restart")?;
+            .is_err()
+        {
+            self.poisoned = true;
+            return Err(
+                "durable journal write failed; outcome must be reconciled on restart".into(),
+            );
+        }
         self.bytes += bytes.len() as u64;
+        self.active_bytes += bytes.len() as u64;
         self.sequence += 1;
         self.previous_hash = hash;
+        Ok(())
+    }
+
+    fn rotate(&mut self, seal_bytes: &[u8]) -> Result<(), String> {
+        self.file
+            .sync_all()
+            .map_err(|_| "cannot sync active journal")?;
+        // The seal is a durable rename intent. Never expose a new writable segment
+        // until both intent and archived directory entry are durable.
+        self.manifest
+            .write_all(seal_bytes)
+            .and_then(|()| self.manifest.sync_all())
+            .map_err(|_| "cannot persist segment seal")?;
+        self.manifest_bytes += seal_bytes.len() as u64;
+        let target = self.directory.join(segment_name(self.archives));
+        if target.exists() {
+            return Err("journal archive path already exists".into());
+        }
+        std::fs::rename(self.directory.join("commands.jsonl"), target)
+            .map_err(|_| "cannot archive journal segment")?;
+        sync_directory(&self.directory)?;
+        self.file = open_file(&self.directory.join("commands.jsonl"))?;
+        sync_directory(&self.directory)?;
+        self.archives += 1;
+        self.active_bytes = 0;
         Ok(())
     }
 }
@@ -422,5 +862,233 @@ mod tests {
         assert_eq!(recovered.version(), 1);
         assert_eq!(&recovered.execution()[..2], &[first, second]);
         assert_eq!(recovered.execution().len(), 3);
+    }
+
+    fn small_options() -> JournalOptions {
+        JournalOptions {
+            segment_max_bytes: 1024,
+            total_max_bytes: 64 * 1024,
+            max_segments: 32,
+            max_commands: 100,
+            max_execution_operations: 100,
+        }
+    }
+
+    fn append_steps(journal: &mut Journal, count: u64) {
+        for now in 0..count {
+            journal
+                .commit_execution(vec![serde_json::json!({"kind":"advance","now_ms":now})])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn rotation_preserves_owner_identity_and_execution_order_across_every_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+        let command = Command::Control {
+            id: "durable-owner".into(),
+            expected_version: 0,
+            action: "pause".into(),
+        };
+        let receipt = Receipt {
+            command_id: command.id().into(),
+            applied_version: 1,
+            mode_at_ack: "paused".into(),
+        };
+        journal.commit(command.clone(), receipt.clone()).unwrap();
+        append_steps(&mut journal, 12);
+        let before = journal.metrics();
+        assert!(before.archive_segments >= 3);
+        assert!(before.total_bytes > before.segment_max_bytes);
+        drop(journal);
+        let recovered = Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+        assert_eq!(recovered.existing(&command).unwrap(), Some(receipt));
+        assert_eq!(recovered.metrics().total_bytes, before.total_bytes);
+        assert_eq!(recovered.execution().len(), 12);
+        for (now, operation) in recovered.execution().iter().enumerate() {
+            assert_eq!(operation["now_ms"], now as u64);
+        }
+    }
+
+    #[test]
+    fn old_single_file_migrates_without_rewriting_acknowledged_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), 1024 * 1024, limits()).unwrap();
+        append_steps(&mut journal, 3);
+        drop(journal);
+        let original = std::fs::read(dir.path().join("commands.jsonl")).unwrap();
+        std::fs::remove_file(dir.path().join("journal-manifest.jsonl")).unwrap();
+        let mut journal =
+            Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+        append_steps(&mut journal, 1);
+        assert_eq!(
+            std::fs::read(dir.path().join(segment_name(0))).unwrap(),
+            original
+        );
+        assert_eq!(journal.execution().len(), 4);
+    }
+
+    #[test]
+    fn complete_rotation_intent_recovers_both_crash_boundaries() {
+        for rename_before_crash in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut journal =
+                Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+            append_steps(&mut journal, 1);
+            let mut seal = Seal {
+                segment: 0,
+                bytes: journal.active_bytes,
+                next_sequence: journal.sequence,
+                last_hash: journal.previous_hash.clone(),
+                hash: String::new(),
+            };
+            seal.hash = seal.digest().unwrap();
+            let mut encoded = serde_json::to_vec(&seal).unwrap();
+            encoded.push(b'\n');
+            journal.manifest.write_all(&encoded).unwrap();
+            journal.manifest.sync_all().unwrap();
+            drop(journal);
+            if rename_before_crash {
+                std::fs::rename(
+                    dir.path().join("commands.jsonl"),
+                    dir.path().join(segment_name(0)),
+                )
+                .unwrap();
+            }
+            let recovered =
+                Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+            assert_eq!(recovered.execution().len(), 1);
+            assert_eq!(recovered.metrics().archive_segments, 1);
+            assert!(dir.path().join(segment_name(0)).exists());
+        }
+    }
+
+    #[test]
+    fn missing_archive_or_partial_manifest_or_archive_refuses_recovery() {
+        for fault in ["missing", "manifest", "archive"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut journal =
+                Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+            append_steps(&mut journal, 8);
+            drop(journal);
+            let archive = dir.path().join(segment_name(0));
+            match fault {
+                "missing" => std::fs::remove_file(archive).unwrap(),
+                "manifest" => {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(dir.path().join("journal-manifest.jsonl"))
+                        .unwrap()
+                        .write_all(b"{\"partial\":")
+                        .unwrap();
+                }
+                _ => {
+                    let length = std::fs::metadata(&archive).unwrap().len();
+                    OpenOptions::new()
+                        .write(true)
+                        .open(archive)
+                        .unwrap()
+                        .set_len(length - 1)
+                        .unwrap();
+                }
+            }
+            assert!(Journal::open_with_options(dir.path(), small_options(), limits()).is_err());
+        }
+    }
+
+    #[test]
+    fn retained_budget_and_command_budget_stop_without_discarding_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = small_options();
+        options.total_max_bytes = 2048;
+        options.max_commands = 1;
+        let mut journal =
+            Journal::open_with_options(dir.path(), options.clone(), limits()).unwrap();
+        let command = Command::Control {
+            id: "one".into(),
+            expected_version: 0,
+            action: "pause".into(),
+        };
+        let receipt = Receipt {
+            command_id: "one".into(),
+            applied_version: 1,
+            mode_at_ack: "paused".into(),
+        };
+        journal.commit(command.clone(), receipt.clone()).unwrap();
+        assert!(
+            journal
+                .commit(
+                    Command::Control {
+                        id: "two".into(),
+                        expected_version: 1,
+                        action: "kill".into()
+                    },
+                    Receipt {
+                        command_id: "two".into(),
+                        applied_version: 2,
+                        mode_at_ack: "killed".into()
+                    },
+                )
+                .is_err()
+        );
+        while journal
+            .commit_execution(vec![serde_json::json!({"kind":"advance","now_ms":1})])
+            .is_ok()
+        {}
+        let bytes = journal.bytes();
+        assert!(bytes <= options.total_max_bytes);
+        drop(journal);
+        let recovered = Journal::open_with_options(dir.path(), options, limits()).unwrap();
+        assert_eq!(recovered.bytes(), bytes);
+        assert_eq!(recovered.existing(&command).unwrap(), Some(receipt));
+    }
+
+    #[test]
+    fn replay_buffer_release_bounds_actor_memory_but_preserves_restart_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = small_options();
+        options.max_execution_operations = 3;
+        let mut journal =
+            Journal::open_with_options(dir.path(), options.clone(), limits()).unwrap();
+        append_steps(&mut journal, 2);
+        journal.release_replay_buffer();
+        append_steps(&mut journal, 1);
+        assert!(journal.execution().is_empty());
+        assert_eq!(journal.metrics().execution_operations, 3);
+        assert!(
+            journal
+                .commit_execution(vec![serde_json::json!({"kind":"advance","now_ms":4})])
+                .is_err()
+        );
+        drop(journal);
+        let recovered = Journal::open_with_options(dir.path(), options, limits()).unwrap();
+        assert_eq!(recovered.execution().len(), 3);
+    }
+
+    #[test]
+    fn streaming_recovery_visits_bounded_transactions_without_building_tape() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+        append_steps(&mut journal, 12);
+        drop(journal);
+        let mut recovered = Journal::open_streaming(dir.path(), small_options(), limits()).unwrap();
+        assert!(recovered.execution().is_empty());
+        let mut now = 0;
+        recovered
+            .visit_execution(|operations| {
+                for operation in operations {
+                    assert_eq!(operation["now_ms"], now);
+                    now += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(now, 12);
+        append_steps(&mut recovered, 1);
+        assert!(recovered.execution().is_empty());
+        assert_eq!(recovered.metrics().execution_operations, 13);
     }
 }

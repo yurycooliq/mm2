@@ -25,9 +25,23 @@ export interface Simulation {
 }
 export interface EngineState {
   boot_id: string; published_at_ms: number; command_version: number;
-  mode: 'paused' | 'shadow' | 'killed'; execution_mode: 'emulator' | 'shadow';
+  mode: 'paused' | 'shadow' | 'killed'; execution_mode: 'emulator' | 'simulation' | 'shadow' | 'trading' | 'both';
   feed_source: string; api_ready: boolean; feed_ready: boolean; shadow_ready: boolean;
-  live_eligible: false; exact_twap_available: false;
+  live_eligible: boolean; exact_twap_available: false;
+  live?: {
+    simulated: false; phase: 'paused' | 'running' | 'killed' | 'faulted'; can_resume: boolean;
+    account_reconciled: boolean; user_stream_connected: boolean;
+    last_reconciliation_ms: number | null; last_heartbeat_ms: number | null;
+    collateral_micros: number; available_micros: number; reserved_pico: string;
+    orders: { order_id: string; quote: Order['quote']; phase: string; cumulative_filled_micros: number }[];
+    positions: { condition_id: string; token_id: string; outcome: 'up' | 'down'; quantity_micros: number }[];
+    fault: string | null; unsupported_operations: string[];
+  } | null;
+  paper_portfolio?: { cash_pico: string; available_pico: string; spent_pico: string;
+    position_count?:number;positions_truncated?:number;
+    available_cash_micros: number; positions: { market: { id: string }; up: { quantity_micros: number }; down: { quantity_micros: number } }[] } | null;
+  parallel_simulation?: { mode: string; fault: string | null; published_at_ms: number; command_version: number } | null;
+  journal?: { total_bytes: number; total_max_bytes: number; archive_segments: number } | null;
   simulation: Simulation | null; simulation_error?: string | null;
   market: { slug: string; window_start_ms: number; window_end_ms: number } | null;
   limits: Limits;

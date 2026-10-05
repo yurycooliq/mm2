@@ -1,0 +1,49 @@
+mode = "both"
+feed_source = "public"
+listen = "0.0.0.0:8088"
+allow_remote_http = true
+state_dir = "/data/both"
+live_state_dir = "/data/account-live"
+journal_max_bytes = 8388608
+command_capacity = 32
+feed_capacity = 256
+
+[limits]
+initial_collateral_usd = "100"
+max_imbalance_shares = "10"
+lot_shares = "5"
+half_width = "0.01"
+max_feed_age_ms = 1000
+
+# Owner fills these values locally after account/protocol/host validation.
+# No key values belong in this file. No allowance transaction is sent implicitly.
+[live]
+clob_url = "https://clob-v2.polymarket.com"
+chain_id = 137
+protocol = 2
+owner_address = ""
+signer_address = ""
+funder_address = ""
+exchange_address = ""
+collateral_address = ""
+signature_type = 0
+private_key_env = "MM2_POLY_PRIVATE_KEY"
+api_key_env = "MM2_POLY_API_KEY"
+api_secret_env = "MM2_POLY_API_SECRET"
+api_passphrase_env = "MM2_POLY_API_PASSPHRASE"
+allowed_conditions = []
+allowed_market_prefixes = ["btc-updown-5m-"]
+owner_authorized = false
+request_timeout_ms = 2000
+quote_ttl_ms = 1000
+heartbeat_interval_ms = 2000
+journal_max_bytes = 67108864
+
+[live.risk]
+max_budget_micros = 100000000
+max_gross_micros = 50000000
+max_imbalance_micros = 10000000
+max_order_micros = 5000000
+max_orders = 16
+max_markets = 16
+daily_loss_limit_micros = 5000000

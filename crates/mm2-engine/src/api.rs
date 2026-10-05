@@ -119,7 +119,7 @@ async fn health(State(api): State<Api>) -> Json<Value> {
 async fn ready(State(api): State<Api>) -> Response {
     let snapshot = api.handle.state.borrow().clone();
     (if snapshot["api_ready"] == true { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
-        Json(json!({"api_ready":snapshot["api_ready"],"feed_ready":snapshot["feed_ready"],"shadow_ready":snapshot["shadow_ready"],"live_eligible":false}))).into_response()
+        Json(json!({"api_ready":snapshot["api_ready"],"feed_ready":snapshot["feed_ready"],"shadow_ready":snapshot["shadow_ready"],"live_eligible":snapshot["live_eligible"],"execution_mode":snapshot["execution_mode"]}))).into_response()
 }
 fn authorized(api: &Api, headers: &HeaderMap) -> Option<Response> {
     if api.auth.authorized(headers) {
@@ -310,7 +310,11 @@ mod tests {
             listen: "127.0.0.1:8088".parse().unwrap(),
             allow_remote_http: false,
             state_dir: dir.path().into(),
+            live_state_dir: None,
             journal_max_bytes: 1_048_576,
+            journal: None,
+            strategy: mm2_strategy::Rules::default(),
+            live: None,
             command_capacity: 8,
             feed_capacity: 16,
             limits: Limits {

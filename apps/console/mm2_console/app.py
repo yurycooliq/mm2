@@ -5,6 +5,7 @@ import time
 
 from .auth import RateLimiter, Sessions
 from .engine import EngineClient, Reply, redact
+from .observability import execution_summary, health_identity, health_log, history_projection
 from .store import Store
 
 
@@ -49,7 +50,7 @@ class App:
         self._sample_lock = threading.Lock()
         self._snapshot = {"state": None, "observed_at_ms": None, "connected": False, "error": "waiting for first engine sample"}
         self._metrics = {"sampling_interval_ms": 1000, "sample_count": 0, "history_dropped": 0,
-                         "logs_dropped": 0, "overruns": 0, "last_sampling_ms": None, "storage_error": None}
+                         "logs_dropped": 0, "history_compacted": 0, "overruns": 0, "last_sampling_ms": None, "storage_error": None}
         self._last_log_identity = None
         self.stop = threading.Event()
         self._sampler = None
@@ -67,7 +68,9 @@ class App:
             started = time.monotonic()
             reply = self.engine.request("GET", "/v1/state")
             now = int(time.time() * 1000)
-            connected = reply.status == 200 and type(reply.payload.get("command_version")) is int
+            connected = (reply.status == 200 and isinstance(reply.payload, dict)
+                         and type(reply.payload.get("command_version")) is int
+                         and 0 <= reply.payload["command_version"] < 2**64)
             with self._lock:
                 self._metrics["sample_count"] += 1
                 self._metrics["last_sampling_ms"] = round((time.monotonic() - started) * 1000, 3)
@@ -79,15 +82,20 @@ class App:
                     self._snapshot["connected"] = False
                     self._snapshot["error"] = "engine unavailable; displayed state is the last successful sample" if self._snapshot["state"] else "engine unavailable; no state has been sampled"
             if state is not None:
-                if not self.store.sample(now, state):
+                historical = history_projection(state)
+                if historical is not state:
+                    with self._lock:
+                        self._metrics["history_compacted"] += 1
+                if not self.store.sample(now, historical):
                     with self._lock:
                         self._metrics["history_dropped"] += 1
                         self._metrics["storage_error"] = "sample exceeds 64 KiB or secondary persistence unavailable"
-                identity = (state.get("boot_id"), state.get("command_version"), state.get("mode"),
-                            state.get("fault"), state.get("source_status", {}).get("phase"), state.get("feed_ready"))
+                published = state.get("published_at_ms")
+                fresh = (type(published) is int and 0 <= published <= now + 5000
+                         and now - published <= 3000)
+                identity = health_identity(state) + (fresh,)
                 if identity != self._last_log_identity:
-                    self.log("ERROR" if state.get("fault") else "INFO",
-                             f"Engine {state.get('mode', 'unknown')}; feeds {'fresh' if state.get('feed_ready') else 'not ready'}; command version {state.get('command_version')}")
+                    self.log(*health_log(state, fresh))
                     self._last_log_identity = identity
             elif self._last_log_identity != ("offline",):
                 self.log("WARN", "Engine unavailable; secondary state is stale")
@@ -110,6 +118,7 @@ class App:
             elif now - publication > 3000:
                 result["connected"] = False
                 result["error"] = "engine publication is older than 3 seconds; displayed state is stale"
+        result["execution"] = execution_summary(result["state"], result["connected"])
         return result
 
     def proxy(self, value, limits=False):

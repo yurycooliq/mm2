@@ -10,7 +10,15 @@ pub struct Config {
     pub listen: SocketAddr,
     pub allow_remote_http: bool,
     pub state_dir: PathBuf,
+    #[serde(default)]
+    pub live_state_dir: Option<PathBuf>,
     pub journal_max_bytes: u64,
+    #[serde(default)]
+    pub journal: Option<crate::journal::JournalOptions>,
+    #[serde(default)]
+    pub strategy: mm2_strategy::Rules,
+    #[serde(default)]
+    pub live: Option<mm2_live::LiveSettings>,
     pub command_capacity: usize,
     pub feed_capacity: usize,
     pub limits: Limits,
@@ -79,10 +87,29 @@ impl Config {
         if !matches!(
             (self.mode.as_str(), self.feed_source),
             ("emulator", FeedSource::Demo)
+                | ("simulation", FeedSource::Demo | FeedSource::Public)
                 | ("shadow", FeedSource::Public)
                 | ("shadow", FeedSource::Demo)
+                | ("trading" | "both", FeedSource::Public)
         ) {
-            return Err("supported pairs are emulator/demo and shadow/public; live gateway is deliberately absent".into());
+            return Err("supported modes: emulator/demo, simulation/demo|public, shadow/demo|public, trading/public, both/public".into());
+        }
+        if self.trades() && self.live.is_none() {
+            return Err("trading and both require an explicit [live] configuration".into());
+        }
+        if self.trades()
+            && self
+                .live_state_dir
+                .as_ref()
+                .is_none_or(|path| path.as_os_str().is_empty() || path == &self.state_dir)
+        {
+            return Err("trading requires a separate persistent live_state_dir shared by the owner account across startup profiles".into());
+        }
+        if !self.trades() && self.live.is_some() {
+            return Err("live settings are forbidden in simulation/shadow profiles".into());
+        }
+        if !self.trades() && self.live_state_dir.is_some() {
+            return Err("live_state_dir is forbidden in simulation/shadow profiles".into());
         }
         if !self.listen.ip().is_loopback() && !self.allow_remote_http {
             return Err(
@@ -98,6 +125,62 @@ impl Config {
             return Err("configuration exceeds supported resource bounds".into());
         }
         self.limits.core()?;
+        self.strategy.validate()?;
+        if let Some(options) = &self.journal {
+            options.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn simulates(&self) -> bool {
+        matches!(self.mode.as_str(), "emulator" | "simulation" | "both")
+    }
+
+    pub fn trades(&self) -> bool {
+        matches!(self.mode.as_str(), "trading" | "both")
+    }
+
+    /// A persisted profile prevents switching a paper ledger into a real account.
+    /// Called only while the engine's directory fence is held.
+    pub fn bind_profile(&self) -> Result<(), String> {
+        use std::io::Write;
+        let path = self.state_dir.join("execution-profile.json");
+        let mut identity = serde_json::json!({"schema":1,"mode":self.mode,"feed_source":match self.feed_source { FeedSource::Demo=>"demo",FeedSource::Public=>"public" }});
+        if let Some(path) = &self.live_state_dir {
+            identity["live_state_dir"] =
+                serde_json::to_value(path).map_err(|_| "cannot encode live state location")?;
+        }
+        if path.exists() {
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .map_err(|_| "cannot read execution profile")?
+                .take(4097)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "cannot read execution profile")?;
+            if bytes.len() > 4096
+                || serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .as_ref()
+                    != Some(&identity)
+            {
+                return Err("state directory belongs to another execution profile; choose its original profile or a fresh directory".into());
+            }
+        } else {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|_| "cannot create execution profile")?;
+            file.write_all(
+                &serde_json::to_vec(&identity).map_err(|_| "cannot encode execution profile")?,
+            )
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "cannot persist execution profile")?;
+            #[cfg(unix)]
+            std::fs::File::open(&self.state_dir)
+                .and_then(|f| f.sync_all())
+                .map_err(|_| "cannot sync execution profile directory")?;
+        }
         Ok(())
     }
 }
@@ -144,5 +227,27 @@ mod tests {
             assert_eq!(core.lot_micro, 5_000_000);
             assert_eq!(core.half_width_micro, 10_000);
         }
+    }
+    #[test]
+    fn startup_modes_are_explicit_and_state_profiles_cannot_be_crossed() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        for (name, mode) in [
+            ("simulation", "simulation"),
+            ("trading", "trading"),
+            ("both", "both"),
+        ] {
+            let mut config = Config::load(&root.join(format!("{name}.toml"))).unwrap();
+            assert_eq!(config.mode, mode);
+            assert_eq!(config.live.is_some(), mode != "simulation");
+            let directory = tempfile::tempdir().unwrap();
+            config.state_dir = directory.path().into();
+            config.bind_profile().unwrap();
+            config.bind_profile().unwrap();
+            config.mode = "shadow".into();
+            assert!(config.bind_profile().is_err());
+        }
+        let mut config = Config::load(&root.join("demo.toml")).unwrap();
+        config.mode = "trading".into();
+        assert!(config.validate().is_err());
     }
 }

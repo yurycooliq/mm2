@@ -13,6 +13,10 @@ services:
     ports: ["127.0.0.1:8088:8088"]
     environment:
       MM2_ENGINE_API_TOKEN: ${MM2_ENGINE_API_TOKEN:?Run scripts/bootstrap.ps1}
+      MM2_POLY_PRIVATE_KEY: ${MM2_POLY_PRIVATE_KEY:-}
+      MM2_POLY_API_KEY: ${MM2_POLY_API_KEY:-}
+      MM2_POLY_API_SECRET: ${MM2_POLY_API_SECRET:-}
+      MM2_POLY_API_PASSPHRASE: ${MM2_POLY_API_PASSPHRASE:-}
     volumes:
       - type: bind
         source: ${MM2_ENGINE_CONFIG:-./config/demo.toml}
@@ -24,7 +28,7 @@ services:
     pids_limit: 64
     cpus: 1
     mem_limit: 512m
-    stop_grace_period: 10s
+    stop_grace_period: 30s
     restart: unless-stopped
     logging:
       driver: json-file

@@ -9,8 +9,14 @@ export function money(value: unknown): string { const result = micro(value, 2); 
 export function simulated(state: EngineState | null) { return state?.simulation?.simulated === true ? state.simulation : null; }
 export function modeLabel(state: EngineState | null): string {
   if (!state) return 'Waiting for engine';
-  const mode = state.mode === 'shadow' && state.execution_mode === 'emulator' ? 'running' : state.mode;
-  return `${state.execution_mode === 'emulator' ? 'Demo emulator' : 'Public shadow'} · ${mode}`;
+  const mode = state.mode === 'shadow' && state.execution_mode !== 'shadow' ? 'running' : state.mode;
+  const labels = { emulator: 'Demo emulator', simulation: 'Simulation', shadow: 'Public shadow', trading: 'Trading', both: 'Trading + simulation' };
+  return `${labels[state.execution_mode]} · ${mode}`;
+}
+export function picoMoney(value: unknown): string {
+  if (typeof value !== 'string' || !/^\d{1,40}$/.test(value)) return '—';
+  const cents = BigInt(value) / 10_000_000_000n;
+  return `$${(cents / 100n).toLocaleString('en-US')}.${(cents % 100n).toString().padStart(2, '0')}`;
 }
 export function safeVersion(state: EngineState | null): boolean { return !!state && Number.isSafeInteger(state.command_version) && state.command_version >= 0; }
 export function timeLabel(ms: number): string { return new Date(ms).toLocaleTimeString([], { hour12: false }); }

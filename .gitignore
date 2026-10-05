@@ -4,6 +4,7 @@
 !/.env.example
 /data/
 /output/
+/.scratch-sdk/
 **/node_modules/
 **/dist/
 *.tsbuildinfo

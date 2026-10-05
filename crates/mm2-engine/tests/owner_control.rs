@@ -25,7 +25,11 @@ fn config(path: &std::path::Path) -> Config {
         listen: "127.0.0.1:8088".parse().unwrap(),
         allow_remote_http: false,
         state_dir: path.into(),
+        live_state_dir: None,
         journal_max_bytes: 1_048_576,
+        journal: None,
+        strategy: Default::default(),
+        live: None,
         command_capacity: 8,
         feed_capacity: 16,
         limits: Limits {
@@ -295,7 +299,7 @@ async fn dependency_backoff_is_visible_and_recovery_does_not_create_orders() {
             .unwrap()
             .contains("blocked")
     );
-    assert_eq!(state["actual_orders"], serde_json::json!([]));
+    assert_eq!(state["live"], serde_json::Value::Null);
     assert_eq!(state["live_eligible"], false);
     assert!(state["wallet_balance_usd"].is_null());
     halt(service).await;
@@ -408,21 +412,22 @@ async fn emulator_fills_are_durable_and_pause_keeps_reservations_until_cancel_de
         down
     );
     assert_eq!(state["simulation"]["account"]["reserved_micros_ceil"], 0);
-    assert_eq!(state["actual_orders"], serde_json::json!([]));
+    assert_eq!(state["live"], serde_json::Value::Null);
     assert_eq!(state["live_eligible"], false);
     let mut other = selected.clone();
     other.condition_id = format!("0x{}", "b".repeat(64));
     recovered.handle.select_market(other).await.unwrap();
+    let rolled = recovered.handle.state.borrow().clone();
     assert_eq!(
-        recovered
-            .handle
-            .command(control("wrong-market", 2, "resume"))
-            .await
-            .unwrap_err()
-            .kind,
-        "conflict"
+        rolled["paper_portfolio"]["positions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
-    let before = state["journal_bytes"].as_u64().unwrap();
+    assert_eq!(rolled["simulation"]["account"]["up_inventory_micros"], 0);
+    assert_eq!(rolled["simulation"]["account"]["down_inventory_micros"], 0);
+    let before = rolled["journal_bytes"].as_u64().unwrap();
     tokio::time::sleep(Duration::from_millis(450)).await;
     assert_eq!(
         recovered.handle.state.borrow()["journal_bytes"],

@@ -1,8 +1,10 @@
-# Deterministic execution contract
+# Deterministic and authenticated execution contracts
 
-`mm2-core` owns order identities, desired slots, simulated collateral and inventory. It has no network, clock, persistence or dashboard dependency. `mm2-emulator` supplies a deterministic event-time venue and notification transport. The Rust engine journals emulator transitions before adopting the next session. The console's sampled history is separate from that action ledger.
+`mm2-core` owns single-market order identities, desired slots, simulated collateral and inventory. `mm2-strategy` produces bounded BUY-only desired quotes; `mm2-portfolio` owns finite capital and retained positions keyed by market. These libraries have no network, clock, persistence or dashboard dependency. `mm2-emulator` supplies a deterministic event-time venue and notification transport. The engine journals paper transitions before adopting the next session. The console's sampled history is separate from the action ledger.
 
-The current implementation buys Up or Down outcome tokens with passive limit orders. It does not settle a market, sell inventory, sign orders, contact an authenticated venue, claim a profitable strategy or simulate the exact exchange FIFO. The demo strategy's paired quotes are a test driver. Public mode remains read-only shadow.
+The execution candidate buys Up or Down outcome tokens with passive limit orders. `demo`/`emulator` uses synthetic observations; `simulation` uses public observations and local fills; `shadow` submits nothing. `trading` attaches the technical authenticated `mm2-live` adapter and `both` adds an independent paper lane. Every startup is paused. Trading templates are inactive until explicit account/protocol/permission gates pass.
+
+`mm2-live` pins `polymarket_client_sdk_v2 = 0.7.0` to the Polygon CLOB V2 token-order path. Its network lifecycle is tested with controlled mocks, not a funded account. V3 positions, deposit-wallet EIP-1271, sells and on-chain merge/redemption remain unsupported. Portfolio receipt accounting and synthetic lifecycle tests do not submit settlement transactions or establish actual attainable returns.
 
 ## Exact units and risk
 
@@ -14,7 +16,7 @@ Risk admission clips a quote to both exact remaining collateral and the independ
 
 ## Lifecycle
 
-An order has one immutable monotonically increasing ID. Its known phases are `posting`, `live`, `cancelling`, `unknown_post`, `unknown_cancel` and `closed`. A slot holds at most one possibly executable order and one latest desired quote. Changing a live quote requests cancellation. A replacement is posted only after the old order's terminal confirmation. Further changes during the cancellation coalesce into the latest desired quote. The replacement gets a new ID and joins the back of the external queue observed when it arrives.
+An emulator order has one immutable monotonically increasing ID within its single-market session. Its known phases are `posting`, `live`, `cancelling`, `unknown_post`, `unknown_cancel` and `closed`. A slot holds at most one possibly executable order and one latest desired quote. Changing a live quote requests cancellation. A replacement is posted only after the old order's terminal confirmation. Further changes during the cancellation coalesce into the latest desired quote. The replacement gets a new ID and joins the back of the external queue observed when it arrives. Engine portfolio identity includes the market, so a later session cannot reinterpret an old market's order or tokens.
 
 Venue arrival and notification delivery are distinct events. The emulator independently configures post arrival, cancel arrival, acknowledgement, fill notification and timeout delays. Post-only crossing is checked against the book when the post reaches the venue. The venue can fill an accepted order before the client receives its post acknowledgement and while cancellation travels.
 
@@ -33,6 +35,24 @@ New external depth joins behind existing own orders. Reducing external depth con
 The core accepts up to 64 active slots (default 16), retains at most 2,048 orders, and prunes only terminal historical orders. The venue retains at most 2,048 orders, 8,192 pending events, 256 recent audit entries, 32 injected faults and 256 external levels per outcome. An advance call has a bounded event processing budget. Time must move forward; it may advance across a long idle interval without inventing elapsed trading events. Capacity exhaustion latches a fault and prevents new posts; reservations remain visible.
 
 `PaperSession` derives `Clone`, `Serialize` and `Deserialize`. Restore must call `validate()` before use. Recovery includes original IDs, desired successors, reserved amounts, cumulative fills, venue queues, pending delayed events and injected faults. Serialization is intended for the engine's journal/replay boundary, not the live strategy hot path. Recent audit entries are bounded diagnostics with eviction counts; the engine's durable action journal is the exact audit source.
+
+The engine wraps this single-market session in `MultiMarketPaper`. Before changing market it cancels/drains old simulated orders and checks terminality. The portfolio imports cumulative spent/inventory totals, retains unpaired positions under the old market ID and opens the new market only with remaining finite collateral. Equal Up/Down quantities can return complete-set collateral through an explicitly synthetic merge receipt. Demo-only deterministic synthetic resolution is separately labeled; public-paper rollover does not invent a winner or redemption price. The paper integration currently imports zero modeled fees; fee-aware library contracts are not historical fee evidence.
+
+Portfolio accounting bounds gross and per-market committed cost, retained unresolved markets, receipts, daily realized loss and realized-equity drawdown. It preserves old positions and blocks contradictory cumulative totals/receipt reuse. Public unresolved inventory has no invented mark-to-market value. Production settlement requires authoritative finality/provenance and a verified adapter; the deterministic library does not send on-chain operations. See [STRATEGY.md](STRATEGY.md) for exact rules, accounting inputs and bounds.
+
+The engine's active command segment rotates with a durable seal into numbered archives. Hash/sequence continuity and owner identities cover the complete retained chain. Partial data, damaged seals and missing archives refuse recovery. Startup streams bounded execution records instead of retaining the tape in actor memory. All journal, operation, command and portfolio quotas are finite; reaching a quota stops new work while preserving evidence. Backup/restore holds the appropriate engine/paper/live fences and restores only to a new path. See [OPERATIONS.md](OPERATIONS.md).
+
+## Authenticated V2 lane
+
+The live actor has independent account accounting and a separate hash-chained checkpoint ledger. Funded profiles explicitly share that account ledger/fence through `live_state_dir`, so selecting trading/both cannot reset loss/spend history or uncertain reservations. It verifies the pinned protocol, signer/funder derivation, exchange/collateral addresses, allowed market/token identity, minimum size, tick and fee bound. A prepared signed wire intent and its possible-fill commitment are durable before posting. A successful post acknowledgement must return the expected immutable order hash. Request expiry and quote freshness prevent sending an expired prepared candidate.
+
+Authenticated user-stream events request reconciliation; they do not alone establish terminality. The adapter queries known immutable IDs and validates cumulative fills/account identity. A missing open-order entry is insufficient to close an uncertain post or cancel. Cancellation responses retain uncertainty until authoritative order reconciliation, and the replacement waits for terminality. Reconciliation/heartbeat/stream freshness gate new work and Resume. A lost post acknowledgement never causes a blind repost of its signed intent after restart.
+
+Risk admission retains every possible fill and checks reconciled collateral/allowance, finite session spend, gross fee-inclusive cost, independent one-sided exposure, market/order counts and configured conservative worst-loss budget. No expected rebate replenishes cash. Cancels, account reconciliation and heartbeat have scheduling distinct from new prepares/posts; a slow signing path must not grant new quote effects or release old reserves.
+
+Owner controls and their exact IDs persist independently in the selected lanes. A lost acknowledgement must retry the same command payload/ID. The owner journal and companion/live journals do not form one atomic distributed transaction; a lane delivery or acknowledgement failure remains visible and is reconciled explicitly. Pause/Kill clear desired work and request cancellation without releasing uncertain funds. Reset returns to paused state without resetting account capital/history. Startup restores account identity and uncertainty, remains paused and reconciles before another explicit Resume.
+
+The supported path is BUY-only, non-negative-risk Up/Down token markets on the pinned V2 deployment. New protocol/signature types and settlement operations fail closed. Existing SDK/mock checks establish the local technical contract only. Current deployment acceptance, account permissions, authenticated venue behavior, funded-order timings and strategy economics remain separate gates in [ROADMAP.md](ROADMAP.md).
 
 ## Public library API
 
@@ -73,7 +93,7 @@ The CLI accepts one JSON file, capped at 2 MiB and 10,000 steps. It prints the f
 
 The shared bounded tapes cover shared queue volume, partial-fill cancellation delivery, cancel-before-replace coalescing, post-only rejection at arrival and budget clipping. The TypeScript comparison harness in `tools/reference/execution.test.ts` verifies all five against the isolated corrected reference, with acknowledgement delay set to zero and final settled account values compared. That bounded comparison is not full strategy parity. The Rust emulator additionally models independent acknowledgement delay, 429s, unknown outcomes, reconciliation, deterministic serialization and separate outcome books; these scenarios have their own Rust contract tests.
 
-The microbenchmark reports observed local timings for a two-slot deterministic quote-reconciliation call, including input cloning and clock measurement. It runs no network, disk or console. Its output cannot establish end-to-end order latency, regional placement or an exchange fill SLA. Those require measurement with the eventual validated gateway and host.
+The microbenchmark reports observed local timings for unchanged desired quotes after the two existing slots are Live, including input cloning and clock measurement. It does not create/post/cancel an order each iteration and runs no network, disk or console. Its output cannot establish full lifecycle latency, regional placement or an exchange fill SLA. Engine core/strategy CPU metrics and live mock prepare/post/cancel probes retain their stated scope. Authenticated venue end-to-end tails require the actual validated account and selected host.
 
 ## Synthetic delay sensitivity
 

@@ -1,0 +1,15 @@
+mode = "simulation"
+feed_source = "public"
+listen = "0.0.0.0:8088"
+allow_remote_http = true
+state_dir = "/data/simulation"
+journal_max_bytes = 8388608
+command_capacity = 32
+feed_capacity = 256
+
+[limits]
+initial_collateral_usd = "100"
+max_imbalance_shares = "10"
+lot_shares = "5"
+half_width = "0.01"
+max_feed_age_ms = 1000

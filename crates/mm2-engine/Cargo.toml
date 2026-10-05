@@ -8,6 +8,9 @@ publish = false
 [dependencies]
 mm2-core = { path = "../mm2-core" }
 mm2-emulator = { path = "../mm2-emulator" }
+mm2-live = { path = "../mm2-live" }
+mm2-strategy = { path = "../mm2-strategy" }
+mm2-portfolio = { path = "../mm2-portfolio" }
 axum = { version = "0.8", features = ["json", "http1", "tokio"] }
 base64 = "0.22"
 fs2 = "0.4"
@@ -30,4 +33,5 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3"

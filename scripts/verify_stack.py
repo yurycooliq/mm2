@@ -53,6 +53,16 @@ def wait_for(predicate, seconds=30):
         time.sleep(0.1)
     raise AssertionError('bounded wait expired')
 
+def paper_evidence(value):
+    """Execution evidence survives rollover; current-window counters do not."""
+    portfolio = value['paper_portfolio']
+    assert portfolio['positions_truncated'] == 0
+    assert int(portfolio['initial_cash_pico']) + int(portfolio['returned_pico']) == int(portfolio['cash_pico']) + int(portfolio['spent_pico'])
+    executions = {position['market']['id']: tuple(position[field] for field in
+                  ('market', 'execution_spent_pico', 'execution_up_micros', 'execution_down_micros', 'execution_fee_pico'))
+                  for position in portfolio['positions']}
+    return int(portfolio['spent_pico']), portfolio['initial_cash_pico'], executions
+
 def main():
     owner = uuid.uuid4().hex
     label = 'mm2.verification'
@@ -63,6 +73,21 @@ def main():
     started = time.monotonic()
     def passed(name): checks.append(name); print('PASS ' + name, flush=True)
     try:
+        for profile in ('demo', 'simulation', 'public', 'trading', 'both'):
+            docker('run', '--rm', '--network', 'none', '--read-only', '--label', label + '=' + owner,
+                   '--mount', 'type=bind,source=' + str(ROOT / 'config' / (profile + '.toml')) + ',target=/app/config.toml,readonly',
+                   'mm2-engine:local', '--config', '/app/config.toml', '--check')
+        passed('all five packaged startup profiles parse in the production binary')
+        for profile in ('trading', 'both'):
+            refusal = subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
+                                      '--label', label + '=' + owner,
+                                      '--tmpfs', '/data:rw,noexec,nosuid,size=16m,uid=10001,gid=10001',
+                                      '--env', 'MM2_ENGINE_API_TOKEN=' + engine_token,
+                                      '--mount', 'type=bind,source=' + str(ROOT / 'config' / (profile + '.toml')) + ',target=/app/config.toml,readonly',
+                                      'mm2-engine:local'], capture_output=True, text=True, timeout=30)
+            assert refusal.returncode != 0
+            assert 'explicit live owner authorization is missing' in refusal.stdout + refusal.stderr
+        passed('blank funded profiles refuse activation offline before credential loading')
         network = docker('network', 'create', '--label', label + '=' + owner, prefix)
         resources.append(('network', network))
         for suffix in ('engine-data', 'console-data'):
@@ -134,21 +159,18 @@ def main():
         assert ack['receipt'] == retry['receipt']
         request(console_base, '/api/control', payload={**command, 'action': 'kill'}, cookie=cookie, origin=origin, expected=409)
         passed('durable owner command retry and changed-payload conflict')
-        filled = wait_for(lambda: (value := state())['simulation']['venue_stats']['simulated_filled_micros'] > 0
-                          and value['simulation']['account']['spent_pico'] != '0' and value)
-        before_fills = filled['simulation']['venue_stats']['simulated_filled_micros']
-        assert filled['simulation']['account']['spent_pico'] != '0'
+        filled = wait_for(lambda: paper_evidence(value := state())[0] > 0 and value)
+        before_spent = paper_evidence(filled)[0]
         passed('emulated post, queue and delivered fill accounting')
         docker('stop', '--time', '5', console)
-        independent = wait_for(lambda: (value := state())['simulation']['venue_stats']['simulated_filled_micros'] > before_fills and value, 20)
+        independent = wait_for(lambda: paper_evidence(value := state())[0] > before_spent and value, 20)
         assert independent['mode'] == 'shadow'
         passed('engine continues when console and statistics storage are stopped')
         kill_request = {'id': uuid.uuid4().hex, 'expected_version': state()['command_version'], 'action': 'kill'}
         kill = request(engine_base, '/v1/control', engine_token, kill_request)[0]
         assert kill['state']['mode'] == 'killed'
         settled = wait_for(lambda: (value := state())['simulation']['pending_events'] == 0 and value)
-        inventory = (settled['simulation']['account']['up_inventory_micros'], settled['simulation']['account']['down_inventory_micros'])
-        spent = settled['simulation']['account']['spent_pico']
+        spent, initial, executions = paper_evidence(settled)
         docker('kill', engine)
         docker('start', engine)
         # Docker may assign a new ephemeral host port when the container restarts.
@@ -156,8 +178,9 @@ def main():
         engine_base = 'http://127.0.0.1:' + restarted_info['NetworkSettings']['Ports']['8088/tcp'][0]['HostPort']
         recovered = wait_for(lambda: (value := state()).get('api_ready') and value['boot_id'] != settled['boot_id'] and value)
         assert recovered['mode'] == 'killed'
-        assert (recovered['simulation']['account']['up_inventory_micros'], recovered['simulation']['account']['down_inventory_micros']) == inventory
-        assert recovered['simulation']['account']['spent_pico'] == spent
+        recovered_spent, recovered_initial, recovered_executions = paper_evidence(recovered)
+        assert (recovered_spent, recovered_initial) == (spent, initial)
+        assert all(recovered_executions.get(market) == evidence for market, evidence in executions.items())
         assert request(engine_base, '/v1/control', engine_token, kill_request)[0]['receipt'] == kill['receipt']
         passed('abrupt restart recovers simulation ledger, kill latch and receipts')
         fence = docker('run', '--detach', '--label', label + '=' + owner, '--env', 'MM2_ENGINE_API_TOKEN=' + engine_token,

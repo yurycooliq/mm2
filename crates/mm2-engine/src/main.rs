@@ -51,20 +51,94 @@ async fn run() -> Result<(), String> {
         }
         return Err("health HTTP failed".into());
     }
-    if args.len() != 2 || args[0] != "--config" {
-        return Err("usage: mm2-engine --config config/demo.toml".into());
+    let mut config_path = PathBuf::from("/app/config.toml");
+    let mut startup_mode = None;
+    let mut check_only = false;
+    let mut arguments = args.iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => config_path = PathBuf::from(arguments.next().ok_or("--config requires a path")?),
+            "--mode" => startup_mode = Some(arguments.next().ok_or("--mode requires simulation, trading, both or shadow")?.clone()),
+            "--check" => check_only = true,
+            _ => return Err("usage: mm2-engine --config <path> [--mode simulation|trading|both|shadow|emulator] [--check]".into()),
+        }
     }
-    let config = Config::load(&PathBuf::from(&args[1]))?;
+    let mut config = Config::load(&config_path)?;
+    if let Some(mode) = startup_mode {
+        config.mode = mode;
+        config.validate()?;
+    }
+    if check_only {
+        tracing::info!(mode=%config.mode,"configuration parsed; credentials, venue and selected host are not verified");
+        return Ok(());
+    }
     let auth = Auth::from_env()?;
     let start = Instant::now();
+    let (source_feed_tx, source_feed_rx) =
+        mpsc::channel::<mm2_engine::domain::FeedEvent>(config.feed_capacity);
     let (feed_tx, feed_rx) = mpsc::channel(config.feed_capacity);
     let (fault_tx, fault_rx) = watch::channel(None);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (handle, actor) = runtime::prepare(&config, start, feed_rx, fault_rx, shutdown_rx.clone())?;
+    let (mut handle, mut actor) =
+        runtime::prepare(&config, start, feed_rx, fault_rx, shutdown_rx.clone())?;
+    let mut paper_task = None;
+    let mut paper_feed = None;
+    if config.mode == "both" {
+        let mut paper_config = config.clone();
+        paper_config.mode = "simulation".into();
+        paper_config.live = None;
+        paper_config.live_state_dir = None;
+        paper_config.state_dir = config.state_dir.join("paper");
+        let (paper_tx, paper_rx) = mpsc::channel(config.feed_capacity);
+        let (paper_fault_tx, paper_fault_rx) = watch::channel(None);
+        let (paper_handle, paper_actor) = runtime::prepare(
+            &paper_config,
+            start,
+            paper_rx,
+            paper_fault_rx,
+            shutdown_rx.clone(),
+        )?;
+        handle.attach_paper(paper_handle.clone(), paper_fault_tx.clone());
+        actor.attach_paper(paper_handle, paper_fault_tx.clone());
+        paper_feed = Some((paper_tx, paper_fault_tx));
+        paper_task = Some(tokio::spawn(paper_actor.run()));
+    }
+    if let Some(settings) = &config.live {
+        let live = mm2_live::LiveRuntime::start(
+            settings.clone(),
+            config
+                .live_state_dir
+                .clone()
+                .ok_or("missing live account ledger location")?,
+        )
+        .await?;
+        actor.attach_live(live);
+    }
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|_| "cannot bind HTTP listener")?;
     let mut actor_task = tokio::spawn(actor.run());
+    let mut relay_shutdown = shutdown_rx.clone();
+    let mut relay_task = tokio::spawn(async move {
+        let mut input = source_feed_rx;
+        loop {
+            tokio::select! {
+                biased;
+                _=relay_shutdown.changed()=>break,
+                event=input.recv()=>match event {
+                    Some(event)=>{
+                        // Only the primary execution lane can backpressure the source.
+                        if let Some((sender,fault))=&paper_feed
+                            && sender.try_send(event.clone()).is_err() {
+                                fault.send_replace(Some("parallel simulation lost a feed event; rebuild its source state".into()));
+                        }
+                        if feed_tx.send(event).await.is_err() { break; }
+                    },
+                    None=>break,
+                }
+            }
+        }
+    });
     let source_handle = handle.clone();
     let source_fault = fault_tx.clone();
     let source_shutdown = shutdown_rx.clone();
@@ -73,7 +147,7 @@ async fn run() -> Result<(), String> {
             config.feed_source,
             start,
             source_handle,
-            feed_tx,
+            source_feed_tx,
             source_fault.clone(),
             source_shutdown.clone(),
         )
@@ -95,7 +169,7 @@ async fn run() -> Result<(), String> {
             })
             .await
     });
-    tracing::info!("mm2 engine started; live order gateway is deliberately absent");
+    tracing::info!("mm2 engine started paused; execution profile selected at startup");
     let mut actor_done = false;
     let mut source_done = false;
     let mut server_done = false;
@@ -107,7 +181,7 @@ async fn run() -> Result<(), String> {
     };
     shutdown_tx.send_replace(true);
     // The outer deadline also bounds a stalled disk worker; process exit releases its OS fence.
-    let drained = tokio::time::timeout(Duration::from_secs(7), async {
+    let drained = tokio::time::timeout(Duration::from_secs(25), async {
         if !actor_done {
             let _ = (&mut actor_task).await;
         }
@@ -117,12 +191,20 @@ async fn run() -> Result<(), String> {
         if !server_done {
             let _ = (&mut server_task).await;
         }
+        let _ = (&mut relay_task).await;
+        if let Some(paper) = &mut paper_task {
+            let _ = paper.await;
+        }
     })
     .await;
     if drained.is_err() {
         actor_task.abort();
         source_task.abort();
         server_task.abort();
+        relay_task.abort();
+        if let Some(paper) = paper_task {
+            paper.abort();
+        }
         return Err("shutdown deadline exceeded".into());
     }
     tracing::info!("mm2 engine stopped; acknowledged actions are durable");

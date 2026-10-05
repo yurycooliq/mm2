@@ -1,0 +1,44 @@
+[
+  {
+    "name": "source-v1-fresh-paired-quotes",
+    "rules": {"lot_full_micros":502000000,"shrink_ppm":950000,"max_imbalance_micros":2000000000},
+    "input": {},
+    "expected": [["up:lot","up",550000,502000000],["down:lot","down",360000,502000000]],
+    "reason": "quote"
+  },
+  {
+    "name": "source-v1-inventory-hedge",
+    "rules": {"lot_full_micros":502000000,"shrink_ppm":950000,"max_imbalance_micros":2000000000},
+    "input": {"inventory_down_micros":322780000},
+    "expected": [["up:hedge","up",550000,322780000],["up:lot","up",550000,502000000],["down:lot","down",360000,502000000]],
+    "reason": "quote"
+  },
+  {
+    "name": "small-capital-book-only-candidate",
+    "rules": {},
+    "input": {},
+    "expected": [["up:lot","up",560000,10000000],["down:lot","down",350000,10000000]],
+    "reason": "quote"
+  },
+  {
+    "name": "actual-down-book-passive-bound",
+    "rules": {"half_width_micros":0,"shrink_ppm":1000000},
+    "input": {"down":{"bid_micros":310000,"ask_micros":320000,"received_ms":54000000}},
+    "expected": [["up:lot","up",600000,10000000],["down:lot","down",310000,10000000]],
+    "reason": "quote"
+  },
+  {
+    "name": "stale-down-cancels-all-stubs-too",
+    "rules": {"stub_price_micros":10000},
+    "input": {"down":{"bid_micros":390000,"ask_micros":400000,"received_ms":53998999}},
+    "expected": [],
+    "reason": "stale_book"
+  },
+  {
+    "name": "under-minimum-capital",
+    "rules": {},
+    "input": {"available_cash_micros":1000000},
+    "expected": [],
+    "reason": "insufficient_capital"
+  }
+]

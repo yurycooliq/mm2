@@ -2,31 +2,63 @@
 
 ```mermaid
 flowchart LR
-  F[Demo or public feed adapters] --> C[Validated book-only decision core]
-  C --> E[Exact order and risk core]
-  E --> M[Deterministic emulator]
-  M --> E
-  E --> J[Durable execution and owner journal]
+  F[Demo or public feed adapters] --> C[Identity and freshness validation]
+  C --> R[Deterministic strategy rules]
+  R --> X[Selected execution lanes]
+  X --> P[Paper lifecycle and market portfolio]
+  P --> M[Deterministic venue approximation]
+  M --> P
+  P --> J[Segmented paper and owner journal]
+  X --> L[Live account lifecycle and risk]
+  L --> LJ[Durable live intent and checkpoints]
+  L --> SDK[Pinned V2 SDK adapter]
+  SDK --> V[Authenticated venue]
+  V --> SDK
+  SDK --> L
   C --> S[Bounded snapshot copy]
-  E --> S
+  P --> S
+  L --> S
   S --> W[One-slot formatting worker]
   W --> A[Private owner API]
-  A --> P[Console single sampler]
-  P --> D[Secondary SQLite]
-  P --> U[Mini App]
-  T[Telegram bot] --> P
-  U --> P
-  P --> A
+  A --> O[Console single sampler]
+  O --> D[Secondary SQLite]
+  O --> U[Mini App]
+  T[Telegram bot] --> O
+  U --> O
+  O --> A
+  A --> X
 ```
 
-The deterministic core uses bounded maps, immutable IDs, exact cash and shares, and explicit transitions. Rust's type/runtime choices alone do not establish an execution latency target. The public feed core and emulator order core have distinct responsibilities: the former validates freshness and proposes quotes; the latter tracks accepted orders, commitments, partial fills and transport outcomes.
+## Domains and startup
 
-One actor admits owner operations and simulation transactions. A complete candidate transaction is evaluated first, durably appended with a hash chain, then adopted. Owner command identity and associated cancels/limits are one durable record, so a lost HTTP response can be reconciled using the same command. Recovery rejects damaged/partial records and replays accepted inputs before quoting. It starts paused, settles cancellations and preserves the kill latch and known simulated account state.
+`mm2-core`, `mm2-strategy` and `mm2-portfolio` are deterministic libraries. They consume caller-supplied time, immutable market/order identity, exact prices and execution evidence. They have no network, wall-clock, persistence, dashboard or Telegram dependency. The strategy produces bounded desired slots; it does not release reservations or claim queue priority. Portfolio receipts model financial lifecycle, not blockchain dispatch.
 
-Disk durability is a primary execution dependency. Statistics, historical reporting, Telegram calls and UI delivery are secondary. The exact execution journal cannot be discarded on a full queue; a persistence fault stops new work. Secondary observations can be coalesced or dropped and expose that fact. No console failure changes engine risk limits or replenishes the simulated budget.
+The engine's public-book core verifies both outcome identities, freshness, timestamps and stream state. The actor applies the selected rules and owns paper recovery/control state. `simulation` executes locally from public observations; `shadow` proposes without simulated orders; `emulator` uses demo observations. `trading` attaches one live-account actor. `both` also attaches an independent paper actor fed through bounded channels. Both lanes retain separate capital, state and journals; a paper fill never becomes an authenticated account fill.
 
-Periodic full-state JSON formatting and percentile sorting run in a background worker, with at most one outstanding task. Snapshot copy on the actor remains bounded and measured. Immediate owner/fault/source transitions may publish current state synchronously for precise acknowledgement. The private HTTP API consumes watch snapshots, rather than requesting work from the actor for every reader. CPU contention and bounded copying still have nonzero cost; selected-host tests must quantify their tails.
+Every profile starts paused. The persisted execution profile binds mode/feed source and configured account-ledger location to its state directory. Live account identity binds the signer/funder, signature type, network/protocol and deployment contract tuple; validated risk/capacity policy can change without replacing that identity. Funded profiles require an explicit shared `live_state_dir`; packaged trading/both use `/data/account-live`. Switching those profiles preserves the account journal, spend/loss history and one local account fence. Startup selection cannot reinterpret an existing ledger or replenish cash. A direct unconfigured Compose start defaults to demo; the startup wrapper defaults to public simulation. Live templates contain no configured account or activation permission.
 
-The console samples once per approximately one second, maintains a cached state envelope, and serves browser readers from that cache. It holds its own bounded SQLite history, sessions, logs and ingress queues. Docker gives it a separate persistent volume, 0.25 CPU and 128 MiB limit. The engine has 1 CPU and 512 MiB by default. These are local starting limits, not host sizing evidence. The engine token stays between console and engine; owner sessions and Telegram signatures authenticate frontend commands.
+## Primary persistence and recovery
 
-The filesystem fence applies only to processes sharing the same local state directory. The repository does not implement cross-host lease/fencing or active/active execution. Its active simulation contract is one market's Up/Down buy orders. Real SDK gateway, funded account reconciliation, fees, sells, settlement and multi-market inventory remain explicit later work.
+A paper transaction is evaluated against a candidate session, durably appended, then adopted. Owner CAS identity/receipt and associated paper cancels/limits share one durable record, so a lost HTTP response can reuse the same request. The command/execution chain spans sealed archives and the active segment. A synced seal records rotation intent before rename; recovery completes the last matching interrupted rotation or refuses damaged/missing evidence. Execution replay reads bounded records instead of building an unbounded tape in RAM.
+
+`MultiMarketPaper` wraps the current deterministic session and a finite, market-keyed portfolio. Rollover drains/cancels old simulated orders before opening another market. Old unpaired positions stay attached to their original identity. Pair merge and demo resolution use explicitly synthetic accounting receipts; public-paper unresolved positions receive no invented winning outcome or valuation. Recovery validates current-session totals against retained portfolio totals and preserves cash, reservations and IDs.
+
+The live actor serializes account effects through its shared account ledger and fence, independently of the mode-specific owner/paper directories. A signed wire intent and its possible-fill commitment are synced before authenticated posting. Post/cancel responses with unknown outcomes keep reservations. User-stream events trigger authoritative account/order queries rather than directly releasing funds. Restart never resends an old signed post blindly: it restores identities/uncertainty, stays paused, cancels/reconciles known orders and requires fresh account/stream/heartbeat state before Resume.
+
+Owner control identity is forwarded consistently across selected lanes. Each lane has its own durable acknowledgement; there is no distributed atomic transaction across the owner, paper and live journals. Unknown acknowledgement requires the same request identity. Bounded delivery/recovery faults must remain visible rather than inventing success.
+
+Disk durability is a primary execution dependency. All journals, owner receipt collections, market identities, operations and event queues have finite quotas. Rotation retains evidence and increases usable active-file longevity; it does not compact/delete old identity or permit infinite runtime. Capacity or persistence failure stops new work with commitments intact. Offline backup/restore fences the parent, companion paper and live state; restore uses a new destination and preserves originals. See [OPERATIONS.md](OPERATIONS.md).
+
+## Limited technical trading adapter
+
+`mm2-live` pins SDK V2 0.7.0, Polygon deployment, token-order schema, supported signature/funder derivation and market allowlist. It checks authenticated market/token/tick/minimum/fee data, signs BUY-only post-only orders, schedules cancels separately from new prepares/posts, sends heartbeat and reconciles orders/positions/collateral. Quote freshness and network operations have bounded deadlines. The live risk actor admits against collateral/allowance, retained commitments, gross cost, one-sided possible fills, allowed markets and configured worst-loss budgets.
+
+The implemented SDK path is validated in controlled mocks. V3 position protocol, deposit-wallet EIP-1271, sells and on-chain merge/redemption are rejected/unsupported. A chosen host and funded account still require current protocol/eligibility/endpoint acceptance. A compiler or mock test cannot verify a deployed exchange or establish strategy profitability.
+
+## Secondary observation
+
+Periodic state formatting and percentile sorting run in a background worker with at most one outstanding task. Bounded snapshot copy remains on the actor and is measured. Owner/fault/source transitions may publish immediately for acknowledgement precision. Private HTTP readers consume watch snapshots rather than requesting a fresh decision from the actor. Decision CPU timing, loopback API probe timing, durability and exchange post/cancel latency retain separate scopes. None is a zero-overhead claim.
+
+The console samples approximately once per second and serves browser readers from its cached envelope. It owns bounded SQLite history, sessions, logs and ingress. Docker separates its persistent volume, CPU and memory from the engine. The engine token stays between console and engine; owner sessions and signed Telegram initData authenticate frontend commands. Engine risk/identity/accounting must continue independently of console, SQLite and Telegram.
+
+Filesystem fences apply to one local lock/filesystem domain. Cross-host leases, active/active account execution and HA failover are outside this package. Container resource limits are local starting bounds; selected-host soak, alerts, HTTPS and latency measurements establish deployment suitability separately.

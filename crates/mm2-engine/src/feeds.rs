@@ -487,17 +487,35 @@ fn clob_member(
                 .unwrap_or_default())
         }
         "last_trade_price" => {
-            token_outcome(string(value, "asset_id")?, &identity, market)?;
-            price_field(value, "price")?;
-            if micro_field(value, "size")? == 0 {
+            let outcome = token_outcome(string(value, "asset_id")?, &identity, market)?;
+            let price_micro = price_field(value, "price")?;
+            let quantity_micro = micro_field(value, "size")?;
+            if quantity_micro == 0 {
                 return Err("zero trade quantity".into());
             }
-            side(value)?;
+            let trade_side = side(value)?;
             if value.contains_key("fee_rate_bps") {
                 unsigned_string(string(value, "fee_rate_bps")?)?;
             }
-            // A public trade is evidence of activity, never evidence that our proposal filled.
-            Ok(Vec::new())
+            // No native unique trade ID is supplied. Equal witnesses are deduplicated
+            // conservatively in the paper lane; they never update the real account.
+            use sha2::{Digest, Sha256};
+            let fingerprint = hex::encode(Sha256::digest(
+                serde_json::to_vec(value).map_err(|_| "cannot fingerprint public trade")?,
+            ));
+            Ok(outcome
+                .filter(|_| trade_side == BookSide::Ask)
+                .map_or_else(Vec::new, |outcome| {
+                    vec![FeedEvent::Trade {
+                        condition_id: identity,
+                        outcome,
+                        exchange_ms,
+                        observed_mono_ms,
+                        price_micro,
+                        quantity_micro,
+                        fingerprint,
+                    }]
+                }))
         }
         "best_bid_ask" => {
             token_outcome(string(value, "asset_id")?, &identity, market)?;

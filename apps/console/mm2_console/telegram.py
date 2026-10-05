@@ -5,6 +5,7 @@ import time
 from urllib.request import build_opener, HTTPSHandler, Request
 
 from .engine import NoRedirect, redact
+from .observability import execution_summary
 
 
 class TelegramTransport:
@@ -49,8 +50,40 @@ class TelegramBot:
         envelope = self.app.state()
         state = envelope["state"]
         if not state:
-            return "Engine unavailable; no state sampled. Live execution disabled."
-        return f"Engine {state.get('mode', 'unknown')} | {state.get('execution_mode', 'unknown')}\nConnected: {envelope['connected']} | feeds ready: {state.get('feed_ready', False)}\nVersion: {state.get('command_version')} | live disabled\nBalances are simulated in emulator; real account funds are unknown."
+            return "Engine unavailable; no state sampled. Execution profile and balances are unknown."
+        summary = envelope.get("execution") or execution_summary(state, envelope["connected"])
+        real, paper, journal = summary["real"], summary["paper"], summary["journal"]
+        lines = [f"Engine {state.get('mode', 'unknown')} | profile {summary['profile']}",
+                 f"Fresh sample: {envelope['connected']} | feeds ready: {state.get('feed_ready', False)}",
+                 f"Version: {state.get('command_version')}"]
+        if not envelope["connected"]:
+            lines.append("STALE: cached state; current execution and balances are unverified.")
+        if real["selected"]:
+            lines.append(f"REAL trading: {real['phase'] or 'unavailable'} | reconciled: {real['account_reconciled']} | user stream: {real['user_stream_connected']}")
+            if real["balances_known"]:
+                lines.append(f"REAL funds USD: collateral {real['collateral_usd']} | available {real['available_usd']} | reserved {real['reserved_usd'] or 'unknown'}")
+            else:
+                lines.append("REAL funds USD: unknown until fresh account reconciliation.")
+            if real["daily_loss_bound_usd"] is not None:
+                label = "conservative gross purchase loss bound" if real["daily_loss_metric"] == "conservative_gross_purchase_loss_bound" else "risk bound (metric unverified)"
+                lines.append(f"Daily risk USD: {real['daily_loss_bound_usd']} | {label}")
+        else:
+            lines.append("Real trading is not selected in this startup profile.")
+        if paper["selected"]:
+            lines.append(f"VIRTUAL simulation: {paper['phase'] or 'unknown'}{' | cached' if paper['last_sample_only'] else ''}")
+            lines.append(f"VIRTUAL funds USD: global cash {paper['cash_usd'] or 'unknown'} | current market available {paper['available_usd'] or 'unknown'} | reserved {paper['reserved_usd'] or 'unknown'}")
+        lines.append("Economic PnL: unknown.")
+        if journal["used_bytes"] is not None:
+            lines.append(f"Engine journal: {journal['used_bytes']} / {journal['limit_bytes'] if journal['limit_bytes'] is not None else 'unknown'} bytes | {journal['stage']}")
+        for label, item in (("Live journal", real["journal"]), ("Paper journal", paper["journal"])):
+            if item["used_bytes"] is not None:
+                lines.append(f"{label}: {item['used_bytes']} / {item['limit_bytes'] if item['limit_bytes'] is not None else 'unknown'} bytes | {item['stage']}")
+        if real["prepare_error"]:
+            lines.append("Live preparation: " + real["prepare_error"])
+        for label, fault in (("Engine error", summary["engine_fault"]), ("Live error", real["fault"]), ("Paper error", paper["fault"])):
+            if fault:
+                lines.append(f"{label}: {fault}")
+        return redact("\n".join(lines)[:3500], self.app.config.secret_values)
 
     def handle_update(self, update):
         if not self.enabled:

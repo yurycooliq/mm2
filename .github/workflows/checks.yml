@@ -16,7 +16,7 @@ jobs:
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace
+      - run: cargo test --locked --workspace -- --test-threads=2
       - run: cargo build --locked --workspace --release
   python:
     runs-on: ubuntu-latest
@@ -29,6 +29,13 @@ jobs:
       - run: python -B -m unittest discover -s apps/console/tests -p 'test_*.py'
       - run: python -B -m unittest discover -s tools/data -p 'test_*.py'
       - run: python -B -m unittest discover -s tools/latency -p 'test_*.py'
+      - run: python -B -m unittest discover -s scripts -p 'test_*.py'
+  strategy-parity:
+    runs-on: ubuntu-latest
+    container: node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: node --experimental-transform-types --test crates/mm2-strategy/tests/parity.test.ts
   frontend:
     runs-on: ubuntu-latest
     container: node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c

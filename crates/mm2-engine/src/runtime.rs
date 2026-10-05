@@ -44,6 +44,7 @@ impl Failure {
 type Reply = Result<Value, Failure>;
 enum Operation {
     Command(Command, oneshot::Sender<Reply>),
+    Mirror(Command),
     Market(Market, oneshot::Sender<Result<(), String>>),
     SourceStatus(&'static str, Option<String>, Option<u64>),
 }
@@ -52,6 +53,8 @@ enum Operation {
 pub struct Handle {
     tx: mpsc::Sender<Operation>,
     pub state: watch::Receiver<Arc<Value>>,
+    paper: Option<Box<Handle>>,
+    paper_fault: Option<watch::Sender<Option<String>>>,
 }
 impl Handle {
     pub fn source_status(
@@ -85,6 +88,17 @@ impl Handle {
             })?
     }
     pub async fn select_market(&self, market: Market) -> Result<(), String> {
+        if let Some(paper) = &self.paper {
+            let (reply, _) = oneshot::channel();
+            if paper
+                .tx
+                .try_send(Operation::Market(market.clone(), reply))
+                .is_err()
+                && let Some(fault) = &self.paper_fault
+            {
+                fault.send_replace(Some("parallel simulation missed market selection".into()));
+            }
+        }
         let (tx, rx) = oneshot::channel();
         self.tx
             .try_send(Operation::Market(market, tx))
@@ -93,6 +107,11 @@ impl Handle {
             .await
             .map_err(|_| "market selection timed out")?
             .map_err(|_| "market actor stopped")?
+    }
+
+    pub fn attach_paper(&mut self, paper: Handle, fault: watch::Sender<Option<String>>) {
+        self.paper = Some(Box::new(paper));
+        self.paper_fault = Some(fault);
     }
 }
 
@@ -123,7 +142,7 @@ pub struct Actor {
     observation_barrier: Option<u64>,
     source_status: Value,
     awaiting_source_refresh: bool,
-    simulation: Option<mm2_emulator::PaperSession>,
+    simulation: Option<simulation::MultiMarketPaper>,
     simulation_origin_ms: u64,
     simulation_last_trade_ms: u64,
     simulation_error: Option<String>,
@@ -135,6 +154,15 @@ pub struct Actor {
     publication_gate: Arc<tokio::sync::Semaphore>,
     publication_task: Option<tokio::task::JoinHandle<()>>,
     simulation_condition: Option<String>,
+    execution_mode: String,
+    strategy: mm2_strategy::Rules,
+    desired_quotes: Vec<mm2_core::DesiredQuote>,
+    strategy_gate: Option<mm2_strategy::Gate>,
+    live: Option<mm2_live::LiveHandle>,
+    live_quotes: Vec<mm2_core::DesiredQuote>,
+    paper: Option<Handle>,
+    paper_error: Option<String>,
+    paper_fault: Option<watch::Sender<Option<String>>>,
 }
 
 struct Publication {
@@ -163,6 +191,14 @@ struct Publication {
     publication_duration_ns: u64,
     execution_noop_ticks: u64,
     simulation_condition: Option<String>,
+    execution_mode: String,
+    desired_quotes: Vec<mm2_core::DesiredQuote>,
+    strategy_gate: Option<mm2_strategy::Gate>,
+    live: Option<Arc<mm2_live::LiveSnapshot>>,
+    journal_metrics: Option<crate::journal::JournalMetrics>,
+    paper_portfolio: Option<mm2_portfolio::Snapshot>,
+    paper: Option<Arc<Value>>,
+    paper_error: Option<String>,
 }
 
 pub fn prepare(
@@ -173,11 +209,20 @@ pub fn prepare(
     shutdown: watch::Receiver<bool>,
 ) -> Result<(Handle, Actor), String> {
     config.validate()?;
-    let mut journal = Journal::open(
-        &config.state_dir,
-        config.journal_max_bytes,
-        config.limits.canonical()?,
-    )?;
+    let options = config
+        .journal
+        .clone()
+        .unwrap_or(crate::journal::JournalOptions {
+            segment_max_bytes: config.journal_max_bytes,
+            total_max_bytes: config
+                .journal_max_bytes
+                .saturating_mul(16)
+                .min(1_073_741_824),
+            ..Default::default()
+        });
+    let mut journal =
+        Journal::open_streaming(&config.state_dir, options, config.limits.canonical()?)?;
+    config.bind_profile()?;
     let mut limits = journal.bootstrap().clone();
     let mut core = Core::new(limits.core()?)?;
     // Only complete durable records are recovered; a response may have been lost after sync.
@@ -186,25 +231,28 @@ pub fn prepare(
         apply_command(&mut core, &mut limits, command)?;
     }
     core.control(Action::Pause)?; // Pause preserves the durable Kill latch.
-    let mut simulation = if config.mode == "emulator" {
+    let mut simulation = if config.simulates() && config.mode != "both" {
         Some(simulation::new(journal.bootstrap())?)
     } else {
         None
     };
-    if simulation.is_none() && !journal.execution().is_empty() {
+    if simulation.is_none() && journal.metrics().execution_operations != 0 {
         return Err(
             "state directory contains emulator history; use its emulator configuration".into(),
         );
     }
     let mut simulation_origin_ms = 0;
-    let simulation_condition = journal
-        .execution()
-        .iter()
-        .rev()
-        .find(|entry| entry["kind"] == "market")
-        .and_then(|entry| entry["condition_id"].as_str().map(str::to_owned));
+    let mut simulation_condition = None;
     if let Some(session) = &mut simulation {
-        simulation::replay(session, journal.execution())?;
+        journal.visit_execution(|entries| {
+            simulation::replay(session, entries)?;
+            for entry in entries {
+                if entry["kind"] == "market" {
+                    simulation_condition = entry["condition_id"].as_str().map(str::to_owned);
+                }
+            }
+            Ok(())
+        })?;
         let before_recovery = session.clone();
         let now = session.snapshot().now_ms;
         // Venue state is local and deterministic. Recover in-flight events, cancel all,
@@ -224,6 +272,7 @@ pub fn prepare(
         simulation_origin_ms = session.snapshot().now_ms;
     }
     let last_decision = core.evaluate(wall_ms(), mono_ms(start));
+    journal.release_replay_buffer();
     let (tx, commands) = mpsc::channel(config.command_capacity);
     let (state, state_rx) = watch::channel(Arc::new(json!({"api_ready":false})));
     let mut actor = Actor {
@@ -268,12 +317,23 @@ pub fn prepare(
         publication_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         publication_task: None,
         simulation_condition,
+        execution_mode: config.mode.clone(),
+        strategy: config.strategy.clone(),
+        desired_quotes: Vec::new(),
+        strategy_gate: None,
+        live: None,
+        live_quotes: Vec::new(),
+        paper: None,
+        paper_error: None,
+        paper_fault: None,
     };
     actor.publish();
     Ok((
         Handle {
             tx,
             state: state_rx,
+            paper: None,
+            paper_fault: None,
         },
         actor,
     ))
@@ -297,9 +357,147 @@ fn apply_command(core: &mut Core, limits: &mut Limits, command: &Command) -> Res
 }
 
 impl Actor {
+    fn mirror_paper(&mut self, command: Command) {
+        if let Some(paper) = &self.paper
+            && paper.tx.try_send(Operation::Mirror(command)).is_err()
+        {
+            self.paper_error = Some(
+                "parallel simulation control queue unavailable; inspect its independent state"
+                    .into(),
+            );
+            if let Some(fault) = &self.paper_fault {
+                fault.send_replace(self.paper_error.clone());
+            }
+        }
+    }
+    pub fn attach_paper(&mut self, paper: Handle, fault: watch::Sender<Option<String>>) {
+        self.paper = Some(paper);
+        self.paper_fault = Some(fault);
+        self.publish();
+    }
+    pub fn attach_live(&mut self, live: mm2_live::LiveHandle) {
+        self.live = Some(live);
+        self.publish();
+    }
+
     fn evaluate(&mut self) {
         let began = Instant::now();
-        self.last_decision = self.core.evaluate(wall_ms(), mono_ms(self.start));
+        let now = wall_ms();
+        let mono = mono_ms(self.start);
+        self.last_decision = self.core.evaluate(now, mono);
+        self.desired_quotes.clear();
+        self.live_quotes.clear();
+        self.strategy_gate = None;
+        self.last_decision.stop_reasons.retain(|reason| {
+            !matches!(
+                reason,
+                StopReason::NoLegalQuote(_) | StopReason::BudgetExceeded
+            )
+        });
+        let paper_halted = self
+            .simulation
+            .as_ref()
+            .is_some_and(|paper| paper.portfolio_halt().is_some());
+        if paper_halted {
+            self.strategy_gate = Some(mm2_strategy::Gate::InsufficientCapital);
+        }
+        if self.last_decision.stop_reasons.is_empty() && !paper_halted {
+            let snapshot = self.core.snapshot();
+            if let Some(market) = &snapshot.market {
+                let account = self.simulation.as_ref().map(|s| s.snapshot().account);
+                let mut rules = self.strategy.clone();
+                rules.half_width_micros = snapshot.config.half_width_micro;
+                rules.lot_full_micros = snapshot.config.lot_micro;
+                rules.max_imbalance_micros = snapshot.config.max_imbalance_micro;
+                rules.max_feed_age_ms = snapshot.config.max_feed_age_ms;
+                let bbo = |book: &BookSnapshot| mm2_strategy::Bbo {
+                    bid_micros: book.best_bid_micro,
+                    ask_micros: book.best_ask_micro,
+                    received_ms: now
+                        .saturating_sub(mono.saturating_sub(book.observed_mono_ms.unwrap_or(0))),
+                };
+                let input = mm2_strategy::Input {
+                    now_ms: now,
+                    market_start_ms: market.window_start_ms,
+                    market_end_ms: market.window_end_ms,
+                    up: bbo(&snapshot.up_book),
+                    down: bbo(&snapshot.down_book),
+                    inventory_up_micros: account.as_ref().map_or(0, |a| a.up_inventory_micros),
+                    inventory_down_micros: account.as_ref().map_or(0, |a| a.down_inventory_micros),
+                    // These are desired replacements. The execution ledger separately
+                    // retains all old possible fills until terminal reconciliation.
+                    reserved_up_micros: 0,
+                    reserved_down_micros: 0,
+                    available_cash_micros: account
+                        .as_ref()
+                        .map_or(snapshot.config.initial_collateral_micro, |a| {
+                            a.initial_cash_micros.saturating_sub(a.spent_micros_ceil)
+                        }),
+                    tick_micros: common_tick(
+                        snapshot.up_book.tick_micro,
+                        snapshot.down_book.tick_micro,
+                    ),
+                    min_order_micros: 5_000_000,
+                    signals: mm2_strategy::Signals::default(),
+                };
+                match mm2_strategy::decide(&rules, &input) {
+                    Ok(decision) => {
+                        self.strategy_gate = Some(decision.reason);
+                        self.desired_quotes = decision.quotes;
+                    }
+                    Err(_) => self
+                        .last_decision
+                        .stop_reasons
+                        .push(StopReason::InvalidInput),
+                }
+                if let Some(live) = &self.live {
+                    let account = live.snapshot();
+                    let inventory = |outcome| {
+                        account
+                            .positions
+                            .iter()
+                            .filter(|p| {
+                                p.condition_id == market.condition_id && p.outcome == outcome
+                            })
+                            .map(|p| p.quantity_micros)
+                            .sum()
+                    };
+                    let input = mm2_strategy::Input {
+                        inventory_up_micros: inventory(mm2_core::Outcome::Up),
+                        inventory_down_micros: inventory(mm2_core::Outcome::Down),
+                        // Existing reservations are enforced by the live gateway.
+                        available_cash_micros: account.collateral_micros,
+                        ..input
+                    };
+                    if let Ok(decision) = mm2_strategy::decide(&rules, &input) {
+                        self.strategy_gate = Some(decision.reason);
+                        self.live_quotes = decision.quotes;
+                    }
+                    self.desired_quotes = self.live_quotes.clone();
+                }
+            }
+        }
+        self.last_decision.intents = self
+            .desired_quotes
+            .iter()
+            .map(|q| crate::domain::Intent {
+                outcome: if q.outcome == mm2_core::Outcome::Up {
+                    Outcome::Up
+                } else {
+                    Outcome::Down
+                },
+                price_micro: q.price_micros,
+                quantity_micro: q.quantity_micros,
+            })
+            .collect();
+        self.last_decision.hypothetical_reservation_micro = self
+            .desired_quotes
+            .iter()
+            .map(|q| {
+                (u128::from(q.price_micros) * u128::from(q.quantity_micros)).div_ceil(1_000_000)
+                    as u64
+            })
+            .sum();
         self.decision_count = self.decision_count.saturating_add(1);
         if self.durations_ns.len() == 1024 {
             self.durations_ns.pop_front();
@@ -314,6 +512,80 @@ impl Actor {
         let _ = self.core.control(Action::Pause);
         self.evaluate();
         self.publish();
+    }
+
+    async fn live_control(&self, command: &Command) -> Result<(), String> {
+        let Some(live) = &self.live else {
+            return Ok(());
+        };
+        let action = match command {
+            Command::Control { action, .. } => match action.as_str() {
+                "pause" => mm2_live::ControlAction::Pause,
+                "resume" => mm2_live::ControlAction::Resume,
+                "kill" => mm2_live::ControlAction::Kill,
+                "reset" => mm2_live::ControlAction::Reset,
+                _ => return Err("invalid live action".into()),
+            },
+            // Limit changes cancel quotes and require a fresh explicit Resume.
+            Command::Limits { .. } => mm2_live::ControlAction::Pause,
+        };
+        live.command(command.id().to_owned(), action)
+            .await
+            .map(|_| ())
+    }
+
+    fn drive_live(&mut self) {
+        let Some(live) = self.live.clone() else {
+            return;
+        };
+        let phase = live.snapshot().phase;
+        if self.core.snapshot().mode == Mode::Shadow && phase != mm2_live::LivePhase::Running {
+            let _ = self.core.control(Action::Pause);
+            self.evaluate();
+        }
+        let snapshot = self.core.snapshot();
+        let active = snapshot.mode == Mode::Shadow
+            && live.snapshot().phase == mm2_live::LivePhase::Running
+            && self.fatal.is_none()
+            && !self.closing
+            && !self.awaiting_source_refresh;
+        let quotes = if active {
+            snapshot.market.as_ref().map_or_else(Vec::new, |market| {
+                self.live_quotes
+                    .iter()
+                    .map(|quote| mm2_live::LiveQuote {
+                        slot: quote.slot.clone(),
+                        condition_id: market.condition_id.clone(),
+                        market_slug: market.slug.clone(),
+                        window_start_ms: market.window_start_ms,
+                        token_id: if quote.outcome == mm2_core::Outcome::Up {
+                            &market.up_token
+                        } else {
+                            &market.down_token
+                        }
+                        .clone(),
+                        outcome: quote.outcome,
+                        price_micros: quote.price_micros,
+                        quantity_micros: quote.quantity_micros / 10_000 * 10_000,
+                        window_end_ms: market.window_end_ms,
+                        tick_micros: if quote.outcome == mm2_core::Outcome::Up {
+                            snapshot.up_book.tick_micro
+                        } else {
+                            snapshot.down_book.tick_micro
+                        },
+                        min_order_micros: 5_000_000,
+                        fee_bps: 10_000,
+                        protocol: 2,
+                        neg_risk: false,
+                    })
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
+        if let Err(reason) = live.try_submit_quotes(quotes, wall_ms()) {
+            self.latch(reason);
+        }
     }
     fn publication(&mut self) -> Publication {
         let began = Instant::now();
@@ -345,6 +617,20 @@ impl Actor {
             publication_duration_ns: self.publication_duration_ns,
             execution_noop_ticks: self.execution_noop_ticks,
             simulation_condition: self.simulation_condition.clone(),
+            execution_mode: self.execution_mode.clone(),
+            desired_quotes: self.desired_quotes.clone(),
+            strategy_gate: self.strategy_gate,
+            live: self.live.as_ref().map(|handle| handle.snapshot()),
+            journal_metrics: self.journal.as_ref().map(|journal| journal.metrics()),
+            paper_portfolio: self
+                .simulation
+                .as_ref()
+                .map(|session| session.telemetry_portfolio_snapshot()),
+            paper: self
+                .paper
+                .as_ref()
+                .map(|paper| paper.state.borrow().clone()),
+            paper_error: self.paper_error.clone(),
         };
         self.publication_duration_ns = began.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
         publication
@@ -385,6 +671,12 @@ impl Actor {
         };
         let mut active =
             self.core.snapshot().mode == Mode::Shadow && self.fatal.is_none() && !self.closing;
+        if let Some(reason) = session.portfolio_halt() {
+            let _ = self.core.control(Action::Pause);
+            self.simulation_error = Some(format!("paper portfolio halted: {reason}"));
+            self.evaluate();
+            active = false;
+        }
         let snapshot = session.snapshot();
         if !active
             && snapshot.pending_events == 0
@@ -446,9 +738,37 @@ impl Actor {
             }
         }
         if active && !settling {
+            let books = self.core.snapshot();
+            let tick = common_tick(books.up_book.tick_micro, books.down_book.tick_micro);
+            if tick != candidate.limits().tick_micros
+                || candidate.limits().min_order_micros != 5_000_000
+            {
+                let terminal = candidate.snapshot();
+                let operation = if tick > 0
+                    && terminal.pending_events == 0
+                    && terminal.account.reserved_micros_ceil == 0
+                {
+                    SimulationOperation::VenueRules {
+                        now_ms: now,
+                        tick_micros: tick,
+                        min_order_micros: 5_000_000,
+                    }
+                } else {
+                    // Changing a grid never forgets possible fills of old orders.
+                    active = false;
+                    SimulationOperation::CancelAll { now_ms: now }
+                };
+                if let Err(error) = simulation::apply(&mut candidate, &operation) {
+                    self.latch(format!("simulation venue rules invariant: {error}"));
+                    return;
+                }
+                operations.push(operation);
+            }
+        }
+        if active && !settling {
             let quote = SimulationOperation::Quotes {
                 now_ms: now,
-                quotes: simulation::desired(&self.last_decision),
+                quotes: simulation::from_core_quotes(&self.desired_quotes),
             };
             let mut quoted = candidate.clone();
             match simulation::apply(&mut quoted, &quote) {
@@ -461,7 +781,7 @@ impl Actor {
                     self.simulation_error = Some(error.chars().take(256).collect());
                 }
             }
-            if now.saturating_sub(self.simulation_last_trade_ms) >= 500 {
+            if self.source == "demo" && now.saturating_sub(self.simulation_last_trade_ms) >= 500 {
                 let outcome = if (now / 500).is_multiple_of(2) {
                     "up"
                 } else {
@@ -555,19 +875,46 @@ impl Actor {
         if self.simulation_condition.as_deref() == Some(condition) {
             return Ok(());
         }
-        let account = session.snapshot().account;
-        if self.simulation_condition.is_some()
-            && (account.up_inventory_micros > 0
-                || account.down_inventory_micros > 0
-                || account.reserved_micros_ceil > 0)
-        {
-            let _ = self.core.control(Action::Pause);
-            self.simulation_error=Some("emulator market changed with unsettled inventory; original contract ledger retained".into());
-            return Ok(());
+        let mut candidate = session.clone();
+        let now = candidate.now_ms();
+        let market = self.core.snapshot().market;
+        let mut operations = Vec::new();
+        if self.simulation_condition.is_some() {
+            operations.push(SimulationOperation::CancelAll { now_ms: now });
+            operations.push(SimulationOperation::Advance {
+                now_ms: now.saturating_add(10_000),
+            });
         }
-        let operations = simulation::values(&[SimulationOperation::Market {
+        operations.push(SimulationOperation::Market {
             condition_id: condition.into(),
-        }])?;
+            start_ms: market.as_ref().map(|market| market.window_start_ms),
+            end_ms: market.as_ref().map(|market| market.window_end_ms),
+        });
+        if self.source == "demo"
+            && let Some(previous) = &self.simulation_condition
+        {
+            let previous_market = session
+                .portfolio_snapshot()
+                .positions
+                .into_iter()
+                .find(|position| position.market.id == *previous)
+                .ok_or("missing demo settlement market")?
+                .market;
+            operations.push(SimulationOperation::DemoResolution {
+                condition_id: previous.clone(),
+                at_ms: previous_market.end_ms,
+                winning_outcome: if (previous_market.start_ms / 300_000).is_multiple_of(2) {
+                    "up"
+                } else {
+                    "down"
+                }
+                .into(),
+            });
+        }
+        for operation in &operations {
+            simulation::apply(&mut candidate, operation)?;
+        }
+        let operations = simulation::values(&operations)?;
         let Some(mut journal) = self.journal.take() else {
             return Err("execution journal unavailable".into());
         };
@@ -582,10 +929,83 @@ impl Actor {
                 self.journal = Some(journal);
                 result?;
                 self.simulation_condition = Some(condition.into());
+                self.simulation_origin_ms = candidate.now_ms().saturating_sub(mono_ms(self.start));
+                self.simulation_last_trade_ms = candidate.now_ms();
+                self.simulation = Some(candidate);
                 self.simulation_books = [(0, 0); 2];
                 Ok(())
             }
             Err(_) => Err("market identity journal writer stopped".into()),
+        }
+    }
+    async fn observed_trade(&mut self, event: &FeedEvent) {
+        let FeedEvent::Trade {
+            outcome,
+            price_micro,
+            quantity_micro,
+            fingerprint,
+            exchange_ms,
+            observed_mono_ms,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let wall = wall_ms();
+        let mono = mono_ms(self.start);
+        if *exchange_ms > wall
+            || wall - *exchange_ms > self.limits.max_feed_age_ms
+            || *observed_mono_ms > mono
+            || mono - *observed_mono_ms > self.limits.max_feed_age_ms
+        {
+            return;
+        }
+        let Some(session) = &self.simulation else {
+            return;
+        };
+        let mut candidate = session.clone();
+        let now = self
+            .simulation_origin_ms
+            .saturating_add(mono_ms(self.start))
+            .max(candidate.now_ms());
+        let operation = SimulationOperation::ObservedTrade {
+            now_ms: now,
+            outcome: outcome_name(*outcome).into(),
+            price_micros: *price_micro,
+            quantity_micros: *quantity_micro,
+            fingerprint: fingerprint.clone(),
+        };
+        if let Err(error) = simulation::apply(&mut candidate, &operation) {
+            self.latch(error);
+            return;
+        }
+        if simulation::same_state_without_clock(session, &candidate) == Ok(true) {
+            return;
+        }
+        let Ok(values) = simulation::values(&[operation]) else {
+            self.latch("paper trade encoding failed".into());
+            return;
+        };
+        let Some(mut journal) = self.journal.take() else {
+            self.latch("paper journal unavailable".into());
+            return;
+        };
+        match tokio::task::spawn_blocking(move || {
+            let result = journal.commit_execution(values);
+            (journal, result)
+        })
+        .await
+        {
+            Ok((journal, result)) => {
+                self.journal_bytes = journal.bytes();
+                self.journal = Some(journal);
+                if let Err(error) = result {
+                    self.latch(error);
+                } else {
+                    self.simulation = Some(candidate);
+                }
+            }
+            Err(_) => self.latch("paper trade journal worker stopped".into()),
         }
     }
     async fn command(&mut self, mut command: Command) -> Reply {
@@ -601,6 +1021,14 @@ impl Actor {
             .existing(&command)
             .map_err(|e| Failure::new("conflict", e))?
         {
+            let historical_resume = matches!(&command, Command::Control {action,..} if action=="resume")
+                && self.core.snapshot().mode != Mode::Shadow;
+            // A recovered lane may never have received its queued mirror before a
+            // crash. Replaying an old receipt must not create a fresh activation.
+            if !historical_resume {
+                self.live_control(&command).await.map_err(|_|Failure::new("outcome_unknown","durable owner command exists; live acknowledgement unavailable; retry same identity"))?;
+                self.mirror_paper(command.clone());
+            }
             return Ok(
                 json!({"receipt":receipt,"state":self.state.borrow().as_ref(),"replayed":true}),
             );
@@ -615,6 +1043,28 @@ impl Actor {
             return Err(Failure::new(
                 "conflict",
                 "expected_version differs from current command_version",
+            ));
+        }
+        if matches!(&command,Command::Control { action,.. } if action=="resume")
+            && self
+                .simulation
+                .as_ref()
+                .is_some_and(|paper| paper.portfolio_halt().is_some())
+        {
+            return Err(Failure::new(
+                "conflict",
+                "paper portfolio loss/drawdown halt blocks resume",
+            ));
+        }
+        if matches!(&command,Command::Control { action,.. } if action=="resume")
+            && self
+                .live
+                .as_ref()
+                .is_some_and(|live| !live.snapshot().can_resume)
+        {
+            return Err(Failure::new(
+                "conflict",
+                "live account, stream or heartbeat is not ready; inspect live state",
             ));
         }
         if matches!(&command,Command::Control {action,..} if action=="resume")
@@ -659,6 +1109,8 @@ impl Actor {
         let execution_values = simulation::values(&simulation_operations)
             .map_err(|error| Failure::new("invalid", error))?;
         let resets = matches!(&command,Command::Control { action,.. } if action=="reset");
+        let pauses_live = self.live.is_some() && matches!(&command, Command::Limits { .. });
+        let live_command = command.clone();
         let receipt = Receipt {
             command_id: command.id().into(),
             applied_version: self.version + 1,
@@ -701,6 +1153,17 @@ impl Actor {
         self.core = candidate;
         self.limits = limits;
         self.simulation = simulation_candidate;
+        if self.live_control(&live_command).await.is_err() {
+            self.latch("durable owner command has an unknown live acknowledgement; retry same command identity".into());
+            return Err(Failure::new(
+                "outcome_unknown",
+                "durable owner command has an unknown live acknowledgement; retry same identity",
+            ));
+        }
+        self.mirror_paper(live_command);
+        if pauses_live {
+            let _ = self.core.control(Action::Pause);
+        }
         if resets {
             self.reset_epoch += 1;
             self.observation_barrier = Some(mono_ms(self.start));
@@ -745,6 +1208,11 @@ impl Actor {
                 operation = self.commands.recv() => {
                     match operation {
                         Some(Operation::Command(command, reply)) => { let result = self.command(command).await; let _ = reply.send(result); }
+                        Some(Operation::Mirror(mut command)) => {
+                            let version=self.journal.as_ref().and_then(|journal|journal.history().iter().find(|(prior,_)|prior.id()==command.id()).map(|(prior,_)|prior.expected_version())).unwrap_or(self.version);
+                            match &mut command {Command::Control {expected_version,..}|Command::Limits {expected_version,..}=>*expected_version=version}
+                            if let Err(error)=self.command(command).await { self.latch(format!("mirrored control failed: {}",error.kind)); }
+                        }
                         Some(Operation::Market(market, reply)) => {
                             // The source owner joins the old stream first. Drain its queued generation.
                             while self.feeds.try_recv().is_ok() {}
@@ -759,17 +1227,18 @@ impl Actor {
                         None => break,
                     }
                 }
-                _ = timer.tick() => { self.evaluate(); self.simulation_step(false).await;self.publish_if_due(); }
+                _ = timer.tick() => { self.evaluate(); self.drive_live(); self.simulation_step(false).await;self.publish_if_due(); }
                 event = self.feeds.recv() => {
                     match event {
                         Some(event) => {
                             if self.awaiting_source_refresh { continue; }
-                            let identity = match &event { FeedEvent::Snapshot { condition_id,.. } | FeedEvent::Delta { condition_id,.. } | FeedEvent::Tick { condition_id,.. } => Some(condition_id), _ => None };
+                            let identity = match &event { FeedEvent::Snapshot { condition_id,.. } | FeedEvent::Delta { condition_id,.. } | FeedEvent::Tick { condition_id,.. } | FeedEvent::Trade {condition_id,..} => Some(condition_id), _ => None };
                             if identity.is_some_and(|id| self.condition.as_ref() != Some(id)) { continue; }
-                            let observed = match &event { FeedEvent::Snapshot { observed_mono_ms,.. } | FeedEvent::Delta { observed_mono_ms,.. } | FeedEvent::Tick { observed_mono_ms,.. } | FeedEvent::Reference { observed_mono_ms,.. } => Some(*observed_mono_ms),_=>None };
+                            let observed = match &event { FeedEvent::Snapshot { observed_mono_ms,.. } | FeedEvent::Delta { observed_mono_ms,.. } | FeedEvent::Tick { observed_mono_ms,.. } | FeedEvent::Reference { observed_mono_ms,.. } | FeedEvent::Trade {observed_mono_ms,..} => Some(*observed_mono_ms),_=>None };
                             if self.observation_barrier.is_some_and(|barrier| observed.is_some_and(|rx|rx<=barrier)) { continue; }
                             self.feed_events = self.feed_events.saturating_add(1);
-                            let _ = self.core.apply(event); self.evaluate();
+                            self.observed_trade(&event).await;
+                            let _ = self.core.apply(event); self.evaluate();self.drive_live();
                         }
                         None => { self.latch("feed owner stopped".into()); break; }
                     }
@@ -779,6 +1248,10 @@ impl Actor {
         self.closing = true;
         let _ = self.core.control(Action::Pause);
         self.evaluate();
+        self.drive_live();
+        if let Some(live) = &self.live {
+            let _ = live.shutdown().await;
+        }
         self.simulation_step(true).await;
         self.publish();
         if let Some(worker) = self.publication_task.take() {
@@ -794,6 +1267,7 @@ impl Actor {
                     let _ = reply.send(Err("service shutting down".into()));
                 }
                 Operation::SourceStatus(..) => {}
+                Operation::Mirror(_) => {}
             }
         }
     }
@@ -807,12 +1281,11 @@ impl Publication {
             && !self.closing
             && !self.awaiting_source_refresh
         {
-            snapshot
-                .intents
+            self.desired_quotes
                 .iter()
                 .map(|i| {
-                    json!({"outcome": outcome_name(i.outcome), "price":decimal(i.price_micro),
-                "shares":decimal(i.quantity_micro), "submitted":false})
+                    json!({"slot":i.slot,"outcome": if i.outcome==mm2_core::Outcome::Up {"up"}else{"down"}, "price":decimal(i.price_micros),
+                "shares":decimal(i.quantity_micros), "submitted":false})
                 })
                 .collect()
         } else {
@@ -840,6 +1313,32 @@ impl Publication {
             )
             && snapshot.last_error.is_none();
         let api_ready = self.fatal.is_none() && !self.committing && !self.closing;
+        let simulation = self
+            .simulation
+            .as_ref()
+            .and_then(|s| serde_json::to_value(s).ok())
+            .or_else(|| self.paper.as_ref().map(|paper| paper["simulation"].clone()));
+        let simulation_error = self
+            .simulation_error
+            .clone()
+            .or(self.paper_error)
+            .or_else(|| {
+                self.paper.as_ref().and_then(|paper| {
+                    paper["fault"]
+                        .as_str()
+                        .or(paper["simulation_error"].as_str())
+                        .map(str::to_owned)
+                })
+            });
+        let simulation_condition = self.simulation_condition.clone().or_else(|| {
+            self.paper.as_ref().and_then(|paper| {
+                paper["simulation_market_condition"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+        });
+        let live_eligible =
+            api_ready && feed_ready && self.live.as_ref().is_some_and(|live| live.can_resume);
         let mut ordered: Vec<_> = self.durations_ns.iter().copied().collect();
         ordered.sort_unstable();
         let percentile = |n: usize| {
@@ -854,21 +1353,25 @@ impl Publication {
             "telemetry_policy":"periodic formatting on one-slot background worker; owner command, source and fault transitions publish immediately",
             "execution_noop_ticks":self.execution_noop_ticks,
             "decision_ns_p50":percentile(50),"decision_ns_p99":if ordered.len()>=1000 {percentile(99)} else {None},
-            "measurement":"core.evaluate only; excludes transport, parsing, queue wait, simulation durability and snapshot publication"});
+            "measurement":"core and strategy evaluation; excludes transport, parsing, queue wait, execution durability and snapshot publication"});
         Arc::new(json!({
             "schema_version":1, "boot_id":self.boot_id,"sequence":self.sequence,"published_at_ms":now,
             "mode":mode_name(snapshot.mode),"command_version":self.version,"feed_source":self.source,
             "reset_epoch":self.reset_epoch,"source_status":self.source_status,
             "awaiting_source_refresh":self.awaiting_source_refresh,
             "api_ready":api_ready,"feed_ready":feed_ready,"shadow_ready":api_ready && feed_ready && !intents.is_empty(),
-            "live_eligible":false,"exact_twap_available":false,"strategy":"experimental_book_only",
-            "execution_mode":if self.simulation.is_some() { "emulator" } else { "shadow" },
-            "simulation":self.simulation,"simulation_error":self.simulation_error,
-            "simulation_market_condition":self.simulation_condition,
+            "live_eligible":live_eligible,"exact_twap_available":false,"strategy":"mo_money_book_candidate",
+            "execution_mode":self.execution_mode,
+            "simulation":simulation,"simulation_error":simulation_error,
+            "simulation_market_condition":simulation_condition,
+            "strategy_gate":self.strategy_gate,
+            "live":self.live,"parallel_simulation":self.paper.as_ref().map(|paper|json!({"mode":paper["mode"],"fault":paper["fault"],"published_at_ms":paper["published_at_ms"],"command_version":paper["command_version"],"journal":paper["journal"]})),
+            "journal":self.journal_metrics,
+            "paper_portfolio":self.paper_portfolio.or_else(||self.paper.as_ref().and_then(|paper|serde_json::from_value(paper["paper_portfolio"].clone()).ok())),
             "market":market,"limits":self.limits,"shadow_intents":intents,
-            "hypothetical_reservation_usd": if api_ready { decimal(snapshot.hypothetical_reservation_micro) } else { "0".into() },
+            "hypothetical_reservation_usd": if api_ready { decimal(self.last_decision.hypothetical_reservation_micro) } else { "0".into() },
             "worst_case_imbalance_shares": if api_ready { decimal(snapshot.worst_case_imbalance_micro) } else { "0".into() },
-            "actual_orders":[],"wallet_balance_usd":null,"inventory":null,"pnl":null,
+            "pnl":null,
             "books":{"up":book_json(&snapshot.up_book,now,mono),"down":book_json(&snapshot.down_book,now,mono)},
             "reference":snapshot.reference.as_ref().map(|r| json!({"source":"binance_btcusdt", "price":decimal(r.price_micro),
                 "exchange_ms":r.exchange_ms,"observed_mono_ms":r.observed_mono_ms,"oracle":false})),
@@ -885,6 +1388,21 @@ fn outcome_name(outcome: Outcome) -> &'static str {
         Outcome::Up => "up",
         Outcome::Down => "down",
     }
+}
+fn common_tick(up: u64, down: u64) -> u64 {
+    if up == 0 || down == 0 {
+        return 0;
+    }
+    let (mut a, mut b) = (up, down);
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    (up / a)
+        .checked_mul(down)
+        .filter(|tick| *tick < 1_000_000)
+        .unwrap_or(0)
 }
 fn book_fresh(book: &BookSnapshot, wall: u64, mono: u64, max_age: u64) -> bool {
     matches!((book.exchange_ms,book.observed_mono_ms), (Some(ex),Some(rx)) if ex <= wall && rx <= mono && wall-ex <= max_age && mono-rx <= max_age)
@@ -923,7 +1441,11 @@ mod tests {
             listen: "127.0.0.1:8088".parse().unwrap(),
             allow_remote_http: false,
             state_dir: directory.path().into(),
+            live_state_dir: None,
             journal_max_bytes: 1_048_576,
+            journal: None,
+            strategy: mm2_strategy::Rules::default(),
+            live: None,
             command_capacity: 8,
             feed_capacity: 16,
             limits: Limits {
@@ -964,7 +1486,11 @@ mod tests {
             listen: "127.0.0.1:8088".parse().unwrap(),
             allow_remote_http: false,
             state_dir: directory.path().into(),
+            live_state_dir: None,
             journal_max_bytes: 1_048_576,
+            journal: None,
+            strategy: mm2_strategy::Rules::default(),
+            live: None,
             command_capacity: 8,
             feed_capacity: 16,
             limits: Limits {
@@ -1050,7 +1576,7 @@ mod tests {
         actor.simulation_step(false).await;
         let restored = serde_json::to_value(actor.simulation.as_ref().unwrap()).unwrap();
         assert_eq!(
-            restored["books"]["up"]["bid_levels"][0]["quantity_micros"],
+            restored["session"]["books"]["up"]["bid_levels"][0]["quantity_micros"],
             100_000_000
         );
     }

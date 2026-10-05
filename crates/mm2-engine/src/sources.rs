@@ -100,11 +100,11 @@ fn demo_frame(market: &Market, wall_ms: u64, observed_mono_ms: u64) -> Vec<FeedE
             exchange_ms: wall_ms,
             observed_mono_ms,
             bids: vec![Level {
-                price_micro: 400_000,
+                price_micro: 490_000,
                 quantity_micro: 100_000_000,
             }],
             asks: vec![Level {
-                price_micro: 600_000,
+                price_micro: 510_000,
                 quantity_micro: 100_000_000,
             }],
         })

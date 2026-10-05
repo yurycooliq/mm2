@@ -89,6 +89,15 @@ pub struct Market {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FeedEvent {
+    Trade {
+        condition_id: String,
+        outcome: Outcome,
+        exchange_ms: u64,
+        observed_mono_ms: u64,
+        price_micro: u64,
+        quantity_micro: u64,
+        fingerprint: String,
+    },
     Snapshot {
         condition_id: String,
         outcome: Outcome,
@@ -433,6 +442,7 @@ impl Core {
     }
     pub fn apply(&mut self, event: FeedEvent) -> Result<(), String> {
         match event {
+            FeedEvent::Trade { .. } => return Ok(()),
             FeedEvent::Disconnect { source, reason } => {
                 self.clear_proposals();
                 self.last_error = Some(reason);

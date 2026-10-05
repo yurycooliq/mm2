@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import { micro, modeLabel, money, simulated, timeLabel } from './model';
+import { micro, modeLabel, money, picoMoney, simulated, timeLabel } from './model';
 import type { Command, CommandReply, Control, EngineState, Envelope, Limits as LimitsValue, Log, Sample } from './types';
 
 export function Login({ busy, error, login }: { busy: boolean; error: string | null; login: (token: string) => Promise<void> }) {
@@ -19,23 +19,26 @@ function Indicator({ good, children }: { good: boolean; children: ReactNode }) {
 export function Overview({ envelope, disabled, command }: { envelope: Envelope | null; disabled: boolean; command: (action: Control) => Promise<void> }) {
   const state = envelope?.state ?? null;
   const [confirm, setConfirm] = useState<Control | null>(null);
-  const act = (action: Control) => action === 'kill' || action === 'reset' ? setConfirm(action) : void command(action);
+  const act = (action: Control) => action === 'kill' || action === 'reset' || (action === 'resume' && !!state?.live) ? setConfirm(action) : void command(action);
   return <section className="overview">
     <div className="overview-heading"><div><h1>Engine overview</h1><p>{modeLabel(state)}</p><p className="mono muted">Single sampler · 1 Hz</p></div>
       <div className="operations"><div className="controls">{(['resume', 'pause', 'kill', 'reset'] as const).map(action =>
-        <button key={action} className={action === 'resume' ? 'primary' : action === 'kill' ? 'danger' : ''} disabled={disabled} onClick={() => act(action)}>{action[0].toUpperCase() + action.slice(1)}</button>)}</div>
+        <button key={action} className={action === 'resume' ? 'primary' : action === 'kill' ? 'danger' : ''} disabled={disabled || (action==='resume' && !!state?.live && !state.live_eligible)} onClick={() => act(action)}>{action[0].toUpperCase() + action.slice(1)}</button>)}</div>
       <div className="indicators"><Indicator good={!!envelope?.connected}>ENGINE {envelope?.connected ? 'CONNECTED' : 'DISCONNECTED'}</Indicator>
-        <Indicator good={!!envelope?.connected && !!state?.feed_ready}>FEEDS {state?.feed_ready && envelope?.connected ? 'FRESH' : 'NOT READY'}</Indicator><Indicator good={false}>LIVE DISABLED</Indicator></div></div></div>
+        <Indicator good={!!envelope?.connected && !!state?.feed_ready}>FEEDS {state?.feed_ready && envelope?.connected ? 'FRESH' : 'NOT READY'}</Indicator><Indicator good={!!state?.live_eligible && !!envelope?.connected}>{state?.live ? state.live_eligible && envelope?.connected ? state.live.phase === 'running' ? 'TRADING ACTIVE' : 'TRADING READY' : 'TRADING NOT READY' : 'SIMULATION / READ ONLY'}</Indicator></div></div></div>
     {envelope?.error && <div className="notice" role="status">{envelope.error}</div>}
     {state?.fault && <div className="notice error" role="alert">Engine fault: {state.fault}</div>}
     {state?.simulation_error && <div className="notice error" role="alert">Emulator stopped: {state.simulation_error}</div>}
+    {state?.live?.fault && <div className="notice error" role="alert">Trading stopped: {state.live.fault}</div>}
+    {state?.parallel_simulation && <p className="small muted">Parallel simulation: {state.parallel_simulation.mode}{state.parallel_simulation.fault ? ` · ${state.parallel_simulation.fault}` : ''}. Its account and journal are separate.</p>}
+    {state?.journal && <p className="small mono muted">Journal {state.journal.total_bytes.toLocaleString()} / {state.journal.total_max_bytes.toLocaleString()} bytes · {state.journal.archive_segments} archived segments</p>}
     {state?.last_input_error && <div className="notice">Input unavailable: {state.last_input_error}</div>}
     <div className="market"><h2>{state?.market ? 'BTC / Up or Down · 5m' : 'Waiting for market'}</h2>
       <p>{state?.market ? state.execution_mode === 'emulator' ? 'Synthetic market · deterministic demo' : state.market.slug : 'No selected market has been sampled'}</p>
       {state?.books && <p className="small mono muted">Book age · Up receive {state.books.up.receive_age_ms ?? 'unknown'} ms / exchange {state.books.up.exchange_age_ms ?? 'unknown'} ms · Down receive {state.books.down.receive_age_ms ?? 'unknown'} ms / exchange {state.books.down.exchange_age_ms ?? 'unknown'} ms</p>}
       {state?.source_status?.message && <p className="small muted">{state.source_status.message}</p>}</div>
     {confirm && <div className="modal-backdrop"><section className="confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
-      <h2 id="confirm-title">Confirm {confirm}</h2><p>{confirm === 'kill' ? 'Latch Kill and stop new proposals. A durable acknowledgement is required.' : 'Reset the engine control state and require fresh source snapshots. A durable acknowledgement is required.'}</p>
+      <h2 id="confirm-title">Confirm {confirm}</h2><p>{confirm === 'resume' ? 'Resume trading with real funds under the configured account and risk limits. Simulation remains a separate account.' : confirm === 'kill' ? 'Latch Kill and cancel executable quotes. A durable acknowledgement is required.' : 'Reset the engine control state and require fresh source snapshots. A durable acknowledgement is required.'}</p>
       <div className="controls"><button onClick={() => setConfirm(null)} autoFocus>Cancel</button><button className={confirm === 'kill' ? 'danger' : 'primary'} onClick={() => { setConfirm(null); void command(confirm); }}>Confirm {confirm}</button></div>
     </section></div>}
   </section>;
@@ -45,21 +48,31 @@ export function AccountBand({ state }: { state: EngineState | null }) {
   const session = simulated(state), account = session?.account;
   const cash = account ? account.initial_cash_micros - account.spent_micros_ceil : null;
   const values = [
-    ['SIMULATED CASH', money(cash)], ['RESERVED', money(account?.reserved_micros_ceil)],
-    ['AVAILABLE', money(account?.available_micros_floor)], ['UP / DOWN INVENTORY', account ? `${micro(account.up_inventory_micros, 2)} / ${micro(account.down_inventory_micros, 2)}` : '— / —'],
+    ['SIMULATED CASH', state?.paper_portfolio ? picoMoney(state.paper_portfolio.cash_pico) : money(cash)], ['RESERVED', money(account?.reserved_micros_ceil)],
+    ['AVAILABLE FOR THIS MARKET', money(account?.available_micros_floor)], ['UP / DOWN INVENTORY', account ? `${micro(account.up_inventory_micros, 2)} / ${micro(account.down_inventory_micros, 2)}` : '— / —'],
   ];
-  return <section className="account-band" aria-label="Simulated account">
+  const live=state?.live;
+  return <>{live && <section className="account-band" aria-label="Real account">
+    <div><dt>REAL COLLATERAL</dt><dd>{live.account_reconciled ? money(live.collateral_micros) : '—'}</dd></div>
+    <div><dt>REAL RESERVED</dt><dd>{picoMoney(live.reserved_pico)}</dd></div>
+    <div><dt>REAL AVAILABLE</dt><dd>{live.account_reconciled ? money(live.available_micros) : '—'}</dd></div>
+    <div><dt>REAL POSITIONS</dt><dd>{live.positions.length}</dd></div>
+    <p className="unknown-funds">Account {live.account_reconciled ? 'reconciled' : 'not reconciled'} · user stream {live.user_stream_connected ? 'connected' : 'disconnected'} · last reconciliation {live.last_reconciliation_ms ? timeLabel(live.last_reconciliation_ms) : 'unknown'}. {!state?.live_eligible && 'Displayed balances are the last sampled account state.'}</p>
+  </section>}{session && <section className="account-band" aria-label="Simulated account">
     {values.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}
-    {!session && <p className="unknown-funds">Real account funds and inventory are unknown in public shadow.</p>}
     {session?.fault && <p className="unknown-funds error">Emulator fault: {session.fault}</p>}
-  </section>;
+    {state?.paper_portfolio && <p className="unknown-funds">{state.paper_portfolio.position_count ?? state.paper_portfolio.positions.length} retained market ledgers{state.paper_portfolio.positions_truncated ? ` · latest ${state.paper_portfolio.positions.length} shown` : ''}. Simulated executions and settlement assumptions.</p>}
+  </section>}{!session && !live && <p className="unknown-funds">Real account funds and inventory are unknown in public shadow.</p>}</>;
 }
 
 export function Orders({ state }: { state: EngineState | null }) {
   const orders = simulated(state)?.orders ?? [];
-  return <section className="orders"><h2>Orders</h2><div className="table-scroll"><table><thead><tr>{['Order', 'Side', 'Outcome', 'Price', 'Remaining', 'Status'].map(label => <th key={label}>{label}</th>)}</tr></thead>
+  const realOrders=state?.live?.orders.filter(order=>order.phase!=='closed') ?? [];
+  return <>{state?.live && <section className="orders"><h2>Real orders</h2><div className="table-scroll"><table><thead><tr>{['Order', 'Side', 'Outcome', 'Price', 'Remaining', 'Status'].map(label => <th key={label}>{label}</th>)}</tr></thead>
+    <tbody>{realOrders.length ? realOrders.map(order=><tr key={order.order_id}><td className="mono" title={order.order_id}>{order.order_id.slice(0,14)}…</td><td>BUY</td><td>{order.quote.outcome}</td><td className="mono">{micro(order.quote.price_micros)}</td><td className="mono">{micro(order.quote.quantity_micros-order.cumulative_filled_micros)}</td><td>{order.phase.replaceAll('_',' ')}</td></tr>) : <tr><td colSpan={6} className="empty">No tracked active orders · account {state.live.account_reconciled ? 'reconciled' : 'unavailable'}</td></tr>}</tbody></table></div></section>}
+  {(simulated(state) || !state?.live) && <section className="orders"><h2>{state?.live ? 'Simulation orders' : 'Orders'}</h2><div className="table-scroll"><table><thead><tr>{['Order', 'Side', 'Outcome', 'Price', 'Remaining', 'Status'].map(label => <th key={label}>{label}</th>)}</tr></thead>
     <tbody>{orders.length ? orders.map(order => <tr key={order.id}><td className="mono">{order.id}</td><td>BUY</td><td>{order.quote.outcome}</td><td className="mono">{micro(order.quote.price_micros)}</td>
-      <td className="mono">{micro(order.quote.quantity_micros - order.cumulative_filled_micros)}</td><td>{order.phase.replaceAll('_', ' ')}</td></tr>) : <tr><td colSpan={6} className="empty">{simulated(state) ? 'No simulated orders' : 'No actual orders submitted; public shadow proposals are unsubmitted'}</td></tr>}</tbody></table></div></section>;
+      <td className="mono">{micro(order.quote.quantity_micros - order.cumulative_filled_micros)}</td><td>{order.phase.replaceAll('_', ' ')}</td></tr>) : <tr><td colSpan={6} className="empty">{simulated(state) ? 'No simulated orders' : 'No actual orders submitted; public shadow proposals are unsubmitted'}</td></tr>}</tbody></table></div></section>}</>;
 }
 
 const fields = [
@@ -111,5 +124,5 @@ export function History({ samples, envelope }: { samples: Sample[]; envelope: En
       : <p className="empty">{samples.length ? 'No simulated account history in sampled state' : 'History appears after the first sampled state'}</p>}</div>
     {telemetry && <p className="telemetry small muted">Samples {telemetry.sample_count} · publication lag {telemetry.publication_lag_ms === null ? 'unknown' : `${telemetry.publication_lag_ms} ms`} · history dropped {telemetry.history_dropped} · logs dropped {telemetry.logs_dropped} · overruns {telemetry.overruns}</p>}
     {telemetry?.storage_error && <p className="warning small">{telemetry.storage_error}</p>}
-  </section>;
+    </section>;
 }
