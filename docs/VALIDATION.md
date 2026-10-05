@@ -11,7 +11,7 @@ acceptance and economic holdout remain external checks.
 | --- | --- |
 | Rust workspace | **215 tests passed** with two test threads; format, Clippy `-D warnings` and locked optimized workspace build passed on Rust 1.98.1. Includes **100 mm2-live tests**, exact signed recovery, finalized effects, imported/owned capital, receipt/account races, private-stream cleanup, shutdown fence release and persistence failure. |
 | Console Python | **25 passed**: owner/auth/CSRF, stale publication and command recovery, mocked Telegram, independent lane summaries and public chain telemetry without signed bytes. |
-| Operations Python | **60 passed on pinned Linux/Python 3.13, no skips**: source/image identity, private environment, mount refusal, encrypted retention, SSH revocation, engine restart preflight, independent secondary recovery, duplicate identities, timeout cleanup, backup/restore and lane capacity. |
+| Operations Python | **61 passed on pinned Linux/Python 3.13, no skips**: source/image identity, private environment, mount refusal, encrypted retention, SSH revocation, engine restart preflight, independent secondary recovery, duplicate identities, timeout cleanup, backup/restore, lane capacity and Docker version/image-store refusal. |
 | Data/latency Python | **55 passed**, pyarrow 25.0.0 / websockets 15.0.1, **no skipped tests**; Parquet and local fake HTTP/WebSocket servers. |
 | Reference/strategy Node | **25 passed = 19 archive/execution + 6 scoped strategy parity vectors**. |
 | Dashboard Node/build | **7 passed**, TypeScript and production Vite build passed; command identity and exact unsigned balance/signed loss formatting. |
@@ -118,6 +118,14 @@ owned by systemd and must repeat release/storage/profile preflight; console/prox
 recovery is independent. All recovery starts paused. The ordinary candidate region
 is eu-west-1 (Ireland); direct London eu-west-2 co-location needs separate acceptance.
 See [AWS_DEPLOY.md](AWS_DEPLOY.md) and [LIVE_GATEWAY.md](LIVE_GATEWAY.md).
+
+The OCI-pinned bundle passed a real local save/load round trip on Docker 29 with
+containerd: all three exact image identities, Linux/amd64 platform and both
+application source labels survived import. Independent archive inspection matched
+all 21 public objects and their SHA-256/byte counts. The host installer now rejects
+Engine versions below 29 before OS/package setup and requires the exact containerd
+image-store indicator after startup. The guard is exercised with synthetic shell
+commands; no host installation or daemon configuration change was performed.
 
 Owner/paper journal defaults are 8 MiB per active segment and 128 MiB total;
 live retains a separate bounded account journal. Capacity needs a selected-host

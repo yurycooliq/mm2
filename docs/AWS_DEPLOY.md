@@ -33,6 +33,8 @@ python3 scripts/deploy_package.py verify --source output/releases/RELEASE
 
 The exporter refuses a dirty source tree, wrong image architecture, symlinked public inputs and an existing destination. It exports three local images by their immutable `sha256:` IDs, public profiles and an explicit allowlist of deployment scripts/files. It never reads `.env`, keys, live credentials, journals or console SQLite. Windows line endings are normalized for Linux. `release-manifest.json` binds the source commit, Linux/amd64 platform, exact image IDs and SHA-256/byte count of every file; `images.tar` is limited to 8 GiB. Failed output is preserved with `INCOMPLETE` until export completes.
 
+The release pins OCI manifest/index identities from a **containerd image store**. The supported target is a fresh **Docker Engine 29 or later with the containerd image store**; a classic image store can load the archive under different config IDs and cannot satisfy these exact identity pins. A save/load round trip has been verified locally on Docker 29 with containerd; selected-host import must still prove the same IDs, platform and application labels. Docker uses containerd by default on fresh Engine 29+ installations, while upgraded hosts can retain the classic store. [Docker image-store contract](https://docs.docker.com/engine/storage/containerd/)
+
 Both application images must carry `org.opencontainers.image.revision` equal to the exact clean committed source. An older image or a build without that label is refused even if its tag says `local`. Host import and every startup preflight recheck the loaded application labels against the manifest. The Caddy image is an external reviewed dependency and does not claim the mm2 source revision. Labels bind the intended build input; review/build provenance and a trusted export/transfer channel remain required.
 
 `scripts/deploy_verify_proxy.py --proxy-image REVIEWED_LOCAL_CADDY_REFERENCE` provides a local fixture acceptance: verified TLS chain/SNI, the actual console image, owner login, Secure/HttpOnly cookie, origin rejection and HTTP redirect. It uses a Docker `--internal` network and its own temporary CA/tokens, publishes no host ports, and cleans up only resources with its unique ownership label. It also requires the repository's pinned Python 3.13 image locally for the isolated TLS client. It neither requests public certificates nor tests actual AWS/DNS/Telegram delivery. The official Caddy binary's `NET_BIND_SERVICE` file capability must remain in its bounding set even with the container's high listening ports; other capabilities remain dropped.
@@ -43,7 +45,7 @@ Verify the manifest/checksum through a trusted channel before transferring the r
 
 Upload the public release directory using the chosen authenticated management path. Do not put private keys, bot tokens or presigned secret links in CloudFormation, UserData, CI logs or a recorded shell command. The package can also be reviewed before AWS billing is solved.
 
-On a **new Ubuntu 24.04 amd64 host**, inspect the exact available versions in Docker's official apt repository, record/review all five component versions and run:
+On a **new Ubuntu 24.04 amd64 host**, inspect the exact available versions in Docker's official apt repository, select **Docker Engine 29 or later**, record/review all five compatible component versions and run:
 
 ```sh
 sudo sh infra/aws/install_runtime.sh \
@@ -51,7 +53,7 @@ sudo sh infra/aws/install_runtime.sh \
   EXACT_BUILDX_VERSION EXACT_COMPOSE_VERSION
 ```
 
-The initial installer verifies Docker's repository signing-key fingerprint, installs exactly these versions, holds their automatic upgrades, starts Docker and Chrony, and creates private `/etc/mm2`. It refuses an existing Docker installation rather than performing an unreviewed upgrade. Base Ubuntu security dependencies are obtained from the OS's maintained repository. Runtime version/security upgrades are a separate reviewed host operation. Confirm clock synchronization before accepting live feeds. [Docker's supported Ubuntu repository installation](https://docs.docker.com/engine/install/ubuntu/)
+The initial installer rejects an older Engine version before OS/package setup, verifies Docker's repository signing-key fingerprint, installs exactly these versions, holds their automatic upgrades and starts Docker and Chrony. It then requires `DriverStatus` to report `driver-type = io.containerd.snapshotter.v1` before creating private `/etc/mm2`; an unsupported backend refuses completion without rewriting daemon configuration or starting mm2. It refuses an existing Docker installation rather than performing an unreviewed upgrade. Base Ubuntu security dependencies are obtained from the OS's maintained repository. Runtime version/security upgrades are a separate reviewed host operation. Confirm clock synchronization before accepting live feeds. [Docker's supported Ubuntu repository installation](https://docs.docker.com/engine/install/ubuntu/)
 
 Copy the **StateVolumeId** from the reviewed stack output. For a volume just created by that stack, explicitly initialize it:
 

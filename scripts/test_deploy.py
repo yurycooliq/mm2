@@ -4,6 +4,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -255,6 +256,39 @@ class DeployTests(unittest.TestCase):
         self.assertNotIn("UserData", resources["Host"]["Properties"])
         self.assertEqual(resources["Host"]["Properties"]["MetadataOptions"]["HttpTokens"], "required")
         self.assertEqual({rule["FromPort"] for rule in resources["HostSecurityGroup"]["Properties"]["SecurityGroupIngress"]}, {80, 443})
+
+    @unittest.skipUnless(os.name == "posix", "Linux installer shell execution")
+    def test_runtime_installer_rejects_classic_identity_backend_without_installing_or_migrating(self):
+        source = (deploy_package.ROOT / "infra/aws/install_runtime.sh").read_text()
+        # Execute the complete older-version path; privileged commands cannot perform effects.
+        isolated = 'id() { printf 0; }; docker() { return 96; };\n' + source
+        for version in ("5:28.5.2-1~ubuntu.24.04~noble", "28.5.2-1~ubuntu.24.04~noble"):
+            result = subprocess.run(["sh", "-s", "--", version, "29.1.0", "2.1.0", "0.30.0", "2.40.3"],
+                                    input=isolated, capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires Docker Engine 29 or later", result.stderr)
+            self.assertNotIn("Pinned Docker components", result.stdout)
+        # Run the actual post-install body with a synthetic Docker result; no OS/apt/service calls.
+        body = source.split("systemctl enable --now docker chrony\n", 1)[1]
+        trace = self.root / "installer-actions"
+        for backend in ("", "overlay2", "io.containerd.snapshotter.v1junk", "io.containerd.snapshotter.v1"):
+            if trace.exists():
+                trace.unlink()
+            prelude = ("set -eu\n"
+                       "docker() { printf '%s\\n' " + shlex.quote(backend) + "; }\n"
+                       "install() { printf '%s\\n' \"$*\" >> " + shlex.quote(str(trace)) + "; }\n")
+            result = subprocess.run(["sh", "-s"], input=prelude + body,
+                                    capture_output=True, text=True, timeout=5)
+            with self.subTest(backend=backend):
+                if backend == "io.containerd.snapshotter.v1":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("No mm2 service started", result.stdout)
+                    self.assertIn("/etc/mm2", trace.read_text())
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("image store is unsupported", result.stderr)
+                    self.assertIn("no daemon configuration was changed", result.stderr)
+                    self.assertFalse(trace.exists())
 
     def test_production_unit_is_only_engine_restart_owner(self):
         unit = (deploy_package.ROOT / "infra/aws/mm2.service").read_text()
