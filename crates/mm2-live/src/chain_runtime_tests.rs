@@ -226,6 +226,24 @@ fn receipt(p: &PreparedChainTransaction) -> ChainReceipt {
     }
 }
 #[tokio::test]
+async fn shutdown_ack_releases_journal_fence_before_actor_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _, _) = fixture(dir.path()).await;
+    assert!(Journal::open(dir.path(), &actor.settings).is_err());
+    let (tx, rx) = oneshot::channel();
+    actor.shutdown = Some((Instant::now(), tx));
+
+    actor.finish_shutdown();
+    rx.await.unwrap();
+
+    // Keep the old actor alive so destructor scheduling cannot hide the race.
+    let (journal, recovered) = Journal::open(dir.path(), &actor.settings).unwrap();
+    assert_eq!(recovered.collateral_micros, actor.ledger.collateral_micros);
+    assert_eq!(recovered.owned_positions.len(), 2);
+    assert_eq!(journal.sequence, 1);
+    assert!(actor.journal.is_none());
+}
+#[tokio::test]
 async fn lost_chain_ack_reserves_and_retry_uses_exact_durable_hash_and_nonce() {
     let dir = tempfile::tempdir().unwrap();
     let (mut actor, venue, prepared) = fixture(dir.path()).await;

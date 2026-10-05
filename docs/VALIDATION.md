@@ -9,7 +9,7 @@ acceptance and economic holdout remain external checks.
 
 | Current check | Confirmed result and scope |
 | --- | --- |
-| Rust workspace | **214 tests passed** with two test threads; format, Clippy `-D warnings` and locked optimized workspace build passed on Rust 1.98.1. Includes **99 mm2-live tests**, exact signed recovery, finalized effects, imported/owned capital, receipt/account races, private-stream cleanup and persistence failure. |
+| Rust workspace | **215 tests passed** with two test threads; format, Clippy `-D warnings` and locked optimized workspace build passed on Rust 1.98.1. Includes **100 mm2-live tests**, exact signed recovery, finalized effects, imported/owned capital, receipt/account races, private-stream cleanup, shutdown fence release and persistence failure. |
 | Console Python | **25 passed**: owner/auth/CSRF, stale publication and command recovery, mocked Telegram, independent lane summaries and public chain telemetry without signed bytes. |
 | Operations Python | **60 passed on pinned Linux/Python 3.13, no skips**: source/image identity, private environment, mount refusal, encrypted retention, SSH revocation, engine restart preflight, independent secondary recovery, duplicate identities, timeout cleanup, backup/restore and lane capacity. |
 | Data/latency Python | **55 passed**, pyarrow 25.0.0 / websockets 15.0.1, **no skipped tests**; Parquet and local fake HTTP/WebSocket servers. |
@@ -52,6 +52,13 @@ Reset cannot clear it. Terminal diagnostics are bounded in later checkpoints,
 while original audit records remain retained. Positive inventory and uncertainty
 are never removed to recover capacity. Private WebSocket ownership, reconnect,
 heartbeat and shutdown are bounded and independently tested.
+
+Remote container CI exposed a shutdown race: the actor acknowledged completion
+before its destructor released the account journal fence. Shutdown now joins the
+listener and workers, publishes the final snapshot, drops the journal and only
+then acknowledges. A deterministic regression keeps the old actor alive while
+reopening the same journal and verifies retained collateral, owned inventory and
+sequence; the existing immediate runtime-restart test covers the complete path.
 
 DepositWallet type 3 uses canonical ERC7739 CLOB order signatures with the
 controlling EOA in authenticated headers and the contract wallet as maker/order

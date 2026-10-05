@@ -1424,7 +1424,12 @@ impl Actor {
         let _ = (&mut self.listener).await;
         self.workers.abort_all();
         while self.workers.join_next().await.is_some() {}
+        self.finish_shutdown();
+    }
+    fn finish_shutdown(&mut self) {
         self.publish();
+        // The acknowledgement permits immediate recovery by another executor.
+        drop(self.journal.take());
         if let Some((_, tx)) = self.shutdown.take() {
             let _ = tx.send(());
         }
