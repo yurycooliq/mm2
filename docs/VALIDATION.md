@@ -16,7 +16,7 @@ acceptance and economic holdout remain external checks.
 | Reference/strategy Node | **25 passed = 19 archive/execution + 6 scoped strategy parity vectors**. |
 | Dashboard Node/build | **7 passed**, TypeScript and production Vite build passed; command identity and exact unsigned balance/signed loss formatting. |
 | Playwright fixtures | **20 cases / 25 screenshots passed**: the earlier 16 controls cases at desktop 1440x1100 and mobile 390x844 cover simulation/trading/both, fixed initial capital, actual risk caps, signed loss, stale refusal, cancel confirmation and exact lost-ACK retry after reload. Pending closeout alone permits a fresh Resume when every readiness gate passes. Four additional final-build cases at 1440x1000 / 390x844 verify distinct batch/transaction labels, private-wire omission, no browser errors/overflow and durable Pause. |
-| Production images/integration | **Both production images built from committed source; 13 checks passed**, including five profiles, blank funded refusal, paper fills, console outage, crash recovery, journal fence and graceful stop. Observed run 23,343 ms / engine stop 750 ms; local observations, not an SLA. |
+| Production images/integration | **Both production images built from committed source; 13 checks passed**, including five profiles, blank funded refusal, paper fills, console outage, crash recovery, journal fence and graceful stop. Latest unchanged-source rerun observed 21,469 ms / engine stop 687 ms; local observations, not an SLA. The earlier failed run is recorded below. |
 | AWS template/runtime | **7 isolated TLS/auth proxy checks passed** with the committed console image and reviewed Caddy; CloudFormation eu-west-1 lint, Compose validation and shell syntax pass. Release export requires clean source and matching application-image OCI source labels; no cloud resources are created. |
 
 Nested test counts are not counted twice. The bounded Rust test concurrency matches
@@ -66,6 +66,16 @@ production five-second command contract while keeping the paper actor permanentl
 unpolled, requiring the durable owner acknowledgement and primary orders, and
 asserting paper version zero. Production timeouts and freshness remain unchanged;
 the test establishes independence, not a disk-latency SLA.
+
+An earlier local smoke of commit 9704d4c stopped before Resume with
+`aggregate execution contradiction or mixed accounting` while selecting a demo
+market (engine log UTC 15:04:55.928707 through 15:04:58.532369). A backward clock
+jump that revisits a resolved market can produce this exact refusal; the failed
+fixture journal was cleaned up, so that possible trigger is **not an established
+cause**. The unchanged rerun passed all 13 checks with zero live orders. Windows
+and Docker UTC agreed at the later 15:08:14 observation. The ledger invariant
+was retained: a failing cloned candidate is never committed. Clock sync and
+continuous operation remain selected-host acceptance requirements.
 
 DepositWallet type 3 uses canonical ERC7739 CLOB order signatures with the
 controlling EOA in authenticated headers and the contract wallet as maker/order
