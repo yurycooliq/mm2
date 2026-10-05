@@ -1,4 +1,4 @@
-use mm2_engine::{api::Api, auth::Auth, config::Config, runtime, sources};
+use mm2_engine::{api::Api, auth::Auth, config::Config, runtime, sources, tls};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -11,6 +11,10 @@ fn main() {
         .with_target(false)
         .with_max_level(tracing::Level::INFO)
         .init();
+    if let Err(error) = tls::initialize() {
+        tracing::error!(error_class=%error,"engine stopped");
+        std::process::exit(1);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

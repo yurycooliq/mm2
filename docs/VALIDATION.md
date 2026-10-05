@@ -1,6 +1,6 @@
 # Validation evidence
 
-## Current checkpoint: October 5, 2026 — public feed access and private venue setup
+## Current checkpoint: October 5, 2026 — public feed access, TLS startup and private venue setup
 
 The public source previously stopped before Gamma discovery whenever the
 order-placement geoblock endpoint was negative or unavailable. Public read-only
@@ -16,6 +16,23 @@ eligibility. The official documents and endpoint disagree; see
 [POLYMARKET_ACCESS.md](POLYMARKET_ACCESS.md) for exact evidence and an unsent
 support/co-location draft.
 
+The first `5bb4762` rollout failed during Rust WebSocket startup: the unified
+dependency graph enabled both Rustls providers, and the implicit provider choice
+panicked. The preceding `55a37ce` release was restored and its paused API verified;
+private settings and durable journals were retained. The engine now explicitly
+installs the pinned AWS-LC provider before constructing Tokio or network workers,
+with certificate and hostname verification unchanged. A regression exercises a
+real default WSS TLS handshake under the dual-provider dependency graph.
+
+The corrected optimized engine image passed a 35-second online public smoke on
+the local Docker host (67 samples). Both fresh Polymarket outcome books and a
+fresh Binance reference were observed together, with one stable paused shadow
+boot, no funded actor and no orders. This is connectivity evidence, not latency
+of authenticated order placement. The acceptance script now fails on absent
+feeds, exits, faults, API loss, restarts, execution/control changes or cleanup
+ownership mismatch, and includes publication lag in observer-time freshness.
+Actual AWS acceptance remains a separate check before switching production.
+
 The owner privately provisioned the wallet key. Server-side public-key derivation
 confirmed the reviewed controlling EOA `0xa2300f310b59df6d0dec94576776ce5435bd0b3f`;
 no key value was returned, no authentication signature or transaction was sent,
@@ -26,12 +43,12 @@ CLOB secret padding is normalized without changing its decoded HMAC bytes.
 
 | Check | Confirmed scope |
 | --- | --- |
-| Rust | **218 workspace tests passed** on pinned Rust 1.98.1; includes two new regressions for read-only discovery and independent funded refusal. Locked optimized workspace build, format and Clippy workspace/all-targets `-D warnings` passed. |
+| Rust | **220 workspace tests passed** on pinned Rust 1.98.1; includes read-only discovery, independent funded refusal, dual-provider default WSS startup and production healthcheck regressions. Locked optimized workspace build, format and Clippy workspace/all-targets `-D warnings` passed. |
 | Console | **77 tests passed** in the production Linux container and again during image construction. |
-| Operations/private setup | **89 Linux tests passed, no skips**, including 28 helper tests for hidden inputs, identity, atomic preservation, strict reply schemas, new credential modes and 31/32-byte CLOB padding. |
+| Operations/private setup | **97 Linux tests passed, no skips**, including 28 helper tests for hidden inputs, identity, atomic preservation, strict reply schemas, new credential modes and 31/32-byte CLOB padding, plus eight public smoke acceptance tests. |
 | Data/latency | **55 tests passed**, with pyarrow 25.0.0 and websockets 15.0.1. |
 | Strategy parity | **6 TypeScript vectors passed**; the corresponding Rust parity test passed in the workspace run. |
-| Production containers | **13 checks passed**, including offline funded refusal, isolated console outage, durable command/crash recovery, ownership fence and read-only non-root images; zero live orders. Observed total 23,750 ms and graceful engine stop 828 ms are local observations, not an SLA. |
+| Production containers | **13 checks passed** with the corrected optimized engine, including offline funded refusal, isolated console outage, durable command/crash recovery, ownership fence and read-only non-root images; zero live orders. Observed total 57,500 ms and graceful engine stop 1,250 ms are local observations, not an SLA. |
 
 An additional Windows console run under local load had one socket timeout and
 one time-sensitive fixture become stale (75 passed, one error, one failure).
