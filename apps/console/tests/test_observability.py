@@ -8,7 +8,7 @@ import unittest
 from mm2_console.app import App
 from mm2_console.config import Config
 from mm2_console.engine import Reply
-from mm2_console.observability import execution_summary, journal_summary, money
+from mm2_console.observability import execution_summary, journal_summary, money, health_identity, health_log
 from mm2_console.telegram import TelegramBot
 
 
@@ -44,6 +44,24 @@ def state(profile="both"):
 
 
 class ObservabilityTests(unittest.TestCase):
+    def test_closeout_status_is_bounded_and_does_not_expose_signed_wire_or_infer_net_pnl(self):
+        sample = state("trading")
+        baseline = health_identity(sample)
+        sample["live"].update({"returned_collateral_micros": 5_000_000, "chain_pending_hash": "0x" + "a" * 64,
+                               "last_chain_error": "RPC outcome unknown", "session_gas_cost_wei": "1000",
+                               "raw_transaction": "private-signed-material", "chain_pending_kind": "batch",
+                               "relayer": {"body": "private-signed-batch", "signature": "private-owner-signature"}})
+        summary = execution_summary(sample)
+        self.assertEqual(summary["real"]["returned_collateral_usd"], "5")
+        self.assertIsNone(summary["real"]["pnl_usd"])
+        self.assertNotIn("private-signed-material", json.dumps(summary))
+        self.assertNotIn("private-signed-batch", json.dumps(summary))
+        self.assertNotIn("private-owner-signature", json.dumps(summary))
+        self.assertEqual(summary["real"]["chain_pending_kind"], "batch")
+        self.assertNotEqual(baseline, health_identity(sample))
+        level, text = health_log(sample)
+        self.assertEqual(level, "WARN")
+        self.assertIn("closeout", text)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)

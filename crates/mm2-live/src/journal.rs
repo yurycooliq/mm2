@@ -37,6 +37,9 @@ pub(crate) struct Journal {
     pub bytes: u64,
     segment_bytes: u64,
     maximum: u64,
+    poisoned: bool,
+    #[cfg(test)]
+    fail_sync_once: bool,
 }
 impl Journal {
     pub fn open(directory: &Path, settings: &LiveSettings) -> Result<(Self, Ledger), String> {
@@ -185,11 +188,17 @@ impl Journal {
                 bytes,
                 segment_bytes,
                 maximum: settings.journal_max_bytes,
+                poisoned: false,
+                #[cfg(test)]
+                fail_sync_once: false,
             },
             ledger,
         ))
     }
     pub fn commit(&mut self, reason: &str, ledger: &Ledger) -> Result<(), String> {
+        if self.poisoned {
+            return Err("live journal write outcome unknown; checked restart required".into());
+        }
         let hash = digest(self.sequence, &self.hash, reason, ledger)?;
         let mut bytes = serde_json::to_vec(&Record {
             sequence: self.sequence,
@@ -209,6 +218,9 @@ impl Journal {
         {
             return Err("live journal emergency cancel reserve reached; new posts stopped".into());
         }
+        // A failed write/fsync may have persisted any prefix, including the complete record.
+        // The sequence/hash cannot be reused until replay determines the durable boundary.
+        self.poisoned = true;
         if self.segment_bytes > 0 && self.segment_bytes + bytes.len() as u64 > SEGMENT_BYTES {
             self.file = OpenOptions::new()
                 .create_new(true)
@@ -223,13 +235,28 @@ impl Journal {
         }
         self.file
             .write_all(&bytes)
-            .and_then(|()| self.file.sync_all())
+            .map_err(|_| "durable live journal write failed")?;
+        #[cfg(test)]
+        if self.fail_sync_once {
+            self.fail_sync_once = false;
+            return Err("injected live journal fsync failure after complete write".into());
+        }
+        self.file
+            .sync_all()
             .map_err(|_| "durable live journal write failed")?;
         self.sequence += 1;
         self.bytes += bytes.len() as u64;
         self.segment_bytes += bytes.len() as u64;
         self.hash = hash;
+        self.poisoned = false;
         Ok(())
+    }
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+    #[cfg(test)]
+    pub fn fail_next_sync(&mut self) {
+        self.fail_sync_once = true;
     }
 }
 fn sync_directory(path: &Path) -> Result<(), String> {
@@ -242,6 +269,7 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 pub(crate) fn validate_ledger(ledger: &Ledger, settings: &LiveSettings) -> Result<(), String> {
+    crate::settlement::validate(ledger, settings)?;
     if ledger.orders.len() > 256
         || ledger.positions.len() > 128
         || ledger.position_floor.len() > 128
@@ -308,7 +336,7 @@ pub(crate) fn validate_ledger(ledger: &Ledger, settings: &LiveSettings) -> Resul
             || !crate::settings::condition(&position.condition_id)
             || !token(&position.token_id)
             || position.quantity_micros > 1_000_000_000_000_000
-            || cost > 10u128.pow(32)
+            || cost > u128::from(position.quantity_micros) * 2_000_000
         {
             return Err("invalid recovered position structure".into());
         }

@@ -40,10 +40,36 @@ def preflight_trading(path, mode):
         address = live.get(field)
         if not isinstance(address, str) or not re.fullmatch(r"0x[0-9a-fA-F]{40}", address) or int(address[2:], 16) == 0:
             raise ValueError("trading profile public account/deployment addresses are not configured")
-    if live.get("protocol") != 2 or live.get("chain_id") != 137 or live.get("clob_url") != "https://clob-v2.polymarket.com":
+    if live.get("protocol") != 2 or live.get("chain_id") != 137 or live.get("clob_url") != "https://clob.polymarket.com":
         raise ValueError("trading profile must explicitly select the supported Polygon CLOB V2 deployment")
     if not live.get("allowed_conditions") and not live.get("allowed_market_prefixes"):
         raise ValueError("trading profile needs an explicit approved market allowlist")
+    chain = live.get("chain")
+    if not isinstance(chain, dict) or chain.get("rpc_env") != "MM2_POLYGON_RPC_URL":
+        raise ValueError("trading profile needs its explicit onchain closeout transport")
+    signature_type = live.get("signature_type")
+    if type(signature_type) is not int or signature_type not in (0, 1, 2, 3):
+        raise ValueError("trading profile needs an explicit supported signature type")
+    signer = live["signer_address"].lower()
+    funder = live["funder_address"].lower()
+    if live["owner_address"].lower() != funder or (signature_type == 0 and signer != funder):
+        raise ValueError("trading profile account, funder and controller binding is inconsistent")
+    relayer = chain.get("relayer")
+    if signature_type == 3:
+        if signer == funder or not isinstance(relayer, dict):
+            raise ValueError("deposit-wallet trading needs a separate controlling signer and explicit relayer")
+        defaults = {"url": "https://relayer-v2.polymarket.com", "key_env": "MM2_POLY_RELAYER_API_KEY",
+                    "key_address_env": "MM2_POLY_RELAYER_API_KEY_ADDRESS"}
+        if any(relayer.get(key, value) != value for key, value in defaults.items()):
+            raise ValueError("deposit-wallet startup requires the documented official relayer and runtime key names")
+        for key, default, minimum, maximum in (("deadline_seconds", 600, 60, 3600),
+                                               ("log_chunk_blocks", 50, 10, 5000),
+                                               ("max_scan_pages", 8, 1, 32)):
+            value = relayer.get(key, default)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError("deposit-wallet startup requires finite relayer deadline and scan bounds")
+    elif relayer is not None:
+        raise ValueError("relayer startup is supported only for deposit-wallet signature type")
 
 
 def main(argv=None):

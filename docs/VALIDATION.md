@@ -1,87 +1,115 @@
 # Validation evidence
 
-## Current checkpoint: October 5, 2026
+## Current checkpoint: October 5, 2026 — closeout and AWS package
 
-This section describes the October 5 implementation checkpoint. The October 1 evidence
-below is a historical baseline, not validation of the newer SDK, portfolio,
-segmented journals or execution profiles. No funded venue orders, real Telegram
-recipient or cloud deployment were used. Selected-host/eligibility, authenticated
-account acceptance, HTTPS/Telegram delivery and economic holdout remain external.
+This is local verification of the implemented package. No funded venue order,
+real Polygon transaction, actual Telegram recipient or AWS deployment was used.
+Account compatibility, selected-host eligibility/performance, real HTTPS/Telegram
+acceptance and economic holdout remain external checks.
 
 | Current check | Confirmed result and scope |
 | --- | --- |
-| Console Python | **24 passed**: owner/auth/CSRF, stale publication and receipt recovery, mocked Telegram, real/paper summaries and bounded historical projection. |
-| Operations Python | **23 passed** on Windows and pinned Linux: offline ledger integrity/fences/backup/restore, shared account sidecar, independent lane capacity, loopback-only soak and startup preflight. |
-| Data/latency Python | **55 passed**, pinned optional dependencies, **no skipped tests**; includes Parquet and local fake HTTP/WebSocket servers. |
-| Reference/strategy Node | **25 passed = 19 archive/execution + 6 scoped strategy parity vectors**; separate pinned Node 22/24 jobs. |
-| Dashboard Node | **4 passed** for persisted command identity, uncertain/rejected outcomes, matching receipts and exact limits. |
-| Final Playwright fixtures | **PASS** for three execution profiles, separate real/paper displays, mobile owner flow and retry of an unresolved command. These are controlled fixture accounts, not funded venue executions. |
-| Final Rust workspace/fmt/Clippy/release | **137 tests passed**, formatting and Clippy with `-D warnings` passed; locked optimized workspace build passed inside the production Dockerfile. |
-| Final production container build/integration | **Both images built; 13 checks passed** on the new local images. Includes all five packaged profiles, offline refusal of blank funded profiles, owner/receipt boundaries, delivered paper fills, console outage, crash recovery, journal fence and graceful shutdown. |
+| Rust workspace | **214 tests passed** with two test threads; format, Clippy `-D warnings` and locked optimized workspace build passed on Rust 1.98.1. Includes **99 mm2-live tests**, exact signed recovery, finalized effects, imported/owned capital, receipt/account races, private-stream cleanup and persistence failure. |
+| Console Python | **25 passed**: owner/auth/CSRF, stale publication and command recovery, mocked Telegram, independent lane summaries and public chain telemetry without signed bytes. |
+| Operations Python | **60 passed on pinned Linux/Python 3.13, no skips**: source/image identity, private environment, mount refusal, encrypted retention, SSH revocation, engine restart preflight, independent secondary recovery, duplicate identities, timeout cleanup, backup/restore and lane capacity. |
+| Data/latency Python | **55 passed**, pyarrow 25.0.0 / websockets 15.0.1, **no skipped tests**; Parquet and local fake HTTP/WebSocket servers. |
+| Reference/strategy Node | **25 passed = 19 archive/execution + 6 scoped strategy parity vectors**. |
+| Dashboard Node/build | **7 passed**, TypeScript and production Vite build passed; command identity and exact unsigned balance/signed loss formatting. |
+| Playwright fixtures | **16 cases / 21 screenshots passed** at desktop 1440x1100 and mobile 390x844: simulation/trading/both, fixed initial capital, actual risk caps, signed loss, stale refusal, cancel confirmation and exact lost-ACK retry after reload. Pending closeout alone permits a fresh Resume when every readiness gate passes. |
+| Production images/integration | **Earlier closeout image checkpoint: both production images built; 13 checks passed**, including five profiles, blank funded refusal, paper fills, console outage, crash recovery, journal fence and graceful stop. Observed run 21,203 ms / engine stop 641 ms; local observations, not an SLA. |
+| AWS template/runtime | **Earlier closeout image checkpoint: 7 isolated TLS/auth proxy checks passed** and reviewed Caddy; CloudFormation eu-west-1 lint, Compose validation and shell syntax pass. Release export requires clean source and matching application-image OCI source labels; no cloud resources are created. |
 
-Detailed new code is documented in [STATUS_HANDOFF_2026-10-05.md](STATUS_HANDOFF_2026-10-05.md).
-Passing individual subsets is not a complete workspace or remote-CI claim; nested
-test counts must not be counted twice.
+Nested test counts are not counted twice. The bounded Rust test concurrency matches
+the two-worker build budget; runtime freshness/heartbeat limits were not relaxed.
+Mock RPCs use public fixture keys and local servers. Browser fixtures prove owner
+flow behavior, not funded execution or real Telegram embedding.
 
-The final workspace pass uses two test threads, matching the two-worker build
-budget in Docker/CI. Unlimited simultaneous durable-journal tests caused a
-transport-fixture timeout on the resource-constrained local host. The isolated
-integration retry and bounded final workspace pass succeed; no runtime freshness,
-heartbeat or execution timeout was relaxed.
+### Implemented execution and recovery
 
-The container run took 23,453 ms; graceful demo-engine stop took 859 ms. These
-are single local observations, not host or funded-execution SLAs. It submitted
-zero live orders and removed only its owner-labelled disposable resources.
-The local engine image is `sha256:435b93e925901f84d418ed77b487ab720c7a2b7a57f9af7c9c9eb463b54f808f`;
-console is `sha256:d6da31422e6239b62e7b6401e1f2efcd0c5691020fc8e979e88b7b50a68ed335`.
-These local image identifiers are not a published registry release. Remote CI
-is tracked separately by the workflow and must be checked for the intended commit.
+Five profiles start paused: demo, public simulation, shadow, trading and both.
+The six Rust crates keep deterministic core/strategy/portfolio separate from
+transport and from Telegram/SQLite/UI. Trading/both share the funded account
+ledger and fence; the companion paper lane has its own finite cash and journal.
+Startup capital is immutable in the owner quote-settings flow; UI displays the
+actual configured funded risk caps.
 
-Regression coverage includes fill/account snapshot skew without duplicate
-positions, actual maker-fee admission and hedge progress, eight-query bounded
-reconciliation with no partial refresh, legal 100-to-2500 paper tick transitions,
-portfolio loss halts after settlement, and replay of a Resume that never reached
-the secondary actor before a crash.
+The BUY-only adapter pins V2 SDK 0.7.0 and the validated Polygon deployment.
+Standard-market merge/redemption is implemented for EOA, canonical proxy,
+one-owner Safe and the pinned native-beacon DepositWallet. Direct wallets use a
+separate worker that persists exact signed raw transactions before
+broadcast, retains hash/nonce through lost acknowledgements and only credits
+canonical finalized transaction effects. Missing receipt is never proof of
+absence. A pre-effect account result cannot resurrect settled inventory.
 
-### Implemented current boundaries
+Owned return, retained cost basis and daily/session budgets are tested separately
+from imported inventory. Redemption adapter dust is observable but cannot create
+owned risk capital. Failed transactions charge actual bounded gas and credit no
+cash. Final net PnL remains unavailable because conservative fees and POL currency
+conversion are not invented. Signed wire material remains in private journals.
 
-The package now has six Rust crates, fixed-point strategy/portfolio contracts,
-paused demo/public simulation/shadow/trading/both profiles, separate lane capital,
-a common trading/both account ledger/fence, multi-market paper identity and finite
-journal rotation/recovery. Trading/both templates are unauthorized and blank by
-default. The limited adapter pins V2 SDK 0.7.0 and validated Polygon deployment.
-Its technical checks use mocks; deployed protocol/account/host compatibility is
-not established. V3 positions, deposit-wallet EIP-1271, sells and on-chain
-merge/redemption remain unsupported.
+Failed write/rotation/fsync poisons the journal writer until checked restart;
+Reset cannot clear it. Terminal diagnostics are bounded in later checkpoints,
+while original audit records remain retained. Positive inventory and uncertainty
+are never removed to recover capacity. Private WebSocket ownership, reconnect,
+heartbeat and shutdown are bounded and independently tested.
 
-Owner/paper journal default capacity is 8 MiB per active segment and 128 MiB total,
-with separate finite archive/command/operation quotas. Live retains its own
-finite account journal; the companion paper has its own budget. No automatic
-pruning deletes identities or obligations. Offline maintenance/soak scripts are
-verified code, not evidence of a completed long-running host acceptance or
-off-host backup.
+DepositWallet type 3 uses canonical ERC7739 CLOB order signatures with the
+controlling EOA in authenticated headers and the contract wallet as maker/order
+signer. Its gasless closeout signs a fixed owner EIP712 Batch. The actor syncs the
+signed body and then a dispatch marker before one HTTP submission; recovered
+already-dispatched batches are never posted again. A batch digest is not a chain
+transaction hash. Full factory calldata/signature, wallet completion/execution
+and finalized transaction-specific CTF/pUSD effects establish success. Sponsored
+gas is observable but does not debit the owner's POL budget. Expiry is a separate
+canonical deadline/unchanged nonce/token proof: no fabricated receipt or capital
+credit, followed by Faulted/Reset/fresh Resume. Tests cover lost acknowledgement,
+restart, fsync failure, forged proofs, duplicate credit and private-body omission.
 
-Public paper observations drive an approximate queue/trade-volume model. Public
-prints/book changes are not proof of our own fills or exact queue priority.
-Synthetic complete-set merge/demo resolution and arithmetic multi-window runs
-remain model assumptions. The new deterministic portfolio does not turn replay
-into income evidence. Archive availability and import success are distinct from
-point-in-time economic eligibility.
+Public read-only inspection on Polygon block 95002118 identified the supplied
+profile wallet 0x04Ad8Cb08F04b58fbcEa273603d6cd151Ba8aDB4 as the pinned beacon
+DepositWallet controlled by 0xa2300f310b59df6d0dec94576776ce5435bd0b3f. Current
+E111 uses the known ADA100874 collateral adapter as outcome factory; the selected
+ADA100Db closeout adapter has the same pinned CTF/pUSD/USDCE tuple. Actual BTC5m
+Gamma/CLOB token IDs matched on-chain USDCE CTF derivation. CLOB coarse end dates
+are no longer compared with exact intraday expiry: independently refreshed Gamma
+establishes canonical slug, eventStartTime/endDate, reference and full token pair.
+These public observations do not establish private credentials or funded access.
+[Wallet authentication](https://docs.polymarket.com/trading/wallets-auth),
+[deployed factory source](https://sourcify.dev/server/v2/contract/137/0xada100874d00e3331d00f2007a9c336a65009718?fields=all).
 
-### Timing and evidence limits
+The supplied wallet has approvals for two known external full-balance redeemers.
+The code checks both and refuses Resume/preparation while either remains approved;
+no approval was changed. The owner must resolve that competing authority before
+funded activation. Native-beacon implementation/domain upgrades, legacy UUPS
+DepositWallets, V3 position orders, sells and unsupported markets fail closed.
+No funded order, transaction, API credential creation or actual Telegram message
+was performed. The public trading/both profiles retain owner_authorized=false.
 
-Core/strategy nanosecond benchmarks measure local computation. Runtime decision
-percentiles exclude transport, parsing, queue waits, execution durability and
-snapshot publication. The historical 100,000-call benchmark below repeatedly
-evaluates unchanged slots with orders already Live; it does not submit/cancel an
-order per iteration. Loopback soak measures owner API responsiveness. None
-establishes matching-engine arrival time or full authenticated post/cancel tails.
+### Deployment and evidence limits
 
-Production-storage durability is an execution dependency. Secondary formatting,
-sampling and SQLite are bounded and separate, with measured copying and
-coalescing costs. Zero overhead is not claimed. No untouched economic holdout,
-realized trading PnL, funded canary, selected-host 24-hour soak or real Telegram
-embedding/delivery is claimed by the current checks.
+The AWS package retains encrypted account storage, binds immutable Linux/amd64
+images and contains only explicitly allowed public files. Runtime secrets and
+ledger state are supplied separately on the host. Production engine recovery is
+owned by systemd and must repeat release/storage/profile preflight; console/proxy
+recovery is independent. All recovery starts paused. The ordinary candidate region
+is eu-west-1 (Ireland); direct London eu-west-2 co-location needs separate acceptance.
+See [AWS_DEPLOY.md](AWS_DEPLOY.md) and [LIVE_GATEWAY.md](LIVE_GATEWAY.md).
+
+Owner/paper journal defaults are 8 MiB per active segment and 128 MiB total;
+live retains a separate bounded account journal. Capacity needs a selected-host
+operational plan. Offline backup/restore and loopback soak verify code, not a
+completed 24-hour host acceptance or an off-host backup.
+
+Public paper queue/trade-volume observations are approximate; public prints are
+not proof of our own fills. Synthetic merge/demo resolution and arithmetic
+multi-window runs remain model evidence. Pendulumflow import availability is
+separate from point-in-time scoring quality and an untouched economic holdout.
+
+Local computation benchmarks, owner API responsiveness and container shutdown
+times cannot establish matching-engine arrival or authenticated post/cancel tails.
+Storage durability remains an execution dependency. Secondary sampling/copying
+has bounded nonzero cost. No realized income, funded canary, long host soak or
+real Telegram delivery is claimed by these checks.
 
 ## Historical baseline: October 1, 2026
 

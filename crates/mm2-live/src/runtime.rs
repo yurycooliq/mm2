@@ -24,6 +24,10 @@ struct Quotes {
     now_ms: u64,
     sequence: u64,
 }
+
+#[cfg(test)]
+#[path = "chain_runtime_tests.rs"]
+mod chain_runtime_tests;
 enum Command {
     Control(
         String,
@@ -36,8 +40,11 @@ enum ResultEvent {
     Prepared(Box<(LiveQuote, Result<PreparedOrder, String>)>),
     Posted(String, Result<PostResult, String>),
     Cancelled(Vec<String>, Result<Vec<String>, String>),
-    Reconciled(Result<AccountObservation, String>),
+    Reconciled(u64, Result<AccountObservation, String>),
     Heartbeat(Result<(), String>),
+    ChainPrepared(Box<(ChainPlan, Result<PreparedChainTransaction, String>)>),
+    ChainSubmitted(Result<Option<String>, String>),
+    ChainObserved(Result<ChainObservation, String>),
 }
 #[derive(Clone)]
 pub struct LiveHandle {
@@ -203,6 +210,12 @@ impl LiveRuntime {
             commands_open: true,
             events_open: true,
             quotes_open: true,
+            chain_busy: false,
+            chain_query_next: true,
+            next_chain: Instant::now(),
+            last_chain_error: None,
+            chain_effect_epoch: 0,
+            chain_last_condition: None,
         };
         tokio::spawn(actor.run());
         Ok(LiveHandle {
@@ -254,6 +267,12 @@ struct Actor {
     commands_open: bool,
     events_open: bool,
     quotes_open: bool,
+    chain_busy: bool,
+    chain_query_next: bool,
+    next_chain: Instant,
+    last_chain_error: Option<String>,
+    chain_effect_epoch: u64,
+    chain_last_condition: Option<String>,
 }
 fn matching(actual: &LiveQuote, desired: &LiveQuote) -> bool {
     let mut a = actual.clone();
@@ -278,6 +297,7 @@ fn available_collateral(ledger: &Ledger) -> u64 {
     let base = ledger
         .initial_collateral_micros
         .unwrap_or(0)
+        .saturating_add(ledger.returned_collateral_micros)
         .saturating_sub(spent_micro);
     ledger
         .collateral_micros
@@ -344,7 +364,7 @@ fn snapshot(
         available_micros: available,
         session_spent_pico: ledger.session_spent_pico.clone(),
         daily_loss_micros: ledger.daily_loss_micros,
-        daily_loss_metric: "conservative_gross_purchase_loss_bound".into(),
+        daily_loss_metric: "conservative_purchase_minus_confirmed_owned_returns_loss_bound".into(),
         pnl_available: false,
         orders: ledger
             .orders
@@ -376,16 +396,75 @@ fn snapshot(
         prepare_attempts: 0,
         prepare_failures: 0,
         last_prepare_error: None,
-        unsupported_operations: vec![
-            "sell".into(),
-            "onchain_merge".into(),
-            "onchain_redemption".into(),
-            "v3_positions".into(),
-            "deposit_wallet_1271".into(),
-        ],
+        unsupported_operations: vec!["sell".into(), "v3_positions".into()]
+            .into_iter()
+            .chain(if settings.chain.is_none() {
+                vec![
+                    "onchain_merge_disabled".into(),
+                    "onchain_redemption_disabled".into(),
+                ]
+            } else {
+                vec![]
+            })
+            .collect(),
+        returned_collateral_micros: ledger.returned_collateral_micros,
+        conservative_realized_pnl_pico: (i128::from(ledger.returned_collateral_micros) * 1_000_000
+            - ledger.realized_cost_pico.parse::<i128>().unwrap_or(0))
+        .to_string(),
+        chain_pending_hash: ledger.chain_pending.as_ref().map(|p| p.hash.clone()),
+        chain_pending_kind: ledger.chain_pending.as_ref().map(|p| {
+            if p.relayer.is_some() {
+                "batch"
+            } else {
+                "transaction"
+            }
+            .into()
+        }),
+        chain_receipts: ledger.chain_receipts.clone(),
+        chain_expiries: ledger.chain_expiries.clone(),
+        last_chain_error: None,
+        risk_limits: settings.risk.clone(),
+        session_gas_cost_wei: if ledger.session_gas_cost_wei.is_empty() {
+            "0".into()
+        } else {
+            ledger.session_gas_cost_wei.clone()
+        },
     }
 }
 impl Actor {
+    async fn launch_chain_submit(&mut self, mut prepared: PreparedChainTransaction) {
+        if let Some(relay) = &mut prepared.relayer {
+            if relay.dispatched {
+                return;
+            }
+            relay.dispatched = true;
+            let mut next = self.ledger.clone();
+            next.chain_pending = Some(prepared.clone());
+            if self
+                .persist("relayer_dispatch_before_send_once", next)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        self.chain_busy = true;
+        self.chain_query_next = true;
+        let venue = self.venue.clone();
+        let tx = self.results_tx.clone();
+        self.workers.spawn(async move {
+            let result =
+                tokio::time::timeout(Duration::from_secs(10), venue.submit_chain(prepared))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(
+                    "chain broadcast response unknown; original transaction remains reserved"
+                        .into(),
+                )
+                    });
+            let _ = tx.send(ResultEvent::ChainSubmitted(result)).await;
+        });
+    }
     fn publication_state(&self) -> PublicationState {
         PublicationState {
             connected: self.connected,
@@ -406,6 +485,7 @@ impl Actor {
             state.prepare_attempts = self.prepare_attempts;
             state.prepare_failures = self.prepare_failures;
             state.last_prepare_error = self.last_prepare_error.clone();
+            state.last_chain_error = self.last_chain_error.clone();
             self.publish.send_replace(Arc::new(state));
         }
     }
@@ -429,6 +509,9 @@ impl Actor {
             })
     }
     async fn persist(&mut self, reason: &str, next: Ledger) -> Result<(), String> {
+        if self.journal.as_ref().is_none_or(Journal::is_poisoned) {
+            return Err("live persistence is poisoned; checked restart required".into());
+        }
         if let Err(error) = crate::journal::validate_ledger(&next, &self.settings) {
             self.ledger.phase = LivePhase::Faulted;
             self.ledger.fault = Some(error.clone());
@@ -484,6 +567,12 @@ impl Actor {
                 return Err("live command ID payload conflict".into());
             }
             return Ok(receipt.clone());
+        }
+        if self.journal.as_ref().is_none_or(Journal::is_poisoned) {
+            return Err(
+                "live persistence is poisoned; Reset cannot recover it; checked restart required"
+                    .into(),
+            );
         }
         if self.ledger.receipts.len() >= 2048 {
             return Err("live command receipt capacity reached".into());
@@ -543,6 +632,14 @@ impl Actor {
         };
     }
     fn risk(&self, quote: &LiveQuote) -> Result<(), String> {
+        if self
+            .ledger
+            .chain_pending
+            .as_ref()
+            .is_some_and(|p| p.plan.condition_id == quote.condition_id)
+        {
+            return Err("market inventory reserved for pending closeout".into());
+        }
         let limits = &self.settings.risk;
         let active: Vec<_> = self
             .ledger
@@ -555,11 +652,7 @@ impl Actor {
         }
         let commitment = quote.commitment_pico();
         let reserve = self.ledger.reserved_pico();
-        let spent: u128 = self
-            .ledger
-            .session_spent_pico
-            .parse()
-            .map_err(|_| "corrupt spend")?;
+        let spent = self.ledger.net_spent_pico()?;
         let positions_cost = self
             .ledger
             .positions
@@ -683,6 +776,11 @@ impl Actor {
                     return;
                 }
                 let mut next = self.ledger.clone();
+                next.collect_terminal_diagnostics();
+                if let Err(error) = next.remember_market(&prepared.quote) {
+                    self.fault(error).await;
+                    return;
+                }
                 // Only terminal diagnostics may be pruned; active uncertainty is never evicted.
                 if next.orders.len() >= 256 {
                     let keys: Vec<_> = next
@@ -801,11 +899,20 @@ impl Actor {
                 let _ = self.persist("cancel_response_requires_query", next).await;
                 self.next_reconcile = Instant::now();
             }
-            ResultEvent::Reconciled(result) => {
+            ResultEvent::Reconciled(epoch, result) => {
                 self.reconciling = false;
+                if epoch != self.chain_effect_epoch {
+                    self.next_reconcile = Instant::now();
+                    return;
+                }
                 match result {
                     Ok(account) => {
                         let mut next = self.ledger.clone();
+                        let day = now_ms() / 86_400_000;
+                        if next.loss_day != day {
+                            next.loss_day = day;
+                            next.daily_loss_micros = 0;
+                        }
                         let before_spent = next.session_spent_pico.parse::<u128>().unwrap_or(0);
                         for observation in account.orders {
                             if next.orders.contains_key(&observation.order_id)
@@ -868,6 +975,7 @@ impl Actor {
                                 .div_ceil(1_000_000)
                                 .min(u128::from(u64::MAX)) as u64,
                         );
+                        next.collect_terminal_diagnostics();
                         let old = serde_json::to_vec(&self.ledger).ok();
                         let new = serde_json::to_vec(&next).ok();
                         if old != new
@@ -904,12 +1012,231 @@ impl Actor {
                     self.desired.clear();
                 }
             }
+            ResultEvent::ChainPrepared(preparation) => {
+                self.chain_busy = false;
+                self.next_chain = Instant::now() + Duration::from_secs(5);
+                let (plan, result) = *preparation;
+                let prepared = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.last_chain_error = Some(error.chars().take(256).collect());
+                        self.publish();
+                        return;
+                    }
+                };
+                if self.ledger.phase != LivePhase::Running || !self.healthy() {
+                    return;
+                }
+                if prepared.plan.id != plan.id
+                    || prepared.plan.condition_id != plan.condition_id
+                    || prepared.plan.operation != plan.operation
+                    || plan.token_ids.iter().any(|requested| {
+                        !requested.is_empty() && !prepared.plan.token_ids.contains(requested)
+                    })
+                {
+                    self.fault("prepared closeout differs from requested intent".into())
+                        .await;
+                    return;
+                }
+                let Some(chain_settings) = &self.settings.chain else {
+                    return;
+                };
+                if let Err(error) =
+                    crate::chain::validate_prepared(&self.settings, chain_settings, &prepared)
+                        .and_then(|()| self.ledger.admit_chain(&prepared))
+                {
+                    self.last_chain_error = Some(error.chars().take(256).collect());
+                    self.publish();
+                    return;
+                }
+                let gas = self
+                    .ledger
+                    .session_gas_cost_wei
+                    .parse::<u128>()
+                    .unwrap_or(0);
+                let reserve = prepared
+                    .maximum_gas_cost_wei
+                    .parse::<u128>()
+                    .unwrap_or(u128::MAX);
+                let cap = chain_settings
+                    .max_session_gas_cost_wei
+                    .parse::<u128>()
+                    .unwrap_or(0);
+                if gas.checked_add(reserve).is_none_or(|sum| sum > cap) {
+                    self.fault("session Polygon gas budget reached".into())
+                        .await;
+                    return;
+                }
+                let mut next = self.ledger.clone();
+                next.chain_pending = Some(prepared.clone());
+                if self
+                    .persist("signed_chain_intent_before_broadcast", next)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                self.last_chain_error = None;
+                self.launch_chain_submit(prepared).await;
+            }
+            ResultEvent::ChainSubmitted(result) => {
+                self.chain_busy = false;
+                self.chain_query_next = true;
+                self.next_chain = Instant::now() + Duration::from_secs(1);
+                match result {
+                    Ok(Some(id)) => {
+                        if id.is_empty()
+                            || id.len() > 128
+                            || !id
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        {
+                            self.fault(
+                                "invalid relayer acknowledgement identity; batch remains reserved"
+                                    .into(),
+                            )
+                            .await;
+                            return;
+                        }
+                        let mut next = self.ledger.clone();
+                        let Some(relay) =
+                            next.chain_pending.as_mut().and_then(|p| p.relayer.as_mut())
+                        else {
+                            self.fault("unexpected relayer acknowledgement".into())
+                                .await;
+                            return;
+                        };
+                        if !relay.dispatched
+                            || relay.request_id.as_ref().is_some_and(|prior| prior != &id)
+                        {
+                            self.fault(
+                                "relayer acknowledgement differs from durable dispatch".into(),
+                            )
+                            .await;
+                            return;
+                        }
+                        relay.request_id = Some(id);
+                        let _ = self.persist("relayer_request_acknowledged", next).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.last_chain_error = Some(error.chars().take(256).collect()),
+                }
+            }
+            ResultEvent::ChainObserved(result) => {
+                self.chain_busy = false;
+                self.next_chain = Instant::now() + Duration::from_secs(5);
+                match result {
+                    Ok(ChainObservation::Finalized(receipt)) => {
+                        let success = receipt.success;
+                        let mut next = self.ledger.clone();
+                        if let Err(error) = next.apply_chain_receipt(&receipt) {
+                            self.fault(error).await;
+                            return;
+                        }
+                        if !success {
+                            next.phase = LivePhase::Faulted;
+                            next.fault = Some(
+                                "finalized closeout failed; inspect receipt before Reset".into(),
+                            );
+                            self.desired.clear();
+                        }
+                        if self
+                            .persist("finalized_chain_receipt_capital_reconciliation", next)
+                            .await
+                            .is_ok()
+                        {
+                            self.chain_effect_epoch = self.chain_effect_epoch.saturating_add(1);
+                            self.account_reconciled = false;
+                            self.next_reconcile = Instant::now();
+                            self.last_chain_error = None;
+                        }
+                        self.chain_query_next = true;
+                    }
+                    Ok(ChainObservation::Expired(expiry)) => {
+                        let mut next = self.ledger.clone();
+                        if let Err(error) = next.apply_chain_expiry(&expiry) {
+                            self.fault(error).await;
+                            return;
+                        }
+                        next.phase = LivePhase::Faulted;
+                        next.fault = Some("signed DepositWallet batch expired without execution; inspect proof before Reset".into());
+                        self.desired.clear();
+                        if self
+                            .persist("expired_relayer_batch_without_economic_credit", next)
+                            .await
+                            .is_ok()
+                        {
+                            self.chain_effect_epoch = self.chain_effect_epoch.saturating_add(1);
+                            self.account_reconciled = false;
+                            self.next_reconcile = Instant::now();
+                            self.last_chain_error = None;
+                        }
+                        self.chain_query_next = true;
+                    }
+                    Ok(ChainObservation::Unknown) => {
+                        self.chain_query_next = false;
+                    }
+                    Err(error) => {
+                        self.chain_query_next = true;
+                        self.last_chain_error = Some(error.chars().take(256).collect());
+                    }
+                }
+            }
         }
         self.publish();
     }
     async fn pulse(&mut self) {
         let now = now_ms();
         let instant = Instant::now();
+        if self.settings.chain.is_some() && !self.chain_busy && instant >= self.next_chain {
+            if let Some(prepared) = self.ledger.chain_pending.clone() {
+                if !self.chain_query_next
+                    && self.ledger.phase == LivePhase::Running
+                    && self.healthy()
+                    && prepared.relayer.as_ref().is_none_or(|r| !r.dispatched)
+                {
+                    self.launch_chain_submit(prepared).await;
+                } else {
+                    self.chain_busy = true;
+                    let venue = self.venue.clone();
+                    let tx = self.results_tx.clone();
+                    self.workers.spawn(async move {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            venue.lookup_chain(prepared),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err("chain lookup timed out; transaction remains reserved".into())
+                        });
+                        let _ = tx.send(ResultEvent::ChainObserved(result)).await;
+                    });
+                }
+            } else if self.ledger.phase == LivePhase::Running
+                && self.healthy()
+                && let Some(plan) = self
+                    .ledger
+                    .closeout_candidate(now, self.chain_last_condition.as_deref())
+            {
+                self.chain_busy = true;
+                self.chain_last_condition = Some(plan.condition_id.clone());
+                let venue = self.venue.clone();
+                let tx = self.results_tx.clone();
+                self.workers.spawn(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        venue.prepare_chain(plan.clone()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err("chain preparation timed out; no transaction broadcast".into())
+                    });
+                    let _ = tx
+                        .send(ResultEvent::ChainPrepared(Box::new((plan, result))))
+                        .await;
+                });
+            }
+        }
         if self
             .quote_received
             .is_none_or(|t| t.elapsed().as_millis() > u128::from(self.settings.quote_ttl_ms))
@@ -978,12 +1305,13 @@ impl Actor {
             let venue = self.venue.clone();
             let tx = self.results_tx.clone();
             let timeout = self.settings.request_timeout_ms * 4;
+            let epoch = self.chain_effect_epoch;
             self.workers.spawn(async move {
                 let result =
                     tokio::time::timeout(Duration::from_millis(timeout), venue.reconcile(orders))
                         .await
                         .unwrap_or_else(|_| Err("account reconciliation timeout".into()));
-                let _ = tx.send(ResultEvent::Reconciled(result)).await;
+                let _ = tx.send(ResultEvent::Reconciled(epoch, result)).await;
             });
         }
         // A persistence failure must not keep venue orders alive indefinitely with heartbeats.

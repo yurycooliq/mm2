@@ -10,7 +10,7 @@ must never require funded account credentials or send authenticated venue orders
 | `mm2-emulator` | Deterministic event-time venue, post/cancel/notification delay, price-time queue approximation, finite trade volume, injected faults and serializable recovery. No exact venue FIFO or obtainable-return claim. |
 | `mm2-strategy` | Deterministic bounded BUY-only rules with explicit identity/freshness and optional signal gates. Inputs are supplied by the caller. |
 | `mm2-portfolio` | Finite market-keyed capital/position accounting, fees, reservations, risk and idempotent synthetic/on-chain receipt contracts. Receipt types do not submit blockchain transactions. |
-| `mm2-live` | Pinned V2 SDK adapter, signing/preparation, asynchronous post/cancel, reconciliation, heartbeat/user-stream supervision and independent durable account lifecycle. Technical tests use mocks. |
+| `mm2-live` | Pinned V2 SDK adapter, types 0/1/2 and native-beacon type 3 order signing, asynchronous post/cancel, reconciliation, heartbeat/user-stream supervision, direct/gasless closeout and independent durable account lifecycle. Technical tests use mocks. |
 | `mm2-engine` | Validated feed inputs, startup profile, selected strategy, multi-market paper integration, owner API/CAS receipts, streamed segmented journal recovery and bounded secondary publication. |
 
 ## Runtime selection and durable state
@@ -86,7 +86,12 @@ CI covers formatting, Clippy, locked workspace tests/release build, Python suite
 reference/parity fixtures, frontend tests/build and container integration. Current
 outcomes are recorded in [VALIDATION.md](VALIDATION.md); definitions here do not
 claim the latest remote CI run passed. The V2 adapter is a limited technical path
-validated in mocks. V3 positions, deposit-wallet EIP-1271, sells and on-chain
-merge/redemption are unsupported. Funded venue/account acceptance, economic
+validated in mocks, including the independent Polygon merge/redemption lifecycle,
+native-beacon DepositWallet ERC7739 CLOB signatures and send-once relayer recovery.
+Batch identity, actual transaction identity and canonical authorization expiry remain
+distinct; missing/failed HTTP acknowledgement never refreshes the wallet nonce or
+signature. Sole-writer readiness rejects external AutoRedeemer approvals. V3
+positions, negative-risk markets, legacy UUPS DepositWallets and sells are unsupported.
+Funded venue/account acceptance, private Relayer API eligibility, economic
 holdout, selected-host soak/latency and real HTTPS/Telegram delivery remain
 separate deployment gates.

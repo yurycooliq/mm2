@@ -36,6 +36,10 @@ export interface EngineState {
     orders: { order_id: string; quote: Order['quote']; phase: string; cumulative_filled_micros: number }[];
     positions: { condition_id: string; token_id: string; outcome: 'up' | 'down'; quantity_micros: number }[];
     fault: string | null; unsupported_operations: string[];
+    returned_collateral_micros?: number; conservative_realized_pnl_pico?: string;
+    chain_pending_hash?: string | null; last_chain_error?: string | null; session_gas_cost_wei?: string;
+    chain_pending_kind?: 'batch' | 'transaction' | null;
+    risk_limits?: { max_budget_micros: number; max_gross_micros: number; daily_loss_limit_micros: number; max_orders: number; max_markets: number };
   } | null;
   paper_portfolio?: { cash_pico: string; available_pico: string; spent_pico: string;
     position_count?:number;positions_truncated?:number;

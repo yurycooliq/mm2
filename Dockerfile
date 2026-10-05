@@ -14,6 +14,8 @@ RUN --mount=type=cache,id=mo-money-registry,target=/usr/local/cargo/registry,sha
     && cp target/release/mm2-emulator /build/mm2-emulator
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
+ARG MM2_SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$MM2_SOURCE_REVISION
 RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates \
     && rm -rf /var/lib/apt/lists/* && mkdir /data && chown 10001:10001 /data
 COPY --from=build /build/mm2-engine /build/mm2-emulator /usr/local/bin/

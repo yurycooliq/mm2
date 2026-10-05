@@ -18,5 +18,11 @@ export function picoMoney(value: unknown): string {
   const cents = BigInt(value) / 10_000_000_000n;
   return `$${(cents / 100n).toLocaleString('en-US')}.${(cents % 100n).toString().padStart(2, '0')}`;
 }
+export function signedPicoMoney(value: unknown): string {
+  if (typeof value !== 'string' || !/^-?\d{1,40}$/.test(value)) return '—';
+  const exact = BigInt(value);
+  const cents = (exact < 0n ? -exact : exact) / 10_000_000_000n;
+  return `${exact < 0n ? '-' : ''}$${(cents / 100n).toLocaleString('en-US')}.${(cents % 100n).toString().padStart(2, '0')}`;
+}
 export function safeVersion(state: EngineState | null): boolean { return !!state && Number.isSafeInteger(state.command_version) && state.command_version >= 0; }
 export function timeLabel(ms: number): string { return new Date(ms).toLocaleTimeString([], { hour12: false }); }

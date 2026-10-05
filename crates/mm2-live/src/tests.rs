@@ -699,6 +699,157 @@ fn hash_consistent_corrupt_quote_is_rejected_but_expired_unknown_survives_tighte
     drop(journal);
     assert!(crate::journal::Journal::open(bad_dir.path(), &config).is_err());
 }
+fn user_stream_timing() -> crate::sdk::UserStreamTiming {
+    crate::sdk::UserStreamTiming {
+        request: Duration::from_millis(250),
+        retry: Duration::from_millis(50),
+        ping: Duration::from_millis(30),
+        pong_timeout: Duration::from_millis(120),
+    }
+}
+fn fixture_user_subscription() -> String {
+    use polymarket_client_sdk_v2::{
+        auth::{Credentials, Uuid},
+        clob::ws::types::request::SubscriptionRequest,
+        ws::WithCredentials,
+    };
+    SubscriptionRequest::user(vec![])
+        .as_authenticated(&Credentials::new(
+            Uuid::from_u128(1),
+            "fixture-only-secret".into(),
+            "fixture-only-pass".into(),
+        ))
+        .unwrap()
+}
+#[test]
+fn private_messages_are_bounded_and_use_sdk_user_schemas() {
+    let order = serde_json::json!({"event_type":"order","id":"fixture-order","market":format!("0x{}","a".repeat(64)),"asset_id":"1","side":"BUY","price":"0.49"});
+    let notices = crate::sdk::user_notices(&order.to_string()).unwrap();
+    assert!(matches!(&notices[0], VenueNotice::OrderChanged(id) if id == "fixture-order"));
+    let batch = vec![order.clone(); 128];
+    assert_eq!(
+        crate::sdk::user_notices(&serde_json::to_string(&batch).unwrap())
+            .unwrap()
+            .len(),
+        128
+    );
+    assert!(crate::sdk::user_notices(&serde_json::to_string(&vec![order; 129]).unwrap()).is_err());
+    assert!(crate::sdk::user_notices("{invalid").is_err());
+    assert!(crate::sdk::user_notices("{\"event_type\":\"unexpected\"}").is_err());
+    assert!(crate::sdk::user_notices(&" ".repeat(65_537)).is_err());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_socket_shutdown_closes_the_owned_connection_and_does_not_reconnect() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (events, mut notices) = mpsc::channel(16);
+    let (stop, shutdown) = watch::channel(false);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let subscription = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(subscription.as_str()).unwrap();
+        assert_eq!(payload["type"], "user");
+        assert_eq!(payload["markets"], serde_json::json!([]));
+        assert_eq!(payload["auth"]["secret"], "fixture-only-secret");
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) if text.as_str() == "PING" => {
+                    socket.send(Message::Text("PONG".into())).await.unwrap()
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(_)) => break,
+                _ => {}
+            }
+        }
+        let _ = socket.close(None).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "shutdown must not open another connection"
+        );
+    });
+    let client = tokio::spawn(async move {
+        crate::sdk::listen_user_socket(
+            &endpoint,
+            fixture_user_subscription(),
+            events,
+            shutdown,
+            user_stream_timing(),
+        )
+        .await
+    });
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), notices.recv())
+            .await
+            .unwrap(),
+        Some(VenueNotice::Connected(true))
+    ));
+    stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(2), client)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_socket_silent_peer_disconnects_then_reconnects_with_a_new_subscription() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (events, mut notices) = mpsc::channel(16);
+    let (stop, shutdown) = watch::channel(false);
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let subscription = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let payload: serde_json::Value = serde_json::from_str(subscription.as_str()).unwrap();
+            assert_eq!(payload["type"], "user");
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) if attempt == 1 && text.as_str() == "PING" => {
+                        socket.send(Message::Text("PONG".into())).await.unwrap()
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            let _ = socket.close(None).await;
+        }
+    });
+    let client = tokio::spawn(async move {
+        crate::sdk::listen_user_socket(
+            &endpoint,
+            fixture_user_subscription(),
+            events,
+            shutdown,
+            user_stream_timing(),
+        )
+        .await
+    });
+    for expected in [true, false, true] {
+        assert!(
+            matches!(tokio::time::timeout(Duration::from_secs(2), notices.recv()).await.unwrap(), Some(VenueNotice::Connected(actual)) if actual == expected)
+        );
+    }
+    stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(2), client)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
 #[test]
 fn live_ledger_detects_partial_records_and_fences_second_executor() {
     use std::io::Write;
@@ -716,6 +867,46 @@ fn live_ledger_detects_partial_records_and_fences_second_executor() {
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     file.write_all(b"{broken").unwrap();
     assert!(crate::journal::Journal::open(dir.path(), &config).is_err());
+}
+#[test]
+fn failed_fsync_poison_prevents_duplicate_sequence_until_checked_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = settings();
+    let (mut journal, mut ledger) = crate::journal::Journal::open(dir.path(), &config).unwrap();
+    journal.commit("initial", &ledger).unwrap();
+    let initial_sequence = journal.sequence;
+    let path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
+    let initial_bytes = std::fs::metadata(&path).unwrap().len();
+    ledger.phase = LivePhase::Running;
+    journal.fail_next_sync();
+    assert!(journal.commit("owner_resume_unknown", &ledger).is_err());
+    assert!(journal.is_poisoned());
+    assert_eq!(journal.sequence, initial_sequence);
+    let unknown_bytes = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        unknown_bytes > initial_bytes,
+        "fsync failure can follow a complete write"
+    );
+    ledger.phase = LivePhase::Paused;
+    assert!(
+        journal
+            .commit("owner_reset_must_not_reuse_sequence", &ledger)
+            .is_err()
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), unknown_bytes);
+    drop(journal);
+    // Only startup replay may resolve a complete record whose acknowledgement was lost.
+    let (recovered, restored) = crate::journal::Journal::open(dir.path(), &config).unwrap();
+    assert!(!recovered.is_poisoned());
+    assert_eq!(recovered.sequence, initial_sequence + 1);
+    assert_eq!(restored.phase, LivePhase::Running);
 }
 #[tokio::test]
 async fn signed_intent_is_durable_before_post_pause_preserves_fills_and_duplicate_control() {

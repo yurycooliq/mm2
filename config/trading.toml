@@ -15,18 +15,18 @@ lot_shares = "5"
 half_width = "0.01"
 max_feed_age_ms = 1000
 
-# Owner fills these values locally after account/protocol/host validation.
+# Public wallet identity is configured; activation remains explicitly disabled.
 # No key values belong in this file. No allowance transaction is sent implicitly.
 [live]
-clob_url = "https://clob-v2.polymarket.com"
+clob_url = "https://clob.polymarket.com"
 chain_id = 137
 protocol = 2
-owner_address = ""
-signer_address = ""
-funder_address = ""
-exchange_address = ""
-collateral_address = ""
-signature_type = 0
+owner_address = "0x04Ad8Cb08F04b58fbcEa273603d6cd151Ba8aDB4"
+signer_address = "0xa2300f310b59df6d0dec94576776ce5435bd0b3f"
+funder_address = "0x04Ad8Cb08F04b58fbcEa273603d6cd151Ba8aDB4"
+exchange_address = "0xE111180000d2663C0091e4f400237545B87B996B"
+collateral_address = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+signature_type = 3
 private_key_env = "MM2_POLY_PRIVATE_KEY"
 api_key_env = "MM2_POLY_API_KEY"
 api_secret_env = "MM2_POLY_API_SECRET"
@@ -38,6 +38,25 @@ request_timeout_ms = 2000
 quote_ttl_ms = 1000
 heartbeat_interval_ms = 2000
 journal_max_bytes = 67108864
+
+[live.chain]
+rpc_env = "MM2_POLYGON_RPC_URL"
+adapter_address = "0xAdA100Db00Ca00073811820692005400218FcE1f"
+max_gas_limit = 1000000
+max_fee_per_gas_wei = 100000000000
+max_priority_fee_per_gas_wei = 30000000000
+max_transaction_cost_wei = "100000000000000000"
+max_session_gas_cost_wei = "1000000000000000000"
+minimum_confirmations = 12
+request_timeout_ms = 3000
+
+[live.chain.relayer]
+url = "https://relayer-v2.polymarket.com"
+key_env = "MM2_POLY_RELAYER_API_KEY"
+key_address_env = "MM2_POLY_RELAYER_API_KEY_ADDRESS"
+deadline_seconds = 600
+log_chunk_blocks = 50
+max_scan_pages = 8
 
 [live.risk]
 max_budget_micros = 100000000

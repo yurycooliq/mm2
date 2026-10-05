@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import { micro, modeLabel, money, picoMoney, simulated, timeLabel } from './model';
+import { micro, modeLabel, money, picoMoney, signedPicoMoney, simulated, timeLabel } from './model';
 import type { Command, CommandReply, Control, EngineState, Envelope, Limits as LimitsValue, Log, Sample } from './types';
 
 export function Login({ busy, error, login }: { busy: boolean; error: string | null; login: (token: string) => Promise<void> }) {
@@ -58,6 +58,10 @@ export function AccountBand({ state }: { state: EngineState | null }) {
     <div><dt>REAL AVAILABLE</dt><dd>{live.account_reconciled ? money(live.available_micros) : '—'}</dd></div>
     <div><dt>REAL POSITIONS</dt><dd>{live.positions.length}</dd></div>
     <p className="unknown-funds">Account {live.account_reconciled ? 'reconciled' : 'not reconciled'} · user stream {live.user_stream_connected ? 'connected' : 'disconnected'} · last reconciliation {live.last_reconciliation_ms ? timeLabel(live.last_reconciliation_ms) : 'unknown'}. {!state?.live_eligible && 'Displayed balances are the last sampled account state.'}</p>
+    {live.risk_limits && <p className="unknown-funds small">Trading caps · capital {money(live.risk_limits.max_budget_micros)} · gross {money(live.risk_limits.max_gross_micros)} · daily loss bound {money(live.risk_limits.daily_loss_limit_micros)} · {live.risk_limits.max_orders} orders / {live.risk_limits.max_markets} markets.</p>}
+    {live.returned_collateral_micros !== undefined && <p className="unknown-funds small">Confirmed owned collateral returned {money(live.returned_collateral_micros)} · conservative realized result {signedPicoMoney(live.conservative_realized_pnl_pico)}. POL gas is accounted separately; this is not final net PnL.</p>}
+    {live.chain_pending_hash && <p className="unknown-funds small mono">Closeout {live.chain_pending_kind === 'batch' ? 'batch' : 'transaction'} pending · {live.chain_pending_hash.slice(0, 18)}… · inventory remains reserved.</p>}
+    {live.last_chain_error && <p className="unknown-funds warning">Closeout: {live.last_chain_error}</p>}
   </section>}{session && <section className="account-band" aria-label="Simulated account">
     {values.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}
     {session?.fault && <p className="unknown-funds error">Emulator fault: {session.fault}</p>}
@@ -94,8 +98,8 @@ export function Limits({ state, disabled, apply }: { state: EngineState | null; 
     await apply({ initial_collateral_usd: values.initial_collateral_usd, max_imbalance_shares: values.max_imbalance_shares,
       lot_shares: values.lot_shares, half_width: values.half_width, max_feed_age_ms: age });
   };
-  return <section className="limits"><h2>Risk limits</h2><form onSubmit={submit}>{fields.map(([key, label]) => <label key={key} htmlFor={key}><span>{label}</span>
-    <input id={key} value={values[key] ?? ''} inputMode={key === 'max_feed_age_ms' ? 'numeric' : 'decimal'} maxLength={48} disabled={disabled} required onChange={event => { setDirty(true); setValues(previous => ({ ...previous, [key]: event.target.value })); }} /></label>)}
+  return <section className="limits"><h2>Quote settings</h2><p className="small">Initial capital is fixed at startup. Trading capital, gross exposure, order count and loss caps come from the deployment profile.</p><form onSubmit={submit}>{fields.map(([key, label]) => <label key={key} htmlFor={key}><span>{label}</span>
+    <input id={key} value={values[key] ?? ''} inputMode={key === 'max_feed_age_ms' ? 'numeric' : 'decimal'} maxLength={48} disabled={disabled || key === 'initial_collateral_usd'} required onChange={event => { setDirty(true); setValues(previous => ({ ...previous, [key]: event.target.value })); }} /></label>)}
     <button className="primary" disabled={disabled || !state}>Apply limits</button>{dirty && <button className="text-button" type="button" onClick={() => setDirty(false)}>Restore sampled limits</button>}
     {validation && <p className="error small" role="alert">{validation}</p>}</form></section>;
 }

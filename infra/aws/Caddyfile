@@ -1,0 +1,19 @@
+{
+    admin off
+    http_port 8080
+    https_port 8443
+    auto_https disable_redirects
+    servers {
+        protocols h1 h2
+    }
+}
+
+http://{$MM2_DOMAIN}:8080 {
+    redir https://{$MM2_DOMAIN}{uri} 308
+}
+
+https://{$MM2_DOMAIN}:8443 {
+    reverse_proxy console:8080 {
+        header_up Host {$MM2_DOMAIN}
+    }
+}

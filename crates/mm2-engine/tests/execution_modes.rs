@@ -437,3 +437,47 @@ async fn replayed_parent_resume_never_reactivates_recovered_live_or_paper() {
     assert_eq!(second.paper.state.borrow()["mode"], "paused");
     halt(second).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn funded_profiles_cannot_relabel_initial_capital_as_a_live_risk_change() {
+    for mode in ["trading", "both"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = config(dir.path());
+        profile.mode = mode.into();
+        let (_feeds, input) = mpsc::channel(16);
+        let (_fault, fault) = watch::channel(None);
+        let (stop, shutdown) = watch::channel(false);
+        let (handle, actor) =
+            runtime::prepare(&profile, Instant::now(), input, fault, shutdown).unwrap();
+        let task = tokio::spawn(actor.run());
+        let mut changed = profile.limits.clone();
+        changed.initial_collateral_usd = "1".into();
+        let error = handle
+            .command(Command::Limits {
+                id: format!("bad-capital-{mode}"),
+                expected_version: 0,
+                limits: changed,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("fixed at startup"));
+        assert_eq!(handle.state.borrow()["command_version"], 0);
+        let mut quote_settings = profile.limits.clone();
+        quote_settings.half_width = "0.04".into();
+        let result = handle
+            .command(Command::Limits {
+                id: format!("quotes-{mode}"),
+                expected_version: 0,
+                limits: quote_settings,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["receipt"]["applied_version"], 1);
+        assert_eq!(
+            handle.state.borrow()["limits"]["initial_collateral_usd"],
+            "1000"
+        );
+        stop.send_replace(true);
+        task.await.unwrap();
+    }
+}

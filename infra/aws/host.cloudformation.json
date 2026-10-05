@@ -1,0 +1,80 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "mm2 single-host foundation. No secrets or automatic bot startup. Host, EIP and encrypted state are retained.",
+  "Parameters": {
+    "VpcId": {"Type": "AWS::EC2::VPC::Id"},
+    "SubnetId": {"Type": "AWS::EC2::Subnet::Id", "Description": "Reviewed public IPv4 subnet in the selected eligible region/AZ; internet gateway route required."},
+    "AvailabilityZone": {"Type": "AWS::EC2::AvailabilityZone::Name", "Description": "Must match the subnet. EBS is AZ-local."},
+    "AmiId": {"Type": "AWS::EC2::Image::Id", "Description": "Reviewed Canonical Ubuntu 24.04 LTS amd64 AMI in this region. Pin an exact image ID."},
+    "InstanceType": {"Type": "String", "Default": "c7i.large", "AllowedValues": ["c7i.large", "c7i.xlarge", "c6i.large", "m7i.large"]},
+    "StateGiB": {"Type": "Number", "Default": 64, "MinValue": 32, "MaxValue": 1024},
+    "EnableSsm": {"Type": "String", "Default": "true", "AllowedValues": ["true", "false"]},
+    "EnableSsh": {"Type": "String", "Default": "false", "AllowedValues": ["true", "false"]},
+    "SshKeyName": {"Type": "String", "Default": "", "Description": "Existing EC2 key pair, required only when SSH is explicitly enabled."},
+    "AdminCidr": {"Type": "String", "Default": "127.0.0.1/32", "AllowedPattern": "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/32$", "Description": "One operator IPv4 /32 when SSH is enabled. Never 0.0.0.0/0."}
+  },
+  "Conditions": {
+    "SsmEnabled": {"Fn::Equals": [{"Ref": "EnableSsm"}, "true"]},
+    "SshEnabled": {"Fn::Equals": [{"Ref": "EnableSsh"}, "true"]}
+  },
+  "Rules": {
+    "ManagementAccess": {"Assertions": [{"Assert": {"Fn::Or": [{"Fn::Equals": [{"Ref": "EnableSsm"}, "true"]}, {"Fn::Equals": [{"Ref": "EnableSsh"}, "true"]}]}, "AssertDescription": "Enable SSM or restricted SSH before creating a host."}]},
+    "RestrictedSsh": {"RuleCondition": {"Fn::Equals": [{"Ref": "EnableSsh"}, "true"]}, "Assertions": [
+      {"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "SshKeyName"}, ""]}]}, "AssertDescription": "SSH requires an existing key pair."},
+      {"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "AdminCidr"}, "0.0.0.0/0"]}]}, "AssertDescription": "World-open SSH is forbidden."},
+      {"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "AdminCidr"}, "127.0.0.1/32"]}]}, "AssertDescription": "Replace the SSH placeholder with the operator public IPv4 /32."}
+    ]}
+  },
+  "Resources": {
+    "HostSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "GroupDescription": "HTTPS console and ACME only; engine and console application ports remain private.",
+        "VpcId": {"Ref": "VpcId"},
+        "SecurityGroupIngress": [
+          {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "CidrIp": "0.0.0.0/0", "Description": "ACME HTTP challenge and HTTPS redirect"},
+          {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "CidrIp": "0.0.0.0/0", "Description": "Authenticated owner console and Telegram Mini App"}
+        ],
+        "SecurityGroupEgress": [{"IpProtocol": "-1", "CidrIp": "0.0.0.0/0", "Description": "Venue/public data, DNS, ACME, reviewed OS updates and optional SSM"}],
+        "Tags": [{"Key": "Application", "Value": "mm2"}]
+      }
+    },
+    "SshIngress": {"Type": "AWS::EC2::SecurityGroupIngress", "Condition": "SshEnabled", "Properties": {"GroupId": {"Ref": "HostSecurityGroup"}, "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "CidrIp": {"Ref": "AdminCidr"}}},
+    "SsmRole": {
+      "Type": "AWS::IAM::Role", "Condition": "SsmEnabled", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]},
+        "Policies": [{"PolicyName": "SessionManagerTransportOnly", "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+          {"Effect": "Allow", "Action": ["ssm:UpdateInstanceInformation", "ssmmessages:CreateControlChannel", "ssmmessages:CreateDataChannel", "ssmmessages:OpenControlChannel", "ssmmessages:OpenDataChannel"], "Resource": "*"}
+        ]}}]
+      }
+    },
+    "SsmProfile": {"Type": "AWS::IAM::InstanceProfile", "Condition": "SsmEnabled", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain", "Properties": {"Roles": [{"Ref": "SsmRole"}]}},
+    "Host": {
+      "Type": "AWS::EC2::Instance", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "ImageId": {"Ref": "AmiId"}, "InstanceType": {"Ref": "InstanceType"}, "AvailabilityZone": {"Ref": "AvailabilityZone"},
+        "KeyName": {"Fn::If": ["SshEnabled", {"Ref": "SshKeyName"}, {"Ref": "AWS::NoValue"}]},
+        "IamInstanceProfile": {"Fn::If": ["SsmEnabled", {"Ref": "SsmProfile"}, {"Ref": "AWS::NoValue"}]},
+        "NetworkInterfaces": [{"DeviceIndex": "0", "SubnetId": {"Ref": "SubnetId"}, "AssociatePublicIpAddress": true, "GroupSet": [{"Ref": "HostSecurityGroup"}]}],
+        "MetadataOptions": {"HttpEndpoint": "enabled", "HttpTokens": "required", "HttpPutResponseHopLimit": 1, "InstanceMetadataTags": "disabled"},
+        "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"Encrypted": true, "VolumeType": "gp3", "VolumeSize": 30, "DeleteOnTermination": false}}],
+        "Tags": [{"Key": "Name", "Value": {"Fn::Sub": "${AWS::StackName}-mm2"}}, {"Key": "Application", "Value": "mm2"}]
+      }
+    },
+    "StateVolume": {
+      "Type": "AWS::EC2::Volume", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain",
+      "Properties": {"AvailabilityZone": {"Ref": "AvailabilityZone"}, "Encrypted": true, "Size": {"Ref": "StateGiB"}, "VolumeType": "gp3", "Tags": [{"Key": "Name", "Value": {"Fn::Sub": "${AWS::StackName}-mm2-state"}}, {"Key": "Application", "Value": "mm2"}, {"Key": "Preserve", "Value": "execution-ledger"}]}
+    },
+    "StateAttachment": {"Type": "AWS::EC2::VolumeAttachment", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain", "Properties": {"Device": "/dev/sdf", "InstanceId": {"Ref": "Host"}, "VolumeId": {"Ref": "StateVolume"}}},
+    "PublicAddress": {"Type": "AWS::EC2::EIP", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain", "Properties": {"Domain": "vpc", "Tags": [{"Key": "Application", "Value": "mm2"}]}},
+    "AddressAssociation": {"Type": "AWS::EC2::EIPAssociation", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain", "Properties": {"AllocationId": {"Fn::GetAtt": ["PublicAddress", "AllocationId"]}, "InstanceId": {"Ref": "Host"}}}
+  },
+  "Outputs": {
+    "InstanceId": {"Value": {"Ref": "Host"}},
+    "StateVolumeId": {"Value": {"Ref": "StateVolume"}},
+    "PublicIpv4": {"Value": {"Ref": "PublicAddress"}},
+    "Region": {"Value": {"Ref": "AWS::Region"}},
+    "AvailabilityZone": {"Value": {"Ref": "AvailabilityZone"}}
+  }
+}

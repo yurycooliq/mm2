@@ -1,0 +1,101 @@
+name: mm2-production
+services:
+  engine:
+    image: ${MM2_ENGINE_IMAGE:?Verified release image ID required}
+    pull_policy: never
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports: ["127.0.0.1:8088:8088"]
+    environment:
+      MM2_ENGINE_API_TOKEN: ${MM2_ENGINE_API_TOKEN:?Private runtime token required}
+      MM2_POLY_PRIVATE_KEY: ${MM2_POLY_PRIVATE_KEY:-}
+      MM2_POLY_API_KEY: ${MM2_POLY_API_KEY:-}
+      MM2_POLY_API_SECRET: ${MM2_POLY_API_SECRET:-}
+      MM2_POLY_API_PASSPHRASE: ${MM2_POLY_API_PASSPHRASE:-}
+      MM2_POLYGON_RPC_URL: ${MM2_POLYGON_RPC_URL:-}
+      MM2_POLY_RELAYER_API_KEY: ${MM2_POLY_RELAYER_API_KEY:-}
+      MM2_POLY_RELAYER_API_KEY_ADDRESS: ${MM2_POLY_RELAYER_API_KEY_ADDRESS:-}
+    volumes:
+      - type: bind
+        source: /etc/mm2/active.toml
+        target: /app/config.toml
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/mm2/engine
+        target: /data
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    pids_limit: 96
+    cpus: 1.5
+    mem_limit: 768m
+    stop_grace_period: 30s
+    # systemd performs complete release/storage preflight before engine recovery.
+    restart: "no"
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}
+    networks: [execution]
+  console:
+    image: ${MM2_CONSOLE_IMAGE:?Verified release image ID required}
+    pull_policy: never
+    init: true
+    user: "10002:10002"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      MM2_ENGINE_URL: http://engine:8088
+      MM2_ENGINE_API_TOKEN: ${MM2_ENGINE_API_TOKEN:?Private runtime token required}
+      MM2_CONSOLE_TOKEN: ${MM2_CONSOLE_TOKEN:?Private runtime token required}
+      MM2_TELEGRAM_BOT_TOKEN: ${MM2_TELEGRAM_BOT_TOKEN:-}
+      MM2_TELEGRAM_OWNER_ID: ${MM2_TELEGRAM_OWNER_ID:-}
+      MM2_MINIAPP_URL: https://${MM2_DOMAIN:?Exact HTTPS domain required}/
+      MM2_ALLOWED_ORIGINS: https://${MM2_DOMAIN:?Exact HTTPS domain required}
+      MM2_CONSOLE_STATE_DIR: /data
+      MM2_CONSOLE_STATIC_DIR: /app/dashboard
+    volumes:
+      - type: bind
+        source: /srv/mm2/console
+        target: /data
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    pids_limit: 48
+    cpus: 0.25
+    mem_limit: 192m
+    stop_grace_period: 15s
+    restart: "no"
+    logging: {driver: json-file, options: {max-size: "5m", max-file: "2"}}
+    networks: [execution, frontend]
+  proxy:
+    image: ${MM2_PROXY_IMAGE:?Verified Caddy image ID required}
+    pull_policy: never
+    read_only: true
+    cap_drop: [ALL]
+    # Official Caddy binaries carry this file capability; bounding it away refuses exec.
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    ports: ["80:8080", "443:8443"]
+    environment:
+      MM2_DOMAIN: ${MM2_DOMAIN:?Exact HTTPS domain required}
+    volumes:
+      - type: bind
+        source: ./infra/aws/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/mm2/caddy
+        target: /data
+        bind: {create_host_path: false}
+    tmpfs: ["/config:rw,noexec,nosuid,size=16m,mode=1777", "/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 48
+    restart: "no"
+    logging: {driver: json-file, options: {max-size: "5m", max-file: "2"}}
+    networks: [frontend]
+networks:
+  execution:
+  frontend:

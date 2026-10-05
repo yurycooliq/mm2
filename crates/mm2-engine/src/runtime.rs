@@ -1012,6 +1012,12 @@ impl Actor {
         command.validate().map_err(|e| Failure::new("invalid", e))?;
         if let Command::Limits { limits, .. } = &mut command {
             *limits = limits.canonical().map_err(|e| Failure::new("invalid", e))?;
+            if limits.initial_collateral_usd != self.limits.initial_collateral_usd {
+                return Err(Failure::new(
+                    "conflict",
+                    "initial collateral is fixed at startup; live capital limits are configured in the deployment profile",
+                ));
+            }
         }
         let journal = self
             .journal

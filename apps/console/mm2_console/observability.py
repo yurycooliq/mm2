@@ -102,7 +102,12 @@ def execution_summary(state, connected=True):
                  "fault": _text(live.get("fault")), "prepare_error": _text(live.get("last_prepare_error")),
                  "journal": journal_summary(state, "live"), "pnl_usd": None,
                  "daily_loss_bound_usd": money(live.get("daily_loss_micros")),
-                 "daily_loss_metric": _text(live.get("daily_loss_metric"))},
+                 "daily_loss_metric": _text(live.get("daily_loss_metric")),
+                 "returned_collateral_usd": money(live.get("returned_collateral_micros")),
+                 "chain_pending_hash": _text(live.get("chain_pending_hash")),
+                 "chain_pending_kind": live.get("chain_pending_kind") if live.get("chain_pending_kind") in ("batch", "transaction") else None,
+                 "chain_error": _text(live.get("last_chain_error")),
+                 "session_gas_cost_wei": _text(live.get("session_gas_cost_wei"))},
         "paper": {"selected": profile in {"emulator", "simulation", "both"},
                   "cash_usd": virtual_cash, "available_usd": virtual_available,
                   "reserved_usd": virtual_reserved, "pnl_usd": None,
@@ -123,7 +128,7 @@ def health_identity(state):
             summary["profile"], summary["engine_fault"], source.get("phase"), state.get("feed_ready"),
             real["phase"], real["account_reconciled"], real["user_stream_connected"], real["fault"],
             paper["phase"], paper["fault"], summary["journal"]["stage"],
-            real["journal"]["stage"], paper["journal"]["stage"], real["prepare_error"])
+            real["journal"]["stage"], paper["journal"]["stage"], real["prepare_error"], real["chain_pending_hash"], real["chain_error"], real["returned_collateral_usd"])
 
 
 def health_log(state, connected=True):
@@ -131,7 +136,7 @@ def health_log(state, connected=True):
     real, paper, journal = summary["real"], summary["paper"], summary["journal"]
     errors = [("engine", summary["engine_fault"]), ("live", real["fault"]), ("paper", paper["fault"])]
     failures = "; ".join(f"{kind}: {text}" for kind, text in errors if text)
-    warning = (not connected or bool(real["prepare_error"])
+    warning = (not connected or bool(real["prepare_error"]) or bool(real["chain_error"])
                or any(item["stage"] in {"warning", "critical", "full"}
                       for item in (journal, real["journal"], paper["journal"])))
     level = "ERROR" if failures else "WARN" if warning else "INFO"
@@ -147,6 +152,10 @@ def health_log(state, connected=True):
         text = "Engine publication stale or invalid; " + text
     elif real["prepare_error"]:
         text = "live prepare: " + real["prepare_error"] + "; " + text
+    elif real["chain_error"]:
+        text = "live closeout: " + real["chain_error"] + "; " + text
+    elif real["chain_pending_hash"]:
+        text = "live closeout pending " + real["chain_pending_hash"][:18] + "; " + text
     return level, text
 
 

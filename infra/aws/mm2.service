@@ -1,0 +1,27 @@
+[Unit]
+Description=mm2 paused-start execution and owner console
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=6
+RequiresMountsFor=/srv/mm2
+ConditionPathExists=/etc/mm2/runtime.env
+ConditionPathExists=/etc/mm2/active.toml
+ConditionPathExists=/opt/mm2/current/release-manifest.json
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5s
+WorkingDirectory=/opt/mm2/current
+RuntimeDirectory=mm2
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/python3 scripts/deploy_supervisor.py run --release /opt/mm2/current
+ExecStopPost=/usr/bin/python3 scripts/deploy_supervisor.py stop
+TimeoutStartSec=120
+TimeoutStopSec=120
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target docker.service

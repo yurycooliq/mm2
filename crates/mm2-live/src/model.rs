@@ -1,4 +1,5 @@
 use crate::settings::{LiveSettings, condition};
+use crate::{ChainReceipt, PreparedChainTransaction};
 use mm2_core::Outcome;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -174,6 +175,22 @@ pub(crate) struct Ledger {
     pub loss_day: u64,
     pub foreign_order_ids: Vec<String>,
     pub fault: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub owned_positions: BTreeMap<String, crate::settlement::OwnedPosition>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub closeout_markets: BTreeMap<String, crate::settlement::SettlementMarket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_pending: Option<PreparedChainTransaction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain_receipts: Vec<ChainReceipt>,
+    #[serde(default, skip_serializing_if = "crate::settlement::is_zero")]
+    pub returned_collateral_micros: u64,
+    #[serde(default, skip_serializing_if = "crate::settlement::zero_string")]
+    pub realized_cost_pico: String,
+    #[serde(default, skip_serializing_if = "crate::settlement::zero_string")]
+    pub session_gas_cost_wei: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain_expiries: Vec<crate::relay::RelayExpiry>,
 }
 impl Default for Ledger {
     fn default() -> Self {
@@ -192,6 +209,14 @@ impl Default for Ledger {
             loss_day: 0,
             foreign_order_ids: vec![],
             fault: None,
+            owned_positions: BTreeMap::new(),
+            closeout_markets: BTreeMap::new(),
+            chain_pending: None,
+            chain_receipts: Vec::new(),
+            returned_collateral_micros: 0,
+            realized_cost_pico: String::new(),
+            session_gas_cost_wei: String::new(),
+            chain_expiries: Vec::new(),
         }
     }
 }
@@ -232,6 +257,31 @@ impl Ledger {
             let charged = base + (base * u128::from(order.quote.fee_bps)).div_ceil(10_000);
             spent += charged;
             self.session_spent_pico = spent.to_string();
+            let owned = self
+                .owned_positions
+                .entry(format!(
+                    "{}:{}",
+                    order.quote.condition_id, order.quote.token_id
+                ))
+                .or_default();
+            if owned.day != self.loss_day {
+                owned.day = self.loss_day;
+                owned.daily_quantity_micros = 0;
+            }
+            owned.quantity_micros = owned
+                .quantity_micros
+                .checked_add(filled)
+                .ok_or("owned quantity overflow")?;
+            owned.daily_quantity_micros = owned
+                .daily_quantity_micros
+                .checked_add(filled)
+                .ok_or("daily quantity overflow")?;
+            owned.cost_pico = (owned
+                .cost_pico
+                .parse::<u128>()
+                .map_err(|_| "invalid owned cost")?
+                + charged)
+                .to_string();
             order.cumulative_filled_micros = obs.cumulative_filled_micros;
             // Increment the durable floor, never the potentially ahead Data API quantity.
             let key = format!("{}:{}", order.quote.condition_id, order.quote.token_id);
@@ -312,4 +362,13 @@ pub struct LiveSnapshot {
     pub prepare_failures: u64,
     pub last_prepare_error: Option<String>,
     pub unsupported_operations: Vec<String>,
+    pub returned_collateral_micros: u64,
+    pub conservative_realized_pnl_pico: String,
+    pub chain_pending_hash: Option<String>,
+    pub chain_pending_kind: Option<String>,
+    pub chain_receipts: Vec<ChainReceipt>,
+    pub chain_expiries: Vec<crate::relay::RelayExpiry>,
+    pub last_chain_error: Option<String>,
+    pub risk_limits: crate::LiveRiskLimits,
+    pub session_gas_cost_wei: String,
 }

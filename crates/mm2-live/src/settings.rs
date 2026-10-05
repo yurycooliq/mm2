@@ -74,11 +74,12 @@ pub struct LiveSettings {
     pub quote_ttl_ms: u64,
     pub heartbeat_interval_ms: u64,
     pub journal_max_bytes: u64,
+    pub chain: Option<crate::chain::ChainSettings>,
 }
 impl Default for LiveSettings {
     fn default() -> Self {
         Self {
-            clob_url: "https://clob-v2.polymarket.com".into(),
+            clob_url: "https://clob.polymarket.com".into(),
             owner_address: String::new(),
             funder_address: String::new(),
             signer_address: String::new(),
@@ -87,10 +88,10 @@ impl Default for LiveSettings {
             protocol: 2,
             exchange_address: String::new(),
             collateral_address: String::new(),
-            private_key_env: "MM2_POLYMARKET_PRIVATE_KEY".into(),
-            api_key_env: "MM2_POLYMARKET_API_KEY".into(),
-            api_secret_env: "MM2_POLYMARKET_API_SECRET".into(),
-            api_passphrase_env: "MM2_POLYMARKET_API_PASSPHRASE".into(),
+            private_key_env: "MM2_POLY_PRIVATE_KEY".into(),
+            api_key_env: "MM2_POLY_API_KEY".into(),
+            api_secret_env: "MM2_POLY_API_SECRET".into(),
+            api_passphrase_env: "MM2_POLY_API_PASSPHRASE".into(),
             allowed_conditions: vec![],
             allowed_market_prefixes: vec![],
             owner_authorized: false,
@@ -99,6 +100,7 @@ impl Default for LiveSettings {
             quote_ttl_ms: 1000,
             heartbeat_interval_ms: 2000,
             journal_max_bytes: 64 * 1024 * 1024,
+            chain: None,
         }
     }
 }
@@ -115,12 +117,15 @@ pub(crate) fn condition(s: &str) -> bool {
 impl LiveSettings {
     pub fn validate(&self) -> Result<(), String> {
         self.risk.validate()?;
+        if let Some(chain) = &self.chain {
+            chain.validate()?;
+        }
         if !self.owner_authorized {
             return Err("explicit live owner authorization is missing".into());
         }
         if self.chain_id != 137
             || self.protocol != 2
-            || self.clob_url != "https://clob-v2.polymarket.com"
+            || self.clob_url != "https://clob.polymarket.com"
         {
             return Err("only explicitly pinned Polygon CLOB V2 token orders are supported".into());
         }
@@ -133,9 +138,25 @@ impl LiveSettings {
             0 => Some(signer),
             1 => derive_proxy_wallet(signer, self.chain_id),
             2 => derive_safe_wallet(signer, self.chain_id),
+            3 => {
+                if signer == funder
+                    || self
+                        .chain
+                        .as_ref()
+                        .is_none_or(|chain| chain.relayer.is_none())
+                {
+                    return Err(
+                        "deposit-wallet orders require a separate controlling signer and configured relayer"
+                            .into(),
+                    );
+                }
+                // The SDK requires an explicit deployed funder. The canonical new-beacon
+                // factory, actual wallet owner and delegation are checked by chain readiness.
+                Some(funder)
+            }
             _ => {
                 return Err(
-                    "supported signature types are EOA, canonical proxy and canonical safe".into(),
+                    "supported signature types are EOA, canonical proxy, canonical safe and deposit wallet".into(),
                 );
             }
         };
