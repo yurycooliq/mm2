@@ -4,7 +4,7 @@
 
 This is local verification of the implemented package. No funded venue order,
 real Polygon transaction, actual Telegram recipient or AWS deployment was used.
-Account compatibility, selected-host eligibility/performance, real HTTPS/Telegram
+Authenticated account acceptance, selected-host eligibility/performance, real HTTPS/Telegram
 acceptance and economic holdout remain external checks.
 
 | Current check | Confirmed result and scope |
@@ -15,9 +15,9 @@ acceptance and economic holdout remain external checks.
 | Data/latency Python | **55 passed**, pyarrow 25.0.0 / websockets 15.0.1, **no skipped tests**; Parquet and local fake HTTP/WebSocket servers. |
 | Reference/strategy Node | **25 passed = 19 archive/execution + 6 scoped strategy parity vectors**. |
 | Dashboard Node/build | **7 passed**, TypeScript and production Vite build passed; command identity and exact unsigned balance/signed loss formatting. |
-| Playwright fixtures | **16 cases / 21 screenshots passed** at desktop 1440x1100 and mobile 390x844: simulation/trading/both, fixed initial capital, actual risk caps, signed loss, stale refusal, cancel confirmation and exact lost-ACK retry after reload. Pending closeout alone permits a fresh Resume when every readiness gate passes. |
-| Production images/integration | **Earlier closeout image checkpoint: both production images built; 13 checks passed**, including five profiles, blank funded refusal, paper fills, console outage, crash recovery, journal fence and graceful stop. Observed run 21,203 ms / engine stop 641 ms; local observations, not an SLA. |
-| AWS template/runtime | **Earlier closeout image checkpoint: 7 isolated TLS/auth proxy checks passed** and reviewed Caddy; CloudFormation eu-west-1 lint, Compose validation and shell syntax pass. Release export requires clean source and matching application-image OCI source labels; no cloud resources are created. |
+| Playwright fixtures | **20 cases / 25 screenshots passed**: the earlier 16 controls cases at desktop 1440x1100 and mobile 390x844 cover simulation/trading/both, fixed initial capital, actual risk caps, signed loss, stale refusal, cancel confirmation and exact lost-ACK retry after reload. Pending closeout alone permits a fresh Resume when every readiness gate passes. Four additional final-build cases at 1440x1000 / 390x844 verify distinct batch/transaction labels, private-wire omission, no browser errors/overflow and durable Pause. |
+| Production images/integration | **Both production images built from committed source; 13 checks passed**, including five profiles, blank funded refusal, paper fills, console outage, crash recovery, journal fence and graceful stop. Observed run 23,343 ms / engine stop 750 ms; local observations, not an SLA. |
+| AWS template/runtime | **7 isolated TLS/auth proxy checks passed** with the committed console image and reviewed Caddy; CloudFormation eu-west-1 lint, Compose validation and shell syntax pass. Release export requires clean source and matching application-image OCI source labels; no cloud resources are created. |
 
 Nested test counts are not counted twice. The bounded Rust test concurrency matches
 the two-worker build budget; runtime freshness/heartbeat limits were not relaxed.
