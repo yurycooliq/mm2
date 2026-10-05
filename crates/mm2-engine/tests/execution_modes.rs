@@ -391,15 +391,13 @@ async fn primary_control_and_quotes_do_not_wait_for_a_suspended_paper_actor() {
     let venue = Arc::new(OfflineVenue::default());
     let mut service = launch(dir.path(), false, false, venue).await;
     begin_feeds(&mut service).await;
-    let receipt = tokio::time::timeout(
-        Duration::from_secs(2),
-        service
-            .handle
-            .command(control("resume-slow-paper", 0, "resume")),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    // The unpolled paper actor cannot acknowledge anything. Use the owner's
+    // bounded command contract; durable disk writes have no extra two-second SLA.
+    let receipt = service
+        .handle
+        .command(control("resume-slow-paper", 0, "resume"))
+        .await
+        .unwrap();
     assert_eq!(receipt["receipt"]["applied_version"], 1);
     wait(
         "primary post with suspended paper",

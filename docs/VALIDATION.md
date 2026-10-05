@@ -60,6 +60,13 @@ then acknowledges. A deterministic regression keeps the old actor alive while
 reopening the same journal and verifies retained collateral, owned inventory and
 sequence; the existing immediate runtime-restart test covers the complete path.
 
+A loaded local BuildKit run also exceeded an extra two-second test wrapper around
+owner Resume; the unchanged rerun passed. That independence test now uses the
+production five-second command contract while keeping the paper actor permanently
+unpolled, requiring the durable owner acknowledgement and primary orders, and
+asserting paper version zero. Production timeouts and freshness remain unchanged;
+the test establishes independence, not a disk-latency SLA.
+
 DepositWallet type 3 uses canonical ERC7739 CLOB order signatures with the
 controlling EOA in authenticated headers and the contract wallet as maker/order
 signer. Its gasless closeout signs a fixed owner EIP712 Batch. The actor syncs the
