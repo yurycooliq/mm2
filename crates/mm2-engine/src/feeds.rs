@@ -3,9 +3,14 @@ use crate::domain::{
     BookSide, Change, FeedEvent, FeedSource, Level, Market, Outcome, valid_tick_micro,
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
     collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
@@ -23,6 +28,173 @@ const MAX_MEMBERS: usize = 4096;
 const MAX_DEPTH: usize = 10_000;
 const UINT256_MAX: &str =
     "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+
+/// Optional diagnostics never enter the financial/feed queue or require a network/disk write.
+/// Fixed categories are used rather than response bodies, URLs or exception text.
+#[derive(Default)]
+pub struct FeedDiagnostics {
+    sources: [SourceDiagnostics; 2],
+}
+
+#[derive(Default)]
+struct SourceDiagnostics {
+    attempts: AtomicU64,
+    transport_disconnects: AtomicU64,
+    bootstrap_timeouts: AtomicU64,
+    backoff_resets: AtomicU64,
+    retry_delay_ms: AtomicU64,
+    snapshots_seen: [AtomicU64; 2],
+    snapshots_discarded_before_cutoff: [AtomicU64; 2],
+    bootstrap_cutoff_exchange_ms: [AtomicU64; 2],
+    phase: AtomicU8,
+    last_failure: AtomicU64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct FeedDiagnosticsSnapshot {
+    pub clob: SourceDiagnosticsSnapshot,
+    pub binance: SourceDiagnosticsSnapshot,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SourceDiagnosticsSnapshot {
+    attempts: u64,
+    transport_disconnects: u64,
+    bootstrap_timeouts: u64,
+    backoff_resets: u64,
+    retry_delay_ms: u64,
+    snapshots_seen: [u64; 2],
+    snapshots_discarded_before_cutoff: [u64; 2],
+    bootstrap_cutoff_exchange_ms: [u64; 2],
+    phase: &'static str,
+    last_failure: Option<&'static str>,
+    last_failure_fatal: bool,
+    last_failure_at_mono_ms: Option<u64>,
+}
+
+fn increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_add(1))
+    });
+}
+
+impl FeedDiagnostics {
+    fn source(&self, source: FeedSource) -> &SourceDiagnostics {
+        &self.sources[if source == FeedSource::Clob { 0 } else { 1 }]
+    }
+
+    pub fn snapshot(&self) -> FeedDiagnosticsSnapshot {
+        let source = |source: FeedSource| {
+            let value = self.source(source);
+            let failure = value.last_failure.load(Ordering::Relaxed);
+            let failure_class = (failure & 255) as u8;
+            SourceDiagnosticsSnapshot {
+                attempts: value.attempts.load(Ordering::Relaxed),
+                transport_disconnects: value.transport_disconnects.load(Ordering::Relaxed),
+                bootstrap_timeouts: value.bootstrap_timeouts.load(Ordering::Relaxed),
+                backoff_resets: value.backoff_resets.load(Ordering::Relaxed),
+                retry_delay_ms: value.retry_delay_ms.load(Ordering::Relaxed),
+                snapshots_seen: std::array::from_fn(|i| {
+                    value.snapshots_seen[i].load(Ordering::Relaxed)
+                }),
+                snapshots_discarded_before_cutoff: std::array::from_fn(|i| {
+                    value.snapshots_discarded_before_cutoff[i].load(Ordering::Relaxed)
+                }),
+                bootstrap_cutoff_exchange_ms: std::array::from_fn(|i| {
+                    value.bootstrap_cutoff_exchange_ms[i].load(Ordering::Relaxed)
+                }),
+                phase: match value.phase.load(Ordering::Relaxed) {
+                    1 => "connecting",
+                    2 => "rest_recovery",
+                    3 => "awaiting_native_snapshot",
+                    4 => "streaming",
+                    5 => "retrying",
+                    6 => "faulted",
+                    7 => "stopped",
+                    _ => "starting",
+                },
+                last_failure: failure_name(failure_class),
+                last_failure_fatal: failure & 256 != 0,
+                last_failure_at_mono_ms: (failure_class != 0).then_some(failure >> 9),
+            }
+        };
+        FeedDiagnosticsSnapshot {
+            clob: source(FeedSource::Clob),
+            binance: source(FeedSource::Binance),
+        }
+    }
+}
+
+fn failure_code(reason: &str, fatal: bool) -> u8 {
+    match reason {
+        "fresh both-outcome snapshot bootstrap timeout" => 1,
+        "public WebSocket connection failed" | "public WebSocket connect timeout" => 2,
+        "public REST book transport failed"
+        | "public REST book HTTP unavailable"
+        | "public REST book body failed" => 3,
+        "public WebSocket receive timeout" => 4,
+        "public WebSocket remote close"
+        | "public WebSocket ended"
+        | "public WebSocket read failed" => 5,
+        "public heartbeat send failed"
+        | "public recovery heartbeat send failed"
+        | "public pong send failed"
+        | "public subscription send failed" => 6,
+        "feed queue overflow" | "feed consumer closed" => 7,
+        "public WebSocket exceeds capacity limit" | "public REST book exceeds 256 KiB" => 8,
+        "invalid public WebSocket protocol" | "unsupported public WebSocket frame" => 9,
+        reason if reason.contains("tick") => 12,
+        reason
+            if reason.contains("clock")
+                || reason.contains("timestamp")
+                || reason.contains("unsigned integer") =>
+        {
+            13
+        }
+        reason
+            if reason.contains("condition")
+                || reason.contains("token")
+                || reason.contains("requested outcome") =>
+        {
+            14
+        }
+        reason
+            if reason.contains("depth")
+                || reason.contains("snapshot")
+                || reason.contains("crossed")
+                || reason.contains("book level") =>
+        {
+            15
+        }
+        _ if fatal => 10,
+        _ => 11,
+    }
+}
+
+fn failure_name(code: u8) -> Option<&'static str> {
+    match code {
+        0 => None,
+        1 => Some("native_snapshot_bootstrap_timeout"),
+        2 => Some("connect_unavailable"),
+        3 => Some("rest_book_unavailable"),
+        4 => Some("receive_timeout"),
+        5 => Some("transport_disconnected"),
+        6 => Some("transport_send_failed"),
+        7 => Some("feed_queue_unavailable"),
+        8 => Some("input_capacity_exceeded"),
+        9 => Some("invalid_websocket_protocol"),
+        10 => Some("invalid_public_input"),
+        12 => Some("invalid_tick_input"),
+        13 => Some("invalid_exchange_clock"),
+        14 => Some("invalid_market_identity"),
+        15 => Some("invalid_book_input"),
+        _ => Some("transport_unavailable"),
+    }
+}
+
+pub(crate) fn input_failure_class(reason: &str) -> &'static str {
+    failure_name(failure_code(reason, true)).unwrap_or("invalid_public_input")
+}
 
 fn validate_decimal(value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 128 {
@@ -244,7 +416,15 @@ impl Recovery {
     fn ready(&self) -> bool {
         self.initialized.iter().all(|ready| *ready)
     }
+    #[cfg(test)]
     fn filter(&mut self, events: Vec<FeedEvent>) -> Vec<FeedEvent> {
+        self.filter_observed(events, None)
+    }
+    fn filter_observed(
+        &mut self,
+        events: Vec<FeedEvent>,
+        diagnostics: Option<&SourceDiagnostics>,
+    ) -> Vec<FeedEvent> {
         let index = |outcome: Outcome| if outcome == Outcome::Up { 0 } else { 1 };
         events
             .into_iter()
@@ -255,7 +435,13 @@ impl Recovery {
                     ..
                 } => {
                     let index = index(outcome);
+                    if let Some(diagnostics) = diagnostics {
+                        increment(&diagnostics.snapshots_seen[index]);
+                    }
                     if !self.initialized[index] && exchange_ms <= self.baseline[index] {
+                        if let Some(diagnostics) = diagnostics {
+                            increment(&diagnostics.snapshots_discarded_before_cutoff[index]);
+                        }
                         return None;
                     }
                     self.initialized[index] = true;
@@ -708,6 +894,7 @@ struct Settings {
     retry: Duration,
     max_retry: Duration,
     bootstrap: Duration,
+    stable: Duration,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -719,6 +906,7 @@ impl Default for Settings {
             retry: Duration::from_millis(500),
             max_retry: Duration::from_secs(30),
             bootstrap: Duration::from_secs(15),
+            stable: Duration::from_secs(60),
         }
     }
 }
@@ -735,6 +923,7 @@ struct Endpoint {
     url: String,
     settings: Settings,
     tick_refresh: TickRefresh,
+    diagnostics: Option<Arc<FeedDiagnostics>>,
 }
 
 enum SessionResult {
@@ -762,9 +951,21 @@ async fn session(
     tx: &mpsc::Sender<FeedEvent>,
     fault: &watch::Sender<Option<String>>,
     shutdown: &mut watch::Receiver<bool>,
+    ready_since: &mut Option<Instant>,
 ) -> SessionResult {
     let source = endpoint.source;
     let settings = &endpoint.settings;
+    let diagnostics = endpoint
+        .diagnostics
+        .as_ref()
+        .map(|value| value.source(source));
+    if let Some(diagnostics) = diagnostics {
+        increment(&diagnostics.attempts);
+        diagnostics.phase.store(1, Ordering::Relaxed);
+        for cutoff in &diagnostics.bootstrap_cutoff_exchange_ms {
+            cutoff.store(0, Ordering::Relaxed);
+        }
+    }
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_MESSAGE_BYTES))
@@ -793,6 +994,9 @@ async fn session(
     }
     let mut recovery_state = Recovery::new([0; 2]);
     if source == FeedSource::Clob && matches!(endpoint.tick_refresh, TickRefresh::Public) {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.phase.store(2, Ordering::Relaxed);
+        }
         // Subscribe before REST recovery so updates produced during HTTP lookup remain
         // buffered on the bounded socket. Recovery provides an outcome-specific cutoff.
         let recovery = rest_recovery(market, start);
@@ -819,6 +1023,11 @@ async fn session(
             Err(reason) => return reason,
         };
         recovery_state = Recovery::new(recovered_baseline);
+        if let Some(diagnostics) = diagnostics {
+            for (index, value) in recovered_baseline.into_iter().enumerate() {
+                diagnostics.bootstrap_cutoff_exchange_ms[index].store(value, Ordering::Relaxed);
+            }
+        }
         if let Err(error) = enqueue_frame(tx, events, fault) {
             return SessionResult::Fatal(error);
         }
@@ -826,11 +1035,24 @@ async fn session(
     #[cfg(test)]
     match endpoint.tick_refresh {
         TickRefresh::Skip => recovery_state = Recovery::passthrough(),
-        TickRefresh::Fixture(baseline) => recovery_state = Recovery::new(baseline),
+        TickRefresh::Fixture(baseline) => {
+            recovery_state = Recovery::new(baseline);
+            if let Some(diagnostics) = diagnostics {
+                for (index, value) in baseline.into_iter().enumerate() {
+                    diagnostics.bootstrap_cutoff_exchange_ms[index].store(value, Ordering::Relaxed);
+                }
+            }
+        }
         TickRefresh::Public => {}
     }
     if source == FeedSource::Binance {
         recovery_state.initialized = [true; 2];
+    }
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.phase.store(
+            if recovery_state.ready() { 4 } else { 3 },
+            Ordering::Relaxed,
+        );
     }
     let bootstrap_deadline = tokio::time::sleep(settings.bootstrap);
     tokio::pin!(bootstrap_deadline);
@@ -865,7 +1087,11 @@ async fn session(
                         let observed_mono_ms = match u64::try_from(start.elapsed().as_millis()) { Ok(value) => value, Err(_) => return SessionResult::Fatal("monotonic clock overflow".into()) };
                         let events = if source == FeedSource::Clob { parse_clob(&text, market, observed_mono_ms) } else { parse_binance(&text, observed_mono_ms) };
                         let events = match events { Ok(events) => events, Err(error) => return SessionResult::Fatal(error) };
-                        let events = if source == FeedSource::Clob { recovery_state.filter(events) } else { events };
+                        let events = if source == FeedSource::Clob { recovery_state.filter_observed(events, diagnostics) } else { events };
+                        if recovery_state.ready() && events.iter().any(|event| matches!(event, FeedEvent::Snapshot { .. } | FeedEvent::Delta { .. } | FeedEvent::Reference { .. })) {
+                            ready_since.get_or_insert_with(Instant::now);
+                        }
+                        if recovery_state.ready() && let Some(diagnostics) = diagnostics { diagnostics.phase.store(4, Ordering::Relaxed); }
                         if let Err(error) = enqueue_frame(tx, events, fault) { return SessionResult::Fatal(error); }
                     },
                     Message::Ping(payload) => {
@@ -892,10 +1118,26 @@ async fn run_feed(
     let mut retry = endpoint.settings.retry;
     loop {
         if *shutdown.borrow() {
+            if let Some(diagnostics) = &endpoint.diagnostics {
+                diagnostics.source(source).phase.store(7, Ordering::Relaxed);
+            }
             return Ok(());
         }
-        let result = session(&endpoint, &market, start, &tx, &fault, &mut shutdown).await;
+        let mut ready_since = None;
+        let result = session(
+            &endpoint,
+            &market,
+            start,
+            &tx,
+            &fault,
+            &mut shutdown,
+            &mut ready_since,
+        )
+        .await;
         if matches!(result, SessionResult::Shutdown) {
+            if let Some(diagnostics) = &endpoint.diagnostics {
+                diagnostics.source(source).phase.store(7, Ordering::Relaxed);
+            }
             return Ok(());
         }
         let fatal = matches!(result, SessionResult::Fatal(_));
@@ -904,6 +1146,51 @@ async fn run_feed(
             SessionResult::Transport(reason) => reason.into(),
             SessionResult::Shutdown => unreachable!(),
         };
+        let reset_backoff = !fatal
+            && ready_since
+                .is_some_and(|ready: Instant| ready.elapsed() >= endpoint.settings.stable);
+        retry = reconnect_delay(retry, &endpoint.settings, reset_backoff);
+        if let Some(diagnostics) = &endpoint.diagnostics {
+            let diagnostics = diagnostics.source(source);
+            let code = failure_code(&reason, fatal);
+            let at = u64::try_from(start.elapsed().as_millis())
+                .unwrap_or(u64::MAX)
+                .min(u64::MAX >> 9);
+            diagnostics.last_failure.store(
+                (at << 9) | u64::from(code) | if fatal { 256 } else { 0 },
+                Ordering::Relaxed,
+            );
+            diagnostics
+                .phase
+                .store(if fatal { 6 } else { 5 }, Ordering::Relaxed);
+            if !fatal {
+                increment(&diagnostics.transport_disconnects);
+            }
+            if code == 1 {
+                increment(&diagnostics.bootstrap_timeouts);
+            }
+            if reset_backoff {
+                increment(&diagnostics.backoff_resets);
+            }
+            diagnostics.retry_delay_ms.store(
+                if fatal {
+                    0
+                } else {
+                    u64::try_from(retry.as_millis()).unwrap_or(u64::MAX)
+                },
+                Ordering::Relaxed,
+            );
+            tracing::warn!(
+                source = if source == FeedSource::Clob {
+                    "clob"
+                } else {
+                    "binance"
+                },
+                code = failure_name(code).unwrap_or("unclassified"),
+                fatal,
+                "public feed session ended"
+            );
+        }
         enqueue_frame(
             &tx,
             vec![FeedEvent::Disconnect {
@@ -917,10 +1204,21 @@ async fn run_feed(
             return Err(reason);
         }
         tokio::select! {
-            _ = wait_shutdown(&mut shutdown) => return Ok(()),
+            _ = wait_shutdown(&mut shutdown) => {
+                if let Some(diagnostics) = &endpoint.diagnostics { diagnostics.source(source).phase.store(7, Ordering::Relaxed); }
+                return Ok(());
+            },
             _ = tokio::time::sleep(retry) => {},
         }
         retry = retry.saturating_mul(2).min(endpoint.settings.max_retry);
+    }
+}
+
+fn reconnect_delay(previous: Duration, settings: &Settings, stable_stream: bool) -> Duration {
+    if stable_stream {
+        settings.retry
+    } else {
+        previous
     }
 }
 
@@ -930,6 +1228,17 @@ pub async fn run_public(
     tx: mpsc::Sender<FeedEvent>,
     fault: watch::Sender<Option<String>>,
     shutdown: watch::Receiver<bool>,
+) -> Result<(), String> {
+    run_public_with_diagnostics(market, start, tx, fault, shutdown, None).await
+}
+
+pub async fn run_public_with_diagnostics(
+    market: Market,
+    start: Instant,
+    tx: mpsc::Sender<FeedEvent>,
+    fault: watch::Sender<Option<String>>,
+    shutdown: watch::Receiver<bool>,
+    diagnostics: Option<Arc<FeedDiagnostics>>,
 ) -> Result<(), String> {
     let validate = || -> Result<(), String> {
         validate_token(&market.up_token)?;
@@ -952,6 +1261,7 @@ pub async fn run_public(
             url: CLOB_URL.into(),
             settings: Settings::default(),
             tick_refresh: TickRefresh::Public,
+            diagnostics: diagnostics.clone(),
         },
         market.clone(),
         start,
@@ -965,6 +1275,7 @@ pub async fn run_public(
             url: BINANCE_URL.into(),
             settings: Settings::default(),
             tick_refresh: TickRefresh::Public,
+            diagnostics,
         },
         market,
         start,
@@ -1019,7 +1330,260 @@ mod transport_tests {
             retry: Duration::from_millis(10),
             max_retry: Duration::from_millis(40),
             bootstrap: Duration::from_secs(1),
+            stable: Duration::from_millis(50),
         }
+    }
+
+    #[test]
+    fn diagnostics_count_discarded_snapshots_without_initializing_or_exporting_payloads() {
+        let selected = market();
+        let diagnostics = FeedDiagnostics::default();
+        let mut recovery = Recovery::new([200, 300]);
+        let mut full = snapshot(&selected);
+        full["timestamp"] = "200".into();
+        assert!(
+            recovery
+                .filter_observed(
+                    parse_clob(&full.to_string(), &selected, 7).unwrap(),
+                    Some(diagnostics.source(FeedSource::Clob))
+                )
+                .is_empty()
+        );
+        assert!(!recovery.ready());
+        let sample = diagnostics.snapshot();
+        assert_eq!(sample.clob.snapshots_seen, [1, 0]);
+        assert_eq!(sample.clob.snapshots_discarded_before_cutoff, [1, 0]);
+        assert_eq!(
+            failure_name(failure_code(
+                "private response https://example.invalid/secret",
+                true
+            )),
+            Some("invalid_public_input")
+        );
+        let exported = serde_json::to_string(&sample).unwrap();
+        assert!(!exported.contains(&selected.condition_id));
+        assert!(!exported.contains("example.invalid"));
+        assert!(!exported.contains("private response"));
+    }
+
+    #[tokio::test]
+    async fn stable_native_stream_resets_backoff_after_consecutive_failed_connections() {
+        let selected = market();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server_market = selected.clone();
+        let diagnostics = Arc::new(FeedDiagnostics::default());
+        let observed = diagnostics.clone();
+        let server_diagnostics = diagnostics.clone();
+        let server = tokio::spawn(async move {
+            for connection in 0..4 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let _ = socket.next().await.unwrap().unwrap();
+                if connection < 2 {
+                    let _ = socket.close(None).await;
+                    continue;
+                }
+                for token in [&server_market.up_token, &server_market.down_token] {
+                    let mut full = snapshot(&server_market);
+                    full["asset_id"] = token.as_str().into();
+                    full["timestamp"] = "201".into();
+                    socket
+                        .send(Message::Text(full.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                if connection == 2 {
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while server_diagnostics.snapshot().clob.phase != "streaming" {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let _ = socket.close(None).await;
+                    continue;
+                }
+                while let Some(Ok(message)) = socket.next().await {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                    if matches!(&message, Message::Text(text) if text.as_str() == "PING")
+                        && socket.send(Message::Text("PONG".into())).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let (fault, state) = watch::channel(None);
+        let (shutdown, control) = watch::channel(false);
+        let client = tokio::spawn(run_feed(
+            Endpoint {
+                source: FeedSource::Clob,
+                url,
+                settings: fast_settings(),
+                tick_refresh: TickRefresh::Fixture([100; 2]),
+                diagnostics: Some(diagnostics),
+            },
+            selected,
+            Instant::now(),
+            tx,
+            fault,
+            control,
+        ));
+        let mut snapshots = 0;
+        let mut disconnects = 0;
+        for _ in 0..7 {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                FeedEvent::Snapshot { .. } => snapshots += 1,
+                FeedEvent::Disconnect { .. } => disconnects += 1,
+                _ => panic!("unexpected fixture event"),
+            }
+        }
+        assert_eq!(snapshots, 4);
+        assert_eq!(disconnects, 3);
+        let sample = observed.snapshot();
+        assert_eq!(sample.clob.attempts, 4);
+        assert_eq!(sample.clob.backoff_resets, 1);
+        assert_eq!(sample.clob.retry_delay_ms, 10);
+        assert_eq!(sample.clob.bootstrap_timeouts, 0);
+        assert!(state.borrow().is_none());
+        shutdown.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discarded_initial_snapshot_times_out_reconnects_and_requires_both_native_books() {
+        let selected = market();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server_market = selected.clone();
+        let server = tokio::spawn(async move {
+            for connection in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let _ = socket.next().await.unwrap().unwrap();
+                for token in [&server_market.up_token, &server_market.down_token] {
+                    let mut full = snapshot(&server_market);
+                    full["asset_id"] = token.as_str().into();
+                    full["timestamp"] = if connection == 0 { "100" } else { "201" }.into();
+                    socket
+                        .send(Message::Text(full.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                while let Some(Ok(message)) = socket.next().await {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                    if matches!(&message, Message::Text(text) if text.as_str() == "PING") {
+                        let delta = json!({"event_type":"price_change","market":server_market.condition_id,"timestamp":"150","price_changes":[{"asset_id":server_market.up_token,"price":"0.4","size":"1","side":"BUY"}]});
+                        let response = if connection == 0 {
+                            delta.to_string()
+                        } else {
+                            "PONG".into()
+                        };
+                        if socket.send(Message::Text(response.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let diagnostics = Arc::new(FeedDiagnostics::default());
+        let observed = diagnostics.clone();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (fault, state) = watch::channel(None);
+        let (shutdown, control) = watch::channel(false);
+        let mut settings = fast_settings();
+        settings.bootstrap = Duration::from_millis(100);
+        let client = tokio::spawn(run_feed(
+            Endpoint {
+                source: FeedSource::Clob,
+                url,
+                settings,
+                tick_refresh: TickRefresh::Fixture([100; 2]),
+                diagnostics: Some(diagnostics),
+            },
+            selected,
+            Instant::now(),
+            tx,
+            fault,
+            control,
+        ));
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first, FeedEvent::Disconnect { reason, .. } if reason == "fresh both-outcome snapshot bootstrap timeout")
+        );
+        let up = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let down = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            up,
+            FeedEvent::Snapshot {
+                outcome: Outcome::Up,
+                exchange_ms: 201,
+                ..
+            }
+        ));
+        assert!(matches!(
+            down,
+            FeedEvent::Snapshot {
+                outcome: Outcome::Down,
+                exchange_ms: 201,
+                ..
+            }
+        ));
+        let sample = observed.snapshot();
+        assert_eq!(sample.clob.attempts, 2);
+        assert_eq!(sample.clob.bootstrap_timeouts, 1);
+        assert_eq!(sample.clob.transport_disconnects, 1);
+        assert_eq!(sample.clob.snapshots_seen, [2, 2]);
+        assert_eq!(sample.clob.snapshots_discarded_before_cutoff, [1, 1]);
+        assert_eq!(sample.clob.phase, "streaming");
+        assert_eq!(
+            sample.clob.last_failure,
+            Some("native_snapshot_bootstrap_timeout")
+        );
+        assert!(!sample.clob.last_failure_fatal);
+        assert!(state.borrow().is_none());
+        shutdown.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     fn rest_book(market: &Market, tick: &str, timestamp: &str) -> Value {
@@ -1212,6 +1776,7 @@ mod transport_tests {
                     url,
                     settings,
                     tick_refresh: TickRefresh::Fixture([100, 100]),
+                    diagnostics: None,
                 },
                 selected,
                 Instant::now(),
@@ -1287,6 +1852,7 @@ mod transport_tests {
                     url,
                     settings: fast_settings(),
                     tick_refresh: TickRefresh::Skip,
+                    diagnostics: None,
                 },
                 selected,
                 Instant::now(),
@@ -1353,6 +1919,8 @@ mod transport_tests {
         let (tx, mut rx) = mpsc::channel(1);
         let (fault, state) = watch::channel(None);
         let (_shutdown, control) = watch::channel(false);
+        let diagnostics = Arc::new(FeedDiagnostics::default());
+        let observed = diagnostics.clone();
         let client = tokio::spawn(async move {
             run_feed(
                 Endpoint {
@@ -1360,6 +1928,7 @@ mod transport_tests {
                     url,
                     settings: fast_settings(),
                     tick_refresh: TickRefresh::Skip,
+                    diagnostics: Some(diagnostics),
                 },
                 selected,
                 Instant::now(),
@@ -1377,6 +1946,13 @@ mod transport_tests {
                 .is_err()
         );
         assert_eq!(state.borrow().as_deref(), Some("feed queue overflow"));
+        let sample = observed.snapshot();
+        assert_eq!(sample.clob.last_failure, Some("feed_queue_unavailable"));
+        assert!(sample.clob.last_failure_fatal);
+        assert_eq!(sample.clob.phase, "faulted");
+        assert_eq!(sample.clob.attempts, 1);
+        assert_eq!(sample.clob.retry_delay_ms, 0);
+        assert_eq!(sample.clob.backoff_resets, 0);
         assert!(matches!(
             rx.try_recv().unwrap(),
             FeedEvent::Disconnect {
@@ -1411,6 +1987,7 @@ mod transport_tests {
                     url,
                     settings,
                     tick_refresh: TickRefresh::Skip,
+                    diagnostics: None,
                 },
                 selected,
                 Instant::now(),

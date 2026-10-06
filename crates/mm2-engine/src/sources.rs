@@ -335,12 +335,13 @@ async fn run_public(
         // The actor has acknowledged the new identity before any new-market frame is emitted.
         let (feed_shutdown, feed_shutdown_rx) = watch::channel(false);
         let mut owned = OwnedFeeds {
-            task: Some(tokio::spawn(feeds::run_public(
+            task: Some(tokio::spawn(feeds::run_public_with_diagnostics(
                 market.clone(),
                 start,
                 tx.clone(),
                 fault_tx.clone(),
                 feed_shutdown_rx,
+                Some(handle.feed_diagnostics.clone()),
             ))),
             shutdown: feed_shutdown,
         };

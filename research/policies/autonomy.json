@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "autonomy": "A0",
+  "repository": "yurycooliq/mm2",
+  "model": "gpt-6-astra",
+  "reasoning": "max",
+  "fallback_allowed": false,
+  "enabled_stages": ["analysis", "reliability", "retention"],
+  "automatic_merge": false,
+  "funded_authorization": false,
+  "coding_gate": "verified capability sandbox and independent exact-SHA check broker",
+  "model_gate": "native run settings must be confirmed; worker declaration is not provider attestation",
+  "notification_policy": "material findings, failures, completion or owner action only; detailed daily reports only on explicit request"
+}

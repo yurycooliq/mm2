@@ -55,6 +55,7 @@ pub struct Handle {
     pub state: watch::Receiver<Arc<Value>>,
     paper: Option<Box<Handle>>,
     paper_fault: Option<watch::Sender<Option<String>>>,
+    pub(crate) feed_diagnostics: Arc<crate::feeds::FeedDiagnostics>,
 }
 impl Handle {
     pub fn source_status(
@@ -134,6 +135,7 @@ pub struct Actor {
     committing: bool,
     closing: bool,
     feed_events: u64,
+    feed_diagnostics: Arc<crate::feeds::FeedDiagnostics>,
     decision_count: u64,
     durations_ns: VecDeque<u64>,
     last_decision: Decision,
@@ -182,6 +184,7 @@ struct Publication {
     committing: bool,
     closing: bool,
     feed_events: u64,
+    feed_diagnostics: crate::feeds::FeedDiagnosticsSnapshot,
     decision_count: u64,
     durations_ns: VecDeque<u64>,
     now: u64,
@@ -275,6 +278,7 @@ pub fn prepare(
     journal.release_replay_buffer();
     let (tx, commands) = mpsc::channel(config.command_capacity);
     let (state, state_rx) = watch::channel(Arc::new(json!({"api_ready":false})));
+    let feed_diagnostics = Arc::new(crate::feeds::FeedDiagnostics::default());
     let mut actor = Actor {
         core,
         limits,
@@ -297,6 +301,7 @@ pub fn prepare(
         committing: false,
         closing: false,
         feed_events: 0,
+        feed_diagnostics: feed_diagnostics.clone(),
         decision_count: 0,
         durations_ns: VecDeque::with_capacity(1024),
         last_decision,
@@ -334,6 +339,7 @@ pub fn prepare(
             state: state_rx,
             paper: None,
             paper_fault: None,
+            feed_diagnostics,
         },
         actor,
     ))
@@ -507,6 +513,10 @@ impl Actor {
     }
     fn latch(&mut self, reason: String) {
         if self.fatal.is_none() {
+            tracing::error!(
+                code = runtime_failure_class(&reason),
+                "engine fault latched; owner effects paused"
+            );
             self.fatal = Some(reason.chars().take(256).collect());
         }
         let _ = self.core.control(Action::Pause);
@@ -608,6 +618,7 @@ impl Actor {
             committing: self.committing,
             closing: self.closing,
             feed_events: self.feed_events,
+            feed_diagnostics: self.feed_diagnostics.snapshot(),
             decision_count: self.decision_count,
             durations_ns: self.durations_ns.clone(),
             now: wall_ms(),
@@ -1360,7 +1371,13 @@ impl Publication {
             "execution_noop_ticks":self.execution_noop_ticks,
             "decision_ns_p50":percentile(50),"decision_ns_p99":if ordered.len()>=1000 {percentile(99)} else {None},
             "measurement":"core and strategy evaluation; excludes transport, parsing, queue wait, execution durability and snapshot publication"});
-        Arc::new(json!({
+        let diagnostics = json!({
+            "feed_diagnostics":self.feed_diagnostics,
+            "feed_diagnostics_policy":"bounded atomic counters sampled independently; local boot scope, not a durable event stream",
+            "fault_class":self.fatal.as_deref().map(runtime_failure_class),
+            "input_failure_class":snapshot.last_error.as_deref().map(crate::feeds::input_failure_class)
+        });
+        let mut publication = json!({
             "schema_version":1, "boot_id":self.boot_id,"sequence":self.sequence,"published_at_ms":now,
             "mode":mode_name(snapshot.mode),"command_version":self.version,"feed_source":self.source,
             "reset_epoch":self.reset_epoch,"source_status":self.source_status,
@@ -1385,7 +1402,37 @@ impl Publication {
             "stop_reasons":self.last_decision.stop_reasons.iter().map(reason_name).collect::<Vec<_>>(),
             "committing":self.committing,"shutting_down":self.closing,"journal_bytes":self.journal_bytes,
             "metrics":metrics
-        }))
+        });
+        if let (Value::Object(publication), Value::Object(diagnostics)) =
+            (&mut publication, diagnostics)
+        {
+            publication.extend(diagnostics);
+        }
+        Arc::new(publication)
+    }
+}
+
+fn runtime_failure_class(reason: &str) -> &'static str {
+    if reason.contains("unknown") && reason.contains("acknowledgement") {
+        "external_acknowledgement_unknown"
+    } else if reason.contains("quota") || reason.contains("capacity") || reason.contains("bound") {
+        "capacity_fault"
+    } else if reason.contains("journal")
+        || reason.contains("durable")
+        || reason.contains("sync")
+        || reason.contains("writer")
+    {
+        "durability_fault"
+    } else if reason.contains("invariant") {
+        "simulation_invariant_fault"
+    } else if reason.contains("feed")
+        || reason.contains("source")
+        || reason.contains("WebSocket")
+        || reason.contains("REST")
+    {
+        "source_fault"
+    } else {
+        "runtime_fault"
     }
 }
 
@@ -1438,6 +1485,62 @@ fn reason_name(reason: &StopReason) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn classified_durability_fault_remains_latched_after_valid_source_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            mode: "shadow".into(),
+            feed_source: crate::config::FeedSource::Public,
+            listen: "127.0.0.1:8088".parse().unwrap(),
+            allow_remote_http: false,
+            state_dir: directory.path().into(),
+            live_state_dir: None,
+            journal_max_bytes: 1_048_576,
+            journal: None,
+            strategy: mm2_strategy::Rules::default(),
+            live: None,
+            command_capacity: 8,
+            feed_capacity: 16,
+            limits: Limits {
+                initial_collateral_usd: "100".into(),
+                max_imbalance_shares: "10".into(),
+                lot_shares: "5".into(),
+                half_width: "0.01".into(),
+                max_feed_age_ms: 1000,
+            },
+        };
+        let (_tx, rx) = mpsc::channel(16);
+        let (_fault, fault) = watch::channel(None);
+        let (_shutdown, shutdown) = watch::channel(false);
+        let (handle, mut actor) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+        actor.latch("journal writer stopped; reconcile on restart".into());
+        actor
+            .core
+            .apply(FeedEvent::Reference {
+                exchange_ms: wall_ms(),
+                observed_mono_ms: mono_ms(actor.start),
+                price_micro: 80_000_000_000,
+            })
+            .unwrap();
+        actor.evaluate();
+        actor.publish();
+        assert_eq!(handle.state.borrow()["fault_class"], "durability_fault");
+        assert_eq!(handle.state.borrow()["mode"], "paused");
+        assert_eq!(handle.state.borrow()["api_ready"], false);
+        assert_eq!(handle.state.borrow()["last_input_error"], Value::Null);
+        assert!(handle.state.borrow()["fault"].is_string());
+        let reply = actor
+            .command(Command::Control {
+                id: "must-stay-paused".into(),
+                expected_version: 0,
+                action: "resume".into(),
+            })
+            .await;
+        assert!(reply.is_err());
+        assert_eq!(actor.version, 0);
+        assert!(actor.journal.as_ref().unwrap().history().is_empty());
+    }
+
     #[tokio::test]
     async fn saturated_secondary_worker_drops_snapshot_and_cannot_overwrite_newer_control() {
         let directory = tempfile::tempdir().unwrap();

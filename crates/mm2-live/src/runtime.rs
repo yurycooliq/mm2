@@ -392,6 +392,7 @@ fn snapshot(
         durable_sequence: journal.sequence,
         journal_bytes: journal.bytes,
         journal_max_bytes: settings.journal_max_bytes,
+        journal_committed_prefix: journal.committed_prefix(),
         quotes_coalesced: coalesced,
         prepare_attempts: 0,
         prepare_failures: 0,
