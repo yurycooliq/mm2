@@ -7,8 +7,10 @@ export default function App() {
   if (console.authenticated === null) return <main className="login"><p>Loading…</p></main>;
   if (!console.authenticated) {
     if (console.access === 'local') return <Login login={console.login} busy={console.busy} error={console.error} />;
-    return <main className="login"><h1>{console.access === 'unavailable' ? 'Unavailable' : 'Not found'}</h1>
-      {console.access === 'unavailable' && <p>Reopen the Mini App to try again.</p>}</main>;
+    const title = console.access === 'session_expired' ? 'Session ended' : console.access === 'unavailable' ? 'Temporarily unavailable' : 'Access unavailable';
+    return <main className="login"><h1>{title}</h1>
+      <p>Close this Mini App and open it again from the bot to restore access.</p>
+      {console.access === 'session_expired' && <p>The bot continues independently. Any unconfirmed command is preserved; reopening does not send it again.</p>}</main>;
   }
   const state = console.envelope?.state ?? null;
   const disabled = console.busy || !!console.storageError || !!console.pending || !console.envelope?.connected || !safeVersion(state) || !state?.api_ready;

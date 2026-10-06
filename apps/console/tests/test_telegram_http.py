@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 from mm2_console.app import App
@@ -149,6 +150,24 @@ class TelegramHttpTests(unittest.TestCase):
         clock[0] = 30
         self.assert_hidden(self.request("GET", "/api/state", cookie=cookie))
         self.assert_hidden(self.authenticate(data, cookie))
+
+    def test_reload_after_launch_expiry_keeps_live_session_then_requires_fresh_launch(self):
+        clock, wall = [0], [1_800_000_000]
+        self.app.sessions = Sessions(clock=lambda: clock[0])
+        with patch("mm2_console.auth.time.time", side_effect=lambda: wall[0]):
+            data = signed(auth_date=wall[0])
+            cookie = self.owner_cookie(data)
+            token = cookie.split("=", 1)[1]
+            expiry = self.app.sessions._sessions[token]
+            for age in (301, 3599):
+                clock[0], wall[0] = age, 1_800_000_000 + age
+                self.assertEqual(self.authenticate(data, cookie)[0], 200)
+                self.assertEqual(self.app.sessions._sessions[token], expiry)
+            clock[0], wall[0] = 3600, 1_800_003_600
+            self.assert_hidden(self.authenticate(data, cookie))
+            self.assertEqual(len(self.app.sessions._sessions), 0)
+            self.assertEqual(self.authenticate(signed(auth_date=wall[0], query_id="fresh-reopen"))[0], 200)
+        self.assertFalse(self.engine.calls)
 
     def test_replayed_init_data_cannot_issue_a_session_to_another_cookie_or_client(self):
         data = signed(query_id="original-client")

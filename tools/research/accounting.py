@@ -116,7 +116,7 @@ def calculate_account(events, opening=None, closing=None, *, utc_range, scope, s
     positions_known = opening is not None and opening.get("positions_complete") is True
     external, external_known, reported_cash = 0, True, 0
     actual_cost, bound_cost, actual_fee, reported_returns, turnover = 0, 0, 0, 0, 0
-    cost_missing, fee_missing, trade_events = 0, 0, 0
+    cost_missing, fee_missing, bound_missing, trade_events = 0, 0, 0, 0
     asset_conditions = {p["asset_id"]: p["condition_id"] for p in opening["positions"]} if opening else {}
     conflicts = []
     for event in events:
@@ -143,12 +143,15 @@ def calculate_account(events, opening=None, closing=None, *, utc_range, scope, s
             positions[asset] = positions.get(asset, 0) + integer(change["quantity_delta_micros"], signed=True)
         actual_cost += integer(amounts.get("cost_actual_pico"), nullable=True) or 0
         bound_cost += integer(amounts.get("cost_bound_pico"), nullable=True) or 0
+        # An absent declaration is unknown applicability/cost, including closeout
+        # and non-trade events. Explicit zero is evidence; an empty subtotal is not.
+        bound_missing += amounts.get("cost_bound_pico") is None
         actual_fee += integer(amounts.get("fee_actual_pico"), nullable=True) or 0
+        cost_missing += amounts.get("cost_actual_pico") is None
+        fee_missing += amounts.get("fee_actual_pico") is None
         reported = integer(amounts.get("cash_reported_pico"), nullable=True)
         if event["event_type"] == "TRADE":
             trade_events += 1
-            cost_missing += amounts.get("cost_actual_pico") is None
-            fee_missing += amounts.get("fee_actual_pico") is None
             if reported is not None:
                 turnover += reported
         if event["event_type"] in {"MERGE", "REDEEM", "REWARD", "MAKER_REBATE", "TAKER_REBATE", "YIELD"} and delta is not None:
@@ -207,13 +210,18 @@ def calculate_account(events, opening=None, closing=None, *, utc_range, scope, s
         "net_pnl_pico": exact, "net_pnl_interval_pico": interval,
         "roi": roi, "roi_kind": "window-no-external-flows" if roi is not None else None,
         "twr": None, "twr_reason": "REQUIRES_COMPLETE_VALUATIONS_AROUND_EVERY_EXTERNAL_FLOW",
-        "components": {"observed_actual_cost_pico": str(actual_cost), "conservative_cost_bound_pico": str(bound_cost),
+        "components": {"observed_actual_cost_pico": str(actual_cost),
+            "observed_cost_bound_pico": str(bound_cost),
+            "conservative_cost_bound_pico": str(bound_cost) if financial_window_complete and not is_conflicted and not bound_missing else None,
             "observed_actual_fees_pico": str(actual_fee), "reported_returns_pico": str(reported_returns),
             "reported_trade_turnover_pico": str(turnover), "realized_pnl_pico": None,
-            "actual_cost_total_pico": str(actual_cost) if not cost_missing else None,
-            "actual_fees_total_pico": str(actual_fee) if not fee_missing else None,
+            "actual_cost_total_pico": str(actual_cost) if financial_window_complete and not is_conflicted and not cost_missing else None,
+            "actual_fees_total_pico": str(actual_fee) if financial_window_complete and not is_conflicted and not fee_missing else None,
             "cost_evidence_coverage": {"trade_events": trade_events, "missing_actual_cost": cost_missing,
-                                       "missing_actual_fee": fee_missing}},
+                                       "missing_actual_fee": fee_missing, "actual_cost_records": len(events),
+                                       "cost_bound_records": len(events), "missing_cost_bound": bound_missing,
+                                       "source_window_complete": financial_window_complete and not is_conflicted,
+                                       "bound_scope": "declared event costs; unreported categories are not inferred"}},
         "cost_semantics": "Actual/upper-bound/report-only costs are separate; cash effects already include costs. No second fee deduction.",
         "financial_claim": "synthetic" if lane in {"public-paper", "offline-emulator"} else "observed" if exact is not None else "unverified"}
     return result

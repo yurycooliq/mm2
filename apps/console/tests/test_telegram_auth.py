@@ -4,7 +4,7 @@ import json
 import unittest
 from urllib.parse import urlencode
 
-from mm2_console.auth import Sessions, validate_telegram
+from mm2_console.auth import Sessions, telegram_session, validate_telegram
 
 BOT = "offline-telegram-auth-fixture-token"
 NOW = 1_800_000_000
@@ -22,6 +22,35 @@ def signed(fields=None, user=None, auth_date=NOW):
 
 
 class TelegramAuthenticationTests(unittest.TestCase):
+    def test_old_launch_reuses_only_its_live_cookie_without_renewing_ttl(self):
+        clock = [0]
+        sessions = Sessions(clock=lambda: clock[0])
+        data = signed()
+        token = telegram_session(sessions, "", data, BOT, OWNER, NOW)
+        expiry = sessions._sessions[token]
+        for age in (300, 301, 3599):
+            clock[0] = age
+            self.assertEqual(telegram_session(sessions, token, data, BOT, OWNER, NOW + age), token)
+            self.assertEqual(sessions._sessions[token], expiry)
+            with self.assertRaises(ValueError):
+                telegram_session(sessions, "another-cookie", data, BOT, OWNER, NOW + age)
+        clock[0] = 3600
+        with self.assertRaises(ValueError):
+            telegram_session(sessions, token, data, BOT, OWNER, NOW + 3600)
+        self.assertEqual(len(sessions._sessions), 0)
+
+    def test_old_data_cannot_reuse_cookie_after_owner_switch_tampering_or_restart(self):
+        clock = [0]
+        sessions = Sessions(clock=lambda: clock[0])
+        token = telegram_session(sessions, "", signed(), BOT, OWNER, NOW)
+        clock[0] = 301
+        for data in (signed(user={"id": OWNER + 1}), signed().replace("Owner", "Attacker"),
+                     signed(fields={"query_id": "different-launch"}), signed(auth_date=NOW + 400)):
+            with self.assertRaises(ValueError):
+                telegram_session(sessions, token, data, BOT, OWNER, NOW + 301)
+        with self.assertRaises(ValueError):
+            telegram_session(Sessions(), token, signed(), BOT, OWNER, NOW + 301)
+
     def test_only_the_exact_signed_integer_owner_is_accepted(self):
         self.assertEqual(len(validate_telegram(signed(), BOT, OWNER, now=NOW)), 64)
         for user in ({"id": OWNER + 1}, {"id": str(OWNER)}, {"id": True}, {"id": OWNER, "is_bot": True}, {}):

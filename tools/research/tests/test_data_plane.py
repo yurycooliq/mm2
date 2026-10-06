@@ -124,6 +124,33 @@ class ExactSchemaTests(unittest.TestCase):
 
 
 class AccountingTests(unittest.TestCase):
+    def test_unknown_bound_differs_from_explicit_zero_and_preserves_known_subtotal(self):
+        known = event("known", "0", amounts={"cost_bound_pico": "123"})
+        unknown = event("unknown", "0")
+        result = calculate([known, unknown], snapshot(), snapshot(at=END))
+        self.assertEqual(result["components"]["observed_cost_bound_pico"], "123")
+        self.assertIsNone(result["components"]["conservative_cost_bound_pico"])
+        self.assertEqual(result["components"]["cost_evidence_coverage"]["missing_cost_bound"], 1)
+        # Full NAV accounting remains valid independently of cost decomposition.
+        self.assertEqual(result["net_pnl_pico"], "0")
+        unknown["amounts"]["cost_bound_pico"] = "0"
+        self.assertEqual(calculate([known, unknown], snapshot(), snapshot(at=END))["components"]["conservative_cost_bound_pico"], "123")
+
+    def test_empty_partial_window_has_unknown_bound_not_free_execution(self):
+        result = calculate([], None, snapshot(at=END), quality("PARTIAL"))
+        self.assertEqual(result["components"]["observed_cost_bound_pico"], "0")
+        for name in ("conservative_cost_bound_pico", "actual_cost_total_pico", "actual_fees_total_pico"):
+            self.assertIsNone(result["components"][name])
+        self.assertEqual(calculate([], snapshot(), snapshot(at=END))["components"]["conservative_cost_bound_pico"], "0")
+
+    def test_closeout_unknown_cost_applicability_keeps_complete_bound_unknown(self):
+        events = [event("trade", "0", amounts={"cost_bound_pico": "100"}), event("closeout", "0", kind="MERGE")]
+        result = calculate(events, snapshot(), snapshot(at=END))
+        self.assertIsNone(result["components"]["conservative_cost_bound_pico"])
+        self.assertEqual(result["components"]["cost_evidence_coverage"]["cost_bound_records"], 2)
+        self.assertIsNone(result["components"]["actual_cost_total_pico"])
+        self.assertIsNone(result["components"]["actual_fees_total_pico"])
+
     def test_fee_inclusive_cash_not_charged_twice_and_reservation_not_loss(self):
         opening = snapshot()
         opening["reserved_pico"] = amount("4.5")

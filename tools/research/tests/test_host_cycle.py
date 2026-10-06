@@ -88,12 +88,12 @@ class HostCycleTest(unittest.TestCase):
     def cycle(self, now=None, observe=None):
         return host.run_cycle(self.config, s3=self.s3, observe=observe or self.observe, now=now or self.now)
 
-    def diagnostic(self, incidents, *, end=None, engine_revision="b" * 40):
+    def diagnostic(self, incidents, *, end=None, engine_revision="b" * 40, context=None):
         end = end or self.now
         fmt = lambda stamp: stamp.isoformat().replace("+00:00", "Z")
         packet = publish_bundle(self.root / "exports", {
             "health.json": {"api_ready": False, "fault_class": "runtime_fault"},
-            "diagnostics.json": {"incidents": incidents}, "coverage.json": {"financial_complete": False}},
+            "diagnostics.json": {"incidents": incidents, **(context or {})}, "coverage.json": {"financial_complete": False}},
             scope={"kind": "sanitized-host-diagnostics", "source_id": "fixture-engine", "lane": "public-paper",
                    "engine_source_revision": engine_revision, "incident_epoch_attribution": "UNVERIFIED_HISTORICAL_TAIL"},
             utc_range={"start": fmt(end - timedelta(hours=1)), "end": fmt(end)},
@@ -106,6 +106,26 @@ class HostCycleTest(unittest.TestCase):
     def incident(stamp="1791281000000000", source="docker_engine"):
         return {"category": "runtime_unknown", "message": "diagnostic_code=runtime_fault",
                 "fingerprint": "d" * 64, "source": source, "observed_timestamp_us": stamp}
+
+    def test_each_backfill_window_keeps_its_own_lifecycle_context_and_old_unknowns(self):
+        contexts = [None, {"captured_at_utc": "2026-10-06T10:04:00Z", "systemd": {"NRestarts": "0"},
+                          "containers": [{"service": "engine", "restarts": 0, "oom_killed": False}]},
+                         {"captured_at_utc": "2026-10-06T10:04:02Z", "systemd": {"NRestarts": "7"},
+                          "containers": [{"service": "engine", "restarts": 7, "oom_killed": True}]}]
+        bundles = [self.diagnostic([], end=self.now + timedelta(seconds=index), context=context)
+                   for index, context in enumerate(contexts)]
+        result = self.cycle(self.now + timedelta(seconds=3))
+        windows = read_member(self.root / "archive" / result["packet"], "diagnostics.json")["windows"]
+        by_id = {window["bundle_id"]: window["lifecycle_context"] for window in windows}
+        self.assertIsNone(by_id[bundles[0].name]["systemd"])
+        self.assertIsNone(by_id[bundles[0].name]["captured_at_utc"])
+        for index in (1, 2):
+            self.assertEqual(by_id[bundles[index].name]["systemd"], contexts[index]["systemd"])
+            self.assertEqual(by_id[bundles[index].name]["containers"][0]["restarts"], (0, 7)[index - 1])
+            self.assertEqual(by_id[bundles[index].name]["captured_at_utc"], contexts[index]["captured_at_utc"])
+            self.assertFalse(by_id[bundles[index].name]["historic_root_cause_proven"])
+        self.assertEqual(self.cycle(self.now + timedelta(seconds=4))["diagnostic_windows_processed"], 0)
+
 
     def test_two_account_archive_packets_repeat_without_duplicate_window_or_false_profit(self):
         first = self.cycle()

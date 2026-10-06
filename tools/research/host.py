@@ -295,6 +295,23 @@ def _pending_diagnostics(database, ingest, latest_manifest):
     return pending, backlog
 
 
+def _lifecycle_context(data):
+    """Keep each sanitized window's evidence; never borrow the newest counters."""
+    from scripts.research_export import safe_diagnostics
+    projected = safe_diagnostics(data)
+    captured = data.get("captured_at_utc")
+    if captured is not None:
+        try:
+            utc(captured)
+        except (ResearchError, TypeError, ValueError):
+            captured = None
+    return {"captured_at_utc": captured, "unit": projected["unit"],
+            "hours": projected["hours"], "systemd": projected["systemd"] or None,
+            "containers": projected["containers"] or None,
+            "engine_source_revision": projected.get("engine_source_revision"),
+            "historic_root_cause_proven": False}
+
+
 def run_cycle(config, *, s3=None, observe=None, now=None):
     root = Path(config["state"])
     if root.is_symlink():
@@ -356,7 +373,8 @@ def run_cycle(config, *, s3=None, observe=None, now=None):
                 for manifest, data in pending_diagnostics for incident in data.get("incidents", [])[:400]
                 if isinstance(incident, dict)],
             "windows": [{"bundle_id": manifest["bundle_id"], "scope": manifest["scope"],
-                         "utc_range": manifest["utc_range"]} for manifest, _ in pending_diagnostics]}
+                         "utc_range": manifest["utc_range"],
+                         "lifecycle_context": _lifecycle_context(data)} for manifest, data in pending_diagnostics]}
     packet = publish_bundle(archive, {"comparison.json": comparison, "accounting-summary.json": accounts,
         "health.json": health, "diagnostics.json": incident_data, "provenance.json": {
             "source_bundles": [verify_bundle(path)["bundle_id"] for path in bundles],
