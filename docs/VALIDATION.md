@@ -20,7 +20,7 @@ into client files. Credentials have not yet been imported at this checkpoint.
 | Check | Confirmed scope |
 | --- | --- |
 | Rust | **235 workspace tests passed**, including five Builder tests, eight CLOB utility tests and two CLI tests. Pinned Rust 1.98.1, locked optimized workspace build, format and workspace/all-targets Clippy `-D warnings` passed. |
-| Operations/private setup | **114 Linux tests passed, no skips**, including safe Builder source parsing, exclusive auth selection, canonical padding, atomic stale-snapshot refusal, masked errors and private worker boundaries. |
+| Operations/private setup | **116 Linux tests passed, no skips**, including safe Builder source parsing, exclusive auth selection, canonical padding, atomic stale-snapshot refusal, masked errors, private worker boundaries and supervisor failure classification. |
 | Containers | **14 checks passed** on the optimized candidate engine and retained console, including the packaged credential binary refusing a foreign fixture wallet with network disabled. Zero live orders. Observed elapsed 25,218 ms, graceful stop 875 ms; these are local measurements, not an SLA. |
 | Actual AWS state | Verified through SSM: `eu-west-1`, retained `0bffb99` release, simulation paused, API and public feeds ready, no funded actor, `live_eligible=false`. Wallet key present; CLOB, owner Relayer, Builder and RPC settings absent. AWS CLI identity and pinned SSH/SSM access renewed and verified. |
 
@@ -28,6 +28,13 @@ New exact-revision image export, selected-host rollout and authenticated existin
 credential acceptance are subsequent checks. This checkpoint does not establish
 venue/account eligibility or funded trading readiness. The current host's prior
 negative geoblock evidence remains unresolved; saving keys cannot override it.
+
+The retained AWS unit reported five restarts after its prior rollout. The masked
+historical lifecycle messages do not establish their cause. Thirty current
+Docker engine metadata reads took 14–21 ms, with none beyond the existing 400 ms
+deadline. New diagnostics distinguish engine metadata timeout and other fixed
+failure classes without exception arguments/output. The deadline, fail-closed
+cleanup and recovery policy are unchanged; historical causality is unconfirmed.
 
 ## Previous checkpoint: October 5, 2026 — public feed access, TLS startup and private venue setup
 

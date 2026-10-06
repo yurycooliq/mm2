@@ -27,6 +27,27 @@ class EngineIntegrityError(ValueError):
     """A second engine can mutate the funded account; this is a whole-unit failure."""
 
 
+class EngineMetadataTimeout(subprocess.SubprocessError):
+    """The tracked engine process could not be verified within the fixed deadline."""
+
+
+def failure_class(error):
+    """Only fixed public categories enter the journal; never exception arguments/output."""
+    if isinstance(error, EngineMetadataTimeout):
+        return "engine_metadata_timeout"
+    if isinstance(error, EngineIntegrityError):
+        return "engine_integrity_error"
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "command_timeout"
+    if isinstance(error, subprocess.CalledProcessError):
+        return "command_failed"
+    if isinstance(error, OSError):
+        return "os_error"
+    if isinstance(error, ValueError):
+        return "invalid_lifecycle_metadata"
+    return "subprocess_error"
+
+
 def containers(run=subprocess.run, include_running=False, allow_duplicates=False, timeout=0.4,
                isolate_secondaries=False):
     """Read only bounded process identities; never inspect Env, logs or HTTP health."""
@@ -167,7 +188,11 @@ class Supervisor:
         print("Verified engine process started; owner Resume remains required.", flush=True)
 
     def step(self):
-        engine_flags = running({"engine": self.engine_id}, self.run)
+        try:
+            engine_flags = running({"engine": self.engine_id}, self.run)
+        except subprocess.TimeoutExpired:
+            # Keep the same fail-closed behavior/deadline; distinguish it from a helper timeout.
+            raise EngineMetadataTimeout() from None
         if not engine_flags["engine"]:
             # No in-process engine restart: systemd cleanup and a new full preflight own recovery.
             raise ValueError("engine exited or changed identity")
@@ -310,8 +335,9 @@ def main(argv=None):
                 signal.signal(signum, lambda *_: stop.set())
             Supervisor(args.release).serve(stop)
         return 0
-    except (OSError, ValueError, subprocess.SubprocessError):
-        print("Production lifecycle failed; systemd must stop the stack and repeat full preflight before recovery.", file=sys.stderr)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print("Production lifecycle failed (" + failure_class(error)
+              + "); systemd must stop the stack and repeat full preflight before recovery.", file=sys.stderr)
         return 1
 
 

@@ -1,5 +1,5 @@
 """Release and host boundaries: no dirty/secret bundle, wrong platform or implicit live activation."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import base64
 import json
@@ -407,6 +407,46 @@ class SupervisorTests(unittest.TestCase):
         self.supervisor().start()
         self.assertEqual(len(self.gates), 2)
         self.assertEqual(self.starts, ["engine", "engine"])
+
+    def test_engine_metadata_timeout_still_fails_closed_without_retry_or_recovery(self):
+        supervisor = self.supervisor()
+        supervisor.start()
+        calls = []
+        def timeout(command, **arguments):
+            calls.append((command, arguments))
+            raise subprocess.TimeoutExpired(command, arguments["timeout"], output=b"private-output", stderr=b"private-error")
+        supervisor.run = timeout
+        with self.assertRaises(deploy_supervisor.EngineMetadataTimeout):
+            supervisor.step()
+        self.assertEqual(len(calls), 1)
+        command, arguments = calls[0]
+        self.assertEqual(command[1], "inspect")
+        self.assertEqual(arguments["timeout"], 0.4)
+        self.assertEqual(command[4:], [self.ids["engine"]])
+        self.assertEqual(self.starts, ["engine"])
+        self.assertEqual(self.helpers, [])
+        self.assertNotIn("inventory", supervisor.degraded)
+
+    def test_lifecycle_failure_categories_mask_exception_command_and_output(self):
+        private = "private-fixture-command-output-never-log"
+        cases = (
+            (deploy_supervisor.EngineMetadataTimeout(private), "engine_metadata_timeout"),
+            (deploy_supervisor.EngineIntegrityError(private), "engine_integrity_error"),
+            (subprocess.TimeoutExpired([private], 0.4, output=private, stderr=private), "command_timeout"),
+            (subprocess.CalledProcessError(1, [private], output=private, stderr=private), "command_failed"),
+            (OSError(private), "os_error"), (ValueError(private), "invalid_lifecycle_metadata"),
+            (subprocess.SubprocessError(private), "subprocess_error"),
+        )
+        for error, category in cases:
+            output, errors = StringIO(), StringIO()
+            with self.subTest(category=category), patch.object(deploy_supervisor.os, "geteuid", return_value=0, create=True), \
+                    patch.object(deploy_supervisor.Supervisor, "serve", side_effect=error), \
+                    patch.object(deploy_supervisor.signal, "signal"), redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(deploy_supervisor.main(["run", "--release", "/reviewed-release"]), 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("Production lifecycle failed (" + category + ")", errors.getvalue())
+            self.assertNotIn(private, errors.getvalue())
+            self.assertIn("systemd must stop the stack", errors.getvalue())
 
     def test_secondary_failure_launches_only_secondary_helpers_without_engine_restart(self):
         supervisor = self.supervisor()
