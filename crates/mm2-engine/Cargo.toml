@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 publish = false
+default-run = "mm2-engine"
 
 [dependencies]
 mm2-core = { path = "../mm2-core" }

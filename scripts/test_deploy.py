@@ -1,6 +1,7 @@
 """Release and host boundaries: no dirty/secret bundle, wrong platform or implicit live activation."""
 from contextlib import redirect_stdout
 from io import StringIO
+import base64
 import json
 import os
 from pathlib import Path
@@ -156,6 +157,28 @@ class DeployTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     deploy_host.private_environment(path)
 
+    def test_private_builder_triplet_is_complete_validated_and_exclusive(self):
+        path = self.root / "runtime.env"
+        base = "MM2_ENGINE_API_TOKEN=" + "a" * 64 + "\nMM2_CONSOLE_TOKEN=" + "b" * 64 + "\nMM2_DOMAIN=owner.example.com\n"
+        builder = dict(zip(deploy_host.BUILDER_KEYS, (
+            "7b1e2d60-6f9a-4dd7-8f3e-21b8f94c77a2", base64.urlsafe_b64encode(b"offline-hmac-fixture-only-32byte").decode(), "offline-passphrase")))
+        metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_size=1024)
+        with patch.object(Path, "lstat", return_value=metadata):
+            path.write_text(base + "".join(key + "=" + value + "\n" for key, value in builder.items()))
+            self.assertEqual(deploy_host.private_environment(path)[deploy_host.BUILDER_KEYS[0]], builder[deploy_host.BUILDER_KEYS[0]])
+            malformed = [{key: value for key, value in builder.items() if key != missing} for missing in builder]
+            malformed += [{**builder, deploy_host.BUILDER_KEYS[0]: "00000000-0000-0000-0000-000000000000"},
+                          {**builder, deploy_host.BUILDER_KEYS[1]: "A" * 17},
+                          {**builder, deploy_host.BUILDER_KEYS[1]: base64.urlsafe_b64encode(b"x" * 32).decode() + "="},
+                          {**builder, deploy_host.BUILDER_KEYS[1]: base64.urlsafe_b64encode(b"x" * 31).decode()[:-1]},
+                          {**builder, deploy_host.BUILDER_KEYS[2]: "x" * 257},
+                          {**builder, "MM2_POLY_RELAYER_API_KEY": "offline-owner-key", "MM2_POLY_RELAYER_API_KEY_ADDRESS": "0x" + "b" * 40}]
+            for values in malformed:
+                path.write_text(base + "".join(key + "=" + value + "\n" for key, value in values.items()))
+                with self.assertRaises(ValueError) as caught:
+                    deploy_host.private_environment(path)
+                self.assertNotIn(builder[deploy_host.BUILDER_KEYS[1]], str(caught.exception))
+
     def test_deposit_host_preflight_requires_relayer_key_bound_to_controller_before_docker(self):
         config = self.root / "private"
         config.mkdir()
@@ -189,12 +212,26 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(deploy_host.preflight(self.release, config=config, run=runner), self.manifest)
         self.assertTrue(calls)
         self.assertNotIn("private-fixture-never-display", json.dumps(calls))
+        builder = {key: value for key, value in credentials.items() if key not in deploy_host.RELAYER_KEYS}
+        builder.update(dict(zip(deploy_host.BUILDER_KEYS, (
+            "7b1e2d60-6f9a-4dd7-8f3e-21b8f94c77a2", base64.urlsafe_b64encode(b"offline-hmac-fixture-only-32byte").decode(), "offline-passphrase"))))
+        with patch.object(deploy_host, "check_state_mount"), patch.object(deploy_host, "private_environment", return_value=builder):
+            self.assertEqual(deploy_host.preflight(self.release, config=config, run=runner), self.manifest)
+        invalid_sets = [{**credentials, **builder},
+                        {key: value for key, value in builder.items() if key != deploy_host.BUILDER_KEYS[1]},
+                        {key: value for key, value in builder.items() if key not in deploy_host.BUILDER_KEYS}]
+        for invalid in invalid_sets:
+            with patch.object(deploy_host, "check_state_mount"), patch.object(deploy_host, "private_environment", return_value=invalid):
+                runner = unittest.mock.Mock()
+                with self.assertRaises(ValueError):
+                    deploy_host.preflight(self.release, config=config, run=runner)
+                runner.assert_not_called()
 
     def test_compose_exposes_relayer_credentials_only_to_execution_container(self):
         for name in ("compose.yaml", "infra/aws/compose.yaml"):
             compose = (deploy_package.ROOT / name).read_text()
             engine, secondary = compose.split("  console:", 1)
-            for key in ("MM2_POLY_RELAYER_API_KEY", "MM2_POLY_RELAYER_API_KEY_ADDRESS"):
+            for key in (*deploy_host.RELAYER_KEYS, *deploy_host.BUILDER_KEYS):
                 self.assertIn(key + ": ${" + key + ":-}", engine)
                 self.assertNotIn(key, secondary)
 

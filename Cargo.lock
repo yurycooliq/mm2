@@ -2818,10 +2818,12 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "fs2",
  "futures-util",
  "hex",
+ "hmac",
  "mm2-core",
  "polymarket_client_sdk_v2",
  "reqwest 0.13.5",

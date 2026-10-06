@@ -5,6 +5,43 @@ use tokio::{
     net::TcpListener,
 };
 
+const BUILDER_KEY: &str = "11111111-2222-4333-8444-555555555555";
+const BUILDER_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+const BUILDER_PASSPHRASE: &str = "offline-builder-passphrase";
+
+fn builder_auth() -> RelayAuth {
+    RelayAuth::builder(BUILDER_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE).unwrap()
+}
+
+fn assert_builder_wire(head: &str, method: &str, path: &str, body: &str) {
+    let header = |name: &str| {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then_some(value.trim())
+        })
+    };
+    assert_eq!(header("poly_builder_api_key"), Some(BUILDER_KEY));
+    assert_eq!(header("poly_builder_passphrase"), Some(BUILDER_PASSPHRASE));
+    assert!(header("relayer_api_key").is_none());
+    assert!(header("relayer_api_key_address").is_none());
+    let timestamp = header("poly_builder_timestamp").unwrap();
+    let seconds = timestamp.parse::<u64>().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(seconds.abs_diff(now) < 10);
+    // Independent wire check: concatenate the received method, pathname, and raw
+    // body. The published SDK vector below anchors the HMAC/base64 algorithm.
+    let pathname = path.split('?').next().unwrap();
+    let message = format!("{timestamp}{method}{pathname}{body}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(&[0; 32]).unwrap();
+    mac.update(message.as_bytes());
+    let expected = URL_SAFE.encode(mac.finalize().into_bytes());
+    assert_eq!(header("poly_builder_signature"), Some(expected.as_str()));
+    assert!(!head.contains(BUILDER_SECRET));
+}
+
 fn hash(n: u64) -> String {
     format!("0x{n:064x}")
 }
@@ -78,6 +115,8 @@ struct State {
     lose_ack: bool,
     reject_submit: bool,
     malformed_ack: bool,
+    redirect_submit: bool,
+    builder_requests: usize,
     hint: Option<String>,
     transaction: Option<Value>,
     receipt: Option<Value>,
@@ -113,6 +152,8 @@ impl Default for State {
             lose_ack: false,
             reject_submit: false,
             malformed_ack: false,
+            redirect_submit: false,
+            builder_requests: 0,
             hint: None,
             transaction: None,
             receipt: None,
@@ -182,11 +223,18 @@ impl Mock {
                     let answer = {
                         let mut s = shared.lock().unwrap();
                         s.paths.push(path.into());
+                        if path.starts_with("/v1/account/transactions/") || path == "/submit" {
+                            if head.to_ascii_lowercase().contains("poly_builder_api_key:") {
+                                assert_builder_wire(&head, method, path, &body);
+                                s.builder_requests += 1;
+                            } else {
+                                assert!(
+                                    head.to_ascii_lowercase()
+                                        .contains("relayer_api_key: offline-fixture-key")
+                                );
+                            }
+                        }
                         if path.starts_with("/v1/account/transactions/params") {
-                            assert!(
-                                head.to_ascii_lowercase()
-                                    .contains("relayer_api_key: offline-fixture-key")
-                            );
                             Some((
                                 200,
                                 json!({"address":live.signer_address,"nonce":s.api_nonce.to_string()}),
@@ -201,10 +249,12 @@ impl Mock {
                             s.post_bodies.push(body);
                             if s.lose_ack {
                                 None
+                            } else if s.redirect_submit {
+                                Some((307, json!({"error":"redirect refused"})))
                             } else if s.reject_submit {
                                 Some((
                                     429,
-                                    json!({"error":"offline-fixture-key MUST NOT APPEAR IN ERROR"}),
+                                    json!({"error":"offline-fixture-key offline-builder-passphrase MUST NOT APPEAR IN ERROR"}),
                                 ))
                             } else if s.malformed_ack {
                                 Some((200, json!({"state":"STATE_NEW"})))
@@ -226,9 +276,14 @@ impl Mock {
                     if let Some((status, data)) = answer {
                         let body = serde_json::to_vec(&data).unwrap();
                         let header = format!(
-                            "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
                             if status == 200 { "OK" } else { "Rejected" },
-                            body.len()
+                            body.len(),
+                            if status == 307 {
+                                "Location: /submit\r\n"
+                            } else {
+                                ""
+                            },
                         );
                         stream.write_all(header.as_bytes()).await.unwrap();
                         stream.write_all(&body).await.unwrap();
@@ -245,6 +300,19 @@ impl Mock {
                 ..Default::default()
             },
             owner,
+        )
+        .unwrap()
+    }
+    fn builder_transport(&self, owner: Address) -> RelayTransport {
+        RelayTransport::with_auth(
+            RelaySettings {
+                url: self.url.clone(),
+                ..Default::default()
+            },
+            owner,
+            builder_auth(),
+            1000,
+            true,
         )
         .unwrap()
     }
@@ -501,6 +569,238 @@ fn production_relayer_url_and_bounds_are_pinned() {
         .is_err()
     );
     assert!(serde_json::from_value::<RelaySettings>(json!({"unknown":true})).is_err());
+    assert!(
+        RelaySettings {
+            builder_key_env: "MM2_POLY_RELAYER_API_KEY".into(),
+            ..Default::default()
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn builder_hmac_matches_published_official_signing_sdk_vector() {
+    // https://github.com/Polymarket/builder-signing-sdk/blob/main/tests/hmac.test.ts
+    let secret = URL_SAFE.decode(BUILDER_SECRET).unwrap();
+    assert_eq!(
+        builder_signature(
+            &secret,
+            1_000_000,
+            "test-sign",
+            "/orders",
+            Some(r#"{"hash": "0x123"}"#)
+        )
+        .unwrap(),
+        "ZwAdJKvoYRlEKDkNMwd5BuwNNtg93kNaR_oU2HrfVvc="
+    );
+    let expected =
+        builder_signature(&secret, 1_000_000, "POST", "/submit", Some(r#"{"a":1}"#)).unwrap();
+    for (time, method, path, body) in [
+        (1_000_001, "POST", "/submit", Some(r#"{"a":1}"#)),
+        (1_000_000, "GET", "/submit", Some(r#"{"a":1}"#)),
+        (1_000_000, "POST", "/submit?extra=true", Some(r#"{"a":1}"#)),
+        (1_000_000, "POST", "/submit", Some(r#"{"a": 1}"#)),
+        (1_000_000, "POST", "/submit", None),
+    ] {
+        assert_ne!(
+            builder_signature(&secret, time, method, path, body).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn relayer_auth_requires_exactly_one_complete_scheme_and_matching_owner() {
+    let owner = Address::repeat_byte(0x11);
+    let values = [
+        "offline-fixture-key".to_string(),
+        format!("{owner:#x}"),
+        BUILDER_KEY.into(),
+        BUILDER_SECRET.into(),
+        BUILDER_PASSPHRASE.into(),
+    ];
+    for mask in 0u8..32 {
+        let selected = std::array::from_fn(|i| ((mask & (1 << i)) != 0).then(|| values[i].clone()));
+        let auth = RelayAuth::select(owner, selected);
+        assert_eq!(
+            auth.is_ok(),
+            mask == 0b00011 || mask == 0b11100,
+            "credential selection mask {mask}"
+        );
+        if let Err(error) = auth {
+            assert!(!error.contains(BUILDER_KEY));
+            assert!(!error.contains(BUILDER_SECRET));
+            assert!(!error.contains(BUILDER_PASSPHRASE));
+            assert!(!error.contains("offline-fixture-key"));
+        }
+    }
+    assert!(
+        RelayAuth::select(
+            Address::repeat_byte(0x22),
+            [
+                Some(values[0].clone()),
+                Some(values[1].clone()),
+                None,
+                None,
+                None
+            ]
+        )
+        .is_err()
+    );
+    assert!(
+        RelayAuth::select(
+            Address::repeat_byte(0x22),
+            [
+                None,
+                None,
+                Some(values[2].clone()),
+                Some(values[3].clone()),
+                Some(values[4].clone())
+            ]
+        )
+        .is_ok()
+    );
+    let owner_auth = RelayAuth::owner(&values[0], owner).unwrap();
+    assert!(
+        owner_auth.headers(1, "GET", "/params", None).unwrap()["relayer_api_key"].is_sensitive()
+    );
+    let headers = builder_auth()
+        .headers(1, "POST", "/submit", Some("{}"))
+        .unwrap();
+    for name in [
+        "poly_builder_api_key",
+        "poly_builder_passphrase",
+        "poly_builder_signature",
+    ] {
+        assert!(headers[name].is_sensitive());
+    }
+    let debug = format!("{headers:?}");
+    assert!(!debug.contains(BUILDER_KEY));
+    assert!(!debug.contains(BUILDER_PASSPHRASE));
+    assert!(!debug.contains(headers["poly_builder_signature"].to_str().unwrap()));
+}
+
+#[test]
+fn builder_credentials_reject_invalid_values_and_noncanonical_secret_padding() {
+    for key in [
+        "",
+        "not-a-uuid",
+        "00000000-0000-0000-0000-000000000000",
+        "11111111-2222-4333-8444-555555555555\n",
+    ] {
+        assert!(RelayAuth::builder(key, BUILDER_SECRET, BUILDER_PASSPHRASE).is_err());
+    }
+    for secret in [
+        "",
+        "AAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB=",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+    ] {
+        assert!(RelayAuth::builder(BUILDER_KEY, secret, BUILDER_PASSPHRASE).is_err());
+    }
+    for passphrase in [
+        "",
+        "white space",
+        "line\nfeed",
+        "$expansion",
+        "quote\"",
+        "back`tick",
+        "slash\\",
+        "é",
+    ] {
+        assert!(RelayAuth::builder(BUILDER_KEY, BUILDER_SECRET, passphrase).is_err());
+    }
+    assert!(
+        RelayAuth::builder(
+            BUILDER_KEY,
+            BUILDER_SECRET.trim_end_matches('='),
+            BUILDER_PASSPHRASE
+        )
+        .is_ok()
+    );
+    assert!(
+        RelayAuth::builder(BUILDER_KEY, &URL_SAFE.encode([0; 257]), BUILDER_PASSPHRASE).is_err()
+    );
+    assert!(RelayAuth::builder(BUILDER_KEY, BUILDER_SECRET, &"a".repeat(257)).is_err());
+}
+
+#[tokio::test]
+async fn builder_auth_signs_nonce_query_status_and_exact_durable_submit_body() {
+    let (live, mut p, signer) = fixture().await;
+    let mock = Mock::start(live.clone()).await;
+    let (_, _, mut prepared) = prepared(&mock, &live, &mut p, signer.clone()).await;
+    let transport = mock.builder_transport(signer.address());
+    assert!(
+        transport
+            .authenticated_nonce(Address::repeat_byte(0x66))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        transport
+            .authenticated_nonce(signer.address())
+            .await
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        transport.transaction_hint("fixture-id").await.unwrap(),
+        None
+    );
+    assert!(transport.submit_relay(&prepared).await.is_err());
+    assert!(mock.state.lock().unwrap().post_bodies.is_empty());
+    prepared.dispatched = true;
+    assert_eq!(
+        transport.submit_relay(&prepared).await.unwrap(),
+        "fixture-id"
+    );
+    let state = mock.state.lock().unwrap();
+    assert_eq!(state.builder_requests, 3);
+    assert!(state.paths.iter().any(|path| path
+        == &format!(
+            "/v1/account/transactions/params?address={:#x}&type=WALLET",
+            signer.address()
+        )));
+    assert_eq!(state.post_bodies, vec![prepared.body.clone()]);
+    assert!(!prepared.body.contains(BUILDER_KEY));
+    assert!(!prepared.body.contains(BUILDER_SECRET));
+    assert!(!prepared.body.contains(BUILDER_PASSPHRASE));
+}
+
+#[tokio::test]
+async fn builder_dropped_rejected_malformed_and_redirected_ack_never_retry_or_expose_credentials() {
+    for flag in 0..4 {
+        let (live, mut p, signer) = fixture().await;
+        let mock = Mock::start(live.clone()).await;
+        let (_, _, mut prepared) = prepared(&mock, &live, &mut p, signer.clone()).await;
+        let transport = mock.builder_transport(signer.address());
+        prepared.dispatched = true;
+        {
+            let mut state = mock.state.lock().unwrap();
+            match flag {
+                0 => state.lose_ack = true,
+                1 => state.reject_submit = true,
+                2 => state.malformed_ack = true,
+                _ => state.redirect_submit = true,
+            }
+        }
+        let error = transport.submit_relay(&prepared).await.unwrap_err();
+        for private in [
+            BUILDER_KEY,
+            BUILDER_SECRET,
+            BUILDER_PASSPHRASE,
+            "offline-fixture-key",
+        ] {
+            assert!(!error.contains(private));
+        }
+        let state = mock.state.lock().unwrap();
+        assert_eq!(state.post_bodies, vec![prepared.body]);
+        assert_eq!(state.builder_requests, 1);
+    }
 }
 #[test]
 fn factory_abi_matches_observed_public_transaction_selector() {

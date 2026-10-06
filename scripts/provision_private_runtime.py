@@ -30,8 +30,14 @@ TOKEN = re.compile(r"([1-9][0-9]{4,19}):[A-Za-z0-9_-]{30,128}")
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 FIELDS = {"telegram": {"token", "owner_id"}, "wallet": {"private_key"},
           "clob": {"api_key", "api_secret", "api_passphrase"},
+          "builder": {"api_key", "api_secret", "api_passphrase"},
           "relayer": {"api_key", "key_address"}, "rpc": {"url"}}
 INACTIVE = "none; funded configuration remains a separate gate"
+BUILDER_SOURCE_FIELDS = {"POLY_BUILDER_API_KEY": "api_key", "POLY_BUILDER_SECRET": "api_secret",
+                         "POLY_BUILDER_PASSPHRASE": "api_passphrase"}
+BUILDER_RUNTIME_FIELDS = ("MM2_POLY_BUILDER_API_KEY", "MM2_POLY_BUILDER_API_SECRET", "MM2_POLY_BUILDER_API_PASSPHRASE")
+RELAYER_RUNTIME_FIELDS = ("MM2_POLY_RELAYER_API_KEY", "MM2_POLY_RELAYER_API_KEY_ADDRESS")
+MAX_ENV_SOURCE = 1_048_576
 
 
 class ProvisionError(Exception):
@@ -42,7 +48,7 @@ class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         # A mistakenly pasted credential in argv must not be echoed by argparse.
         self.print_usage(sys.stderr)
-        self.exit(2, "Invalid arguments. Choose telegram, wallet, clob, relayer or rpc; credentials belong only in the hidden prompt.\n")
+        self.exit(2, "Invalid arguments. Choose telegram, wallet, clob, builder, relayer or rpc; credentials belong only in the hidden prompt.\n")
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -82,7 +88,7 @@ def canonical_clob_secret(secret):
         raise ValueError("invalid base64")
     decoded = base64.b64decode(secret + "=" * (-len(secret) % 4), altchars=b"-_", validate=True)
     canonical = base64.urlsafe_b64encode(decoded).decode("ascii")
-    if not 16 <= len(decoded) <= 256 or canonical.rstrip("=") != secret.rstrip("="):
+    if not 16 <= len(decoded) <= 256 or secret not in (canonical, canonical.rstrip("=")):
         raise ValueError("invalid base64 size or encoding")
     return canonical
 
@@ -106,7 +112,7 @@ def validate_payload(payload):
         scalar = int(key.removeprefix("0x"), 16)
         if not 0 < scalar < CURVE_ORDER:
             raise ProvisionError("Signing key is outside the secp256k1 range.")
-    elif kind == "clob":
+    elif kind in {"clob", "builder"}:
         key, secret, passphrase = payload["api_key"], payload["api_secret"], payload["api_passphrase"]
         try:
             if not isinstance(key, str) or len(key) != 36 or str(uuid.UUID(key)) != key.lower() or uuid.UUID(key).int == 0:
@@ -115,7 +121,7 @@ def validate_payload(payload):
             if not literal_credential(passphrase, 256):
                 raise ValueError("invalid passphrase")
         except (ValueError, TypeError):
-            raise ProvisionError("Enter an existing CLOB UUID API key, URL-safe base64 secret and bounded literal passphrase.") from None
+            raise ProvisionError("Enter an existing UUID API key, URL-safe base64 secret and bounded literal passphrase.") from None
     elif kind == "relayer":
         if not literal_credential(payload["api_key"], 1024):
             raise ProvisionError("Relayer API key must be a bounded literal header value.")
@@ -147,6 +153,72 @@ def decode_payload(raw):
         raise
     except Exception:
         raise ProvisionError("Malformed credential request.") from None
+
+
+def builder_env_payload(raw):
+    """Parse only the authorized Olympus triplet as data; never source/expand the file."""
+    if not isinstance(raw, bytes) or len(raw) > MAX_ENV_SOURCE:
+        raise ProvisionError("Builder source file exceeds the supported bound.")
+    try:
+        lines = raw.decode("utf-8-sig").splitlines()
+        payload = {"schema": 1, "kind": "builder"}
+        names = "|".join(BUILDER_SOURCE_FIELDS)
+        selected = re.compile(r"^[ \t]*(?:export[ \t]+)?(" + names + r")[ \t]*=[ \t]*(.*)$")
+        selected_name = re.compile(r"^[ \t]*(?:export[ \t]+)?(?:" + names + r")(?=[^A-Za-z0-9_]|$)")
+        for line in lines:
+            match = selected.fullmatch(line)
+            if match is None:
+                if selected_name.match(line):
+                    raise ValueError("malformed selected field")
+                continue
+            field = BUILDER_SOURCE_FIELDS[match[1]]
+            if field in payload:
+                raise ValueError("duplicate Builder field")
+            value = match[2].strip()
+            if value.startswith(("'", '"')):
+                quoted = re.fullmatch(r"(['\"])(.*?)\1[ \t]*(?:#.*)?", value)
+                if quoted is None:
+                    raise ValueError("incomplete or multiline quoted value")
+                value = quoted[2]
+            else:
+                value = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+                if "#" in value:
+                    raise ValueError("unquoted hash is ambiguous")
+            if (not literal_credential(value, 1024) or re.fullmatch(
+                    r"(?i)(?:<.*>|(?:your|replace|insert|paste)[_-].*|todo|tbd|changeme|change_me|placeholder|undefined|null|none)", value)):
+                raise ValueError("nonliteral or placeholder value")
+            payload[field] = value
+        return validate_payload(payload)
+    except Exception:
+        raise ProvisionError("Builder source requires one complete literal triplet without duplicates, placeholders or multiline values.") from None
+
+
+def builder_from_env(path):
+    """Read only inside this process, with a regular-file/size/race boundary and redacted errors."""
+    descriptor = None
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or path.is_symlink() or before.st_size > MAX_ENV_SOURCE:
+            raise ValueError("unsafe source file")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                             | getattr(os, "O_NONBLOCK", 0))
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino, opened.st_size) != (before.st_dev, before.st_ino, before.st_size)):
+            raise ValueError("source changed before read")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            raw = stream.read(MAX_ENV_SOURCE + 1)
+            after = os.fstat(stream.fileno())
+        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+                before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+            raise ValueError("source changed during read")
+        return builder_env_payload(raw)
+    except Exception:
+        raise ProvisionError("Builder source import was refused; no source path or credential value was printed.") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def telegram_identity(token, opener=None):
@@ -251,7 +323,7 @@ def expected_signer(path):
 
 
 def apply_update(payload, config=Path("/etc/mm2"), profile=Path("/opt/mm2/current/config/trading.toml"),
-                 get_identity=telegram_identity, derive_address=signer_address):
+                 get_identity=telegram_identity, derive_address=signer_address, expected_environment=None):
     """Linux root helper: locked, fsynced atomic replacement; no automatic activation."""
     import fcntl
     from deploy_host import private_environment
@@ -269,6 +341,8 @@ def apply_update(payload, config=Path("/etc/mm2"), profile=Path("/opt/mm2/curren
         if original.st_nlink != 1:
             raise ProvisionError("Runtime environment must have exactly one filesystem link.")
         values = private_environment(target)
+        if expected_environment is not None and values != expected_environment:
+            raise ProvisionError("Runtime environment changed before the update lock; nothing was replaced.")
         if payload["kind"] == "telegram":
             existing_owner = values.get("MM2_TELEGRAM_OWNER_ID", "")
             if existing_owner and existing_owner != str(payload["owner_id"]):
@@ -290,7 +364,16 @@ def apply_update(payload, config=Path("/etc/mm2"), profile=Path("/opt/mm2/curren
             values["MM2_POLY_API_SECRET"] = canonical_clob_secret(payload["api_secret"])
             values["MM2_POLY_API_PASSPHRASE"] = payload["api_passphrase"]
             result = {"kind": "clob", "activation": "unchanged", "restart_required": INACTIVE}
+        elif payload["kind"] == "builder":
+            if any(values.get(field) for field in RELAYER_RUNTIME_FIELDS):
+                raise ProvisionError("Builder and owner Relayer credentials cannot be combined; review an explicit credential switch.")
+            values["MM2_POLY_BUILDER_API_KEY"] = payload["api_key"]
+            values["MM2_POLY_BUILDER_API_SECRET"] = canonical_clob_secret(payload["api_secret"])
+            values["MM2_POLY_BUILDER_API_PASSPHRASE"] = payload["api_passphrase"]
+            result = {"kind": "builder", "activation": "unchanged", "restart_required": INACTIVE}
         elif payload["kind"] == "relayer":
+            if any(values.get(field) for field in BUILDER_RUNTIME_FIELDS):
+                raise ProvisionError("Owner Relayer and Builder credentials cannot be combined; review an explicit credential switch.")
             owner = payload["key_address"].lower()
             if owner != expected_signer(profile):
                 raise ProvisionError("Relayer key owner does not match the reviewed controlling EOA; nothing was changed.")
@@ -380,7 +463,12 @@ def local_main(args, run=subprocess.run):
     config = args.ssh_config.resolve(strict=True)
     if not config.is_file() or config.is_symlink() or config.stat().st_size > 16384:
         raise ProvisionError("Use the dedicated reviewed SSH config with its pinned known_hosts file.")
-    if args.kind == "telegram":
+    from_env = getattr(args, "from_env", None)
+    if from_env is not None:
+        if args.kind != "builder":
+            raise ProvisionError("Source-file import is supported only for existing Builder credentials.")
+        payload = builder_from_env(from_env)
+    elif args.kind == "telegram":
         raw_owner = input("Complete Telegram owner user ID (no ellipsis): ").strip()
         if not re.fullmatch(r"[1-9][0-9]{0,15}", raw_owner):
             raise ProvisionError("Enter the complete numeric Telegram user ID.")
@@ -388,10 +476,11 @@ def local_main(args, run=subprocess.run):
                    "token": hidden_input("@mm2b_bot token (hidden): ")}
     elif args.kind == "wallet":
         payload = {"schema": 1, "kind": "wallet", "private_key": hidden_input("Controlling EOA signing key, hex (hidden): ")}
-    elif args.kind == "clob":
-        payload = {"schema": 1, "kind": "clob", "api_key": hidden_input("Existing CLOB API key, UUID (hidden): "),
-                   "api_secret": hidden_input("Existing CLOB API secret, URL-safe base64 (hidden): "),
-                   "api_passphrase": hidden_input("Existing CLOB API passphrase (hidden): ")}
+    elif args.kind in {"clob", "builder"}:
+        title = "CLOB" if args.kind == "clob" else "Builder"
+        payload = {"schema": 1, "kind": args.kind, "api_key": hidden_input("Existing " + title + " API key, UUID (hidden): "),
+                   "api_secret": hidden_input("Existing " + title + " API secret, URL-safe base64 (hidden): "),
+                   "api_passphrase": hidden_input("Existing " + title + " API passphrase (hidden): ")}
     elif args.kind == "relayer":
         payload = {"schema": 1, "kind": "relayer", "api_key": hidden_input("Owner Relayer API key (hidden): "),
                    "key_address": hidden_input("Relayer key Signer Address (hidden): ")}
@@ -401,7 +490,7 @@ def local_main(args, run=subprocess.run):
         raise ProvisionError("Unsupported credential operation.")
     validate_payload(payload)
     # Unrelated mm2 credentials from an operator's shell never become child env.
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("MM2_")}
+    environment = {key: value for key, value in os.environ.items() if not key.startswith(("MM2_", "POLY_", "POLYMARKET_"))}
     if sys.platform == "win32":
         cli = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Amazon/AWSCLIV2"
         plugin = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Amazon/SessionManagerPlugin/bin"
@@ -447,11 +536,12 @@ def main(argv=None):
     parser.add_argument("--ssh-config", type=Path, default=ROOT / "output/deployment-access/ssh-config")
     parser.add_argument("--host", default="mm2-aws")
     parser.add_argument("--ssh-executable", default="ssh")
+    parser.add_argument("--from-env", type=Path, help="Import only an existing Olympus Builder triplet as literal data")
     parser.add_argument("--remote", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         if args.remote:
-            if args.kind:
+            if args.kind or args.from_env is not None:
                 raise ProvisionError("Remote operation is specified only through stdin.")
             remote_main()
         else:

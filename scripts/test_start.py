@@ -130,7 +130,8 @@ class StartProfileTests(unittest.TestCase):
             path = self.configured_deposit_profile(mode)
             start.preflight_trading(path, mode)
             valid = path.read_text()
-            for fault in ("missing", "same", "url", "key", "key_owner", "deadline", "scan", "owner", "type"):
+            for fault in ("missing", "same", "url", "key", "key_owner", "builder_key", "builder_secret", "builder_passphrase",
+                          "deadline", "scan", "owner", "type"):
                 content = valid
                 if fault == "missing":
                     content = content.split("[live.chain.relayer]")[0]
@@ -142,6 +143,8 @@ class StartProfileTests(unittest.TestCase):
                     content = content.replace('key_env = "MM2_POLY_RELAYER_API_KEY"', 'key_env = "OTHER_KEY"')
                 elif fault == "key_owner":
                     content = content.replace('key_address_env = "MM2_POLY_RELAYER_API_KEY_ADDRESS"', 'key_address_env = "OTHER_ADDRESS"')
+                elif fault.startswith("builder_"):
+                    content += fault + '_env = "OTHER_BUILDER_FIELD"\n'
                 elif fault == "deadline":
                     content = content.replace("deadline_seconds = 600", "deadline_seconds = 0")
                 elif fault == "scan":

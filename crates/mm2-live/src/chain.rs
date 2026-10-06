@@ -258,6 +258,7 @@ impl DirectChain {
                     .relayer
                     .as_ref()
                     .ok_or("DepositWallet relayer configuration missing")?,
+                client.signer.address(),
                 settings.request_timeout_ms,
             )?);
         }

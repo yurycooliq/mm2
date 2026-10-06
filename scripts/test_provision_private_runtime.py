@@ -32,6 +32,8 @@ EXTRA_PAYLOADS = (
     {"schema": 1, "kind": "relayer", "api_key": RELAYER_KEY, "key_address": ADDRESS_ONE},
     {"schema": 1, "kind": "rpc", "url": RPC_URL},
 )
+BUILDER_PAYLOAD = {"schema": 1, "kind": "builder", "api_key": CLOB_KEY, "api_secret": CLOB_SECRET,
+                   "api_passphrase": CLOB_PASSPHRASE}
 
 
 class CredentialHandoffTests(unittest.TestCase):
@@ -77,6 +79,91 @@ class CredentialHandoffTests(unittest.TestCase):
             with self.subTest(field=field, bad=bad), self.assertRaises(provision.ProvisionError):
                 provision.validate_payload({**valid, field: bad})
 
+    def test_builder_payload_shares_strict_hmac_bounds_without_owner_identity(self):
+        self.assertEqual(provision.validate_payload(BUILDER_PAYLOAD), BUILDER_PAYLOAD)
+        for field, value in (("api_key", "00000000-0000-0000-0000-000000000000"),
+                             ("api_secret", "A" * 17), ("api_passphrase", "$ENV")):
+            with self.subTest(field=field), self.assertRaises(provision.ProvisionError):
+                provision.validate_payload({**BUILDER_PAYLOAD, field: value})
+        with self.assertRaises(provision.ProvisionError):
+            provision.validate_payload({**BUILDER_PAYLOAD, "key_address": ADDRESS_ONE})
+
+    def builder_source(self):
+        return ("UNRELATED_SECRET=$(must-never-run)\n"
+                "export POLY_BUILDER_API_KEY='" + CLOB_KEY + "' # literal\n"
+                "POLY_BUILDER_SECRET=\"" + CLOB_SECRET + "\"\n"
+                "POLY_BUILDER_PASSPHRASE=" + CLOB_PASSPHRASE + "\n").encode()
+
+    def test_builder_source_extracts_only_triplet_and_preserves_quoted_hash(self):
+        self.assertEqual(provision.builder_env_payload(self.builder_source()), BUILDER_PAYLOAD)
+        quoted = self.builder_source().replace(CLOB_PASSPHRASE.encode(), b"'offline#literal'")
+        self.assertEqual(provision.builder_env_payload(quoted)["api_passphrase"], "offline#literal")
+        with patch.object(provision.subprocess, "run") as execute:
+            source = self.root / "source.env"
+            source.write_bytes(self.builder_source())
+            self.assertEqual(provision.builder_from_env(source), BUILDER_PAYLOAD)
+        execute.assert_not_called()
+
+    def test_builder_source_rejects_duplicate_missing_multiline_expansion_and_placeholders(self):
+        valid = self.builder_source()
+        invalid = (
+            valid + b"POLY_BUILDER_API_KEY=" + CLOB_KEY.encode() + b"\n",
+            valid.replace(b"POLY_BUILDER_SECRET=", b"UNRELATED_NAME="),
+            valid.replace(CLOB_PASSPHRASE.encode(), b"'first\nsecond'"),
+            valid.replace(CLOB_PASSPHRASE.encode(), b"trailing\\"),
+            valid.replace(CLOB_PASSPHRASE.encode(), b"${OTHER}"),
+            valid.replace(CLOB_PASSPHRASE.encode(), b"$(execute)"),
+            valid.replace(CLOB_PASSPHRASE.encode(), b"your_passphrase"),
+            valid.replace(CLOB_PASSPHRASE.encode(), b"changeme"),
+            valid.replace(CLOB_PASSPHRASE.encode(), b"literal#ambiguous"),
+            valid + b"POLY_BUILDER_SECRET : malformed\n",
+            valid + b"POLY_BUILDER_SECRET+=unsupported\n",
+            b"x" * (provision.MAX_ENV_SOURCE + 1), b"\xff",
+        )
+        for raw in invalid:
+            with self.subTest(raw_length=len(raw)), self.assertRaises(provision.ProvisionError) as caught:
+                provision.builder_env_payload(raw)
+            for secret in (CLOB_KEY, CLOB_SECRET, CLOB_PASSPHRASE):
+                self.assertNotIn(secret, str(caught.exception))
+
+    def test_builder_source_file_bounds_and_identity_refuse_before_transport(self):
+        source = self.root / "source.env"
+        source.write_bytes(self.builder_source())
+        for path in (self.root, self.root / "missing.env"):
+            with self.assertRaises(provision.ProvisionError) as caught:
+                provision.builder_from_env(path)
+            self.assertNotIn(str(path), str(caught.exception))
+        with patch.object(Path, "is_symlink", return_value=True), self.assertRaises(provision.ProvisionError):
+            provision.builder_from_env(source)
+        with patch.object(provision.os, "fstat", side_effect=OSError("private filesystem detail")), self.assertRaises(provision.ProvisionError):
+            provision.builder_from_env(source)
+        source.write_bytes(b"x" * (provision.MAX_ENV_SOURCE + 1))
+        with self.assertRaises(provision.ProvisionError):
+            provision.builder_from_env(source)
+
+    def test_builder_from_env_sends_private_stdin_without_prompt_argv_or_child_environment(self):
+        source = self.root / "source.env"
+        source.write_bytes(self.builder_source())
+        self.args.kind, self.args.from_env = "builder", source
+        calls = []
+        reply = {"ok": True, "kind": "builder", "activation": "unchanged", "restart_required": provision.INACTIVE}
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return SimpleNamespace(returncode=0, stdout=json.dumps(reply).encode())
+        output = StringIO()
+        with patch.object(provision, "hidden_input", side_effect=AssertionError("no prompt")), \
+                patch.dict(os.environ, {"POLY_BUILDER_SECRET": CLOB_SECRET, "MM2_POLY_API_SECRET": CLOB_SECRET}), redirect_stdout(output):
+            provision.local_main(self.args, run=run)
+        command, options = calls[0]
+        self.assertEqual(json.loads(options["input"]), BUILDER_PAYLOAD)
+        self.assertFalse(any(name.startswith(("MM2_", "POLY_", "POLYMARKET_")) for name in options["env"]))
+        for secret in (CLOB_KEY, CLOB_SECRET, CLOB_PASSPHRASE):
+            self.assertNotIn(secret, repr(command))
+            self.assertNotIn(secret, output.getvalue())
+        self.args.kind = "clob"
+        with self.assertRaises(provision.ProvisionError):
+            provision.local_main(self.args, run=lambda *a, **k: self.fail("no transport"))
+
     def test_clob_padding_normalization_preserves_31_and_32_byte_hmac_keys(self):
         for size, padding in ((31, "=="), (32, "=")):
             raw = b"x" * size  # Public HMAC test fixture.
@@ -90,6 +177,10 @@ class CredentialHandoffTests(unittest.TestCase):
                 stored = provision.canonical_clob_secret(supplied)
                 self.assertEqual(stored, canonical)
                 self.assertEqual(base64.b64decode(stored, altchars=b"-_", validate=True), raw)
+            malformed = unpadded + ("=" if padding == "==" else "==")
+            for kind in ("clob", "builder"):
+                with self.subTest(kind=kind, size=size), self.assertRaises(provision.ProvisionError):
+                    provision.validate_payload({**EXTRA_PAYLOADS[0], "kind": kind, "api_secret": malformed})
 
     def test_relayer_key_and_public_owner_are_bounded_literal_values(self):
         valid = EXTRA_PAYLOADS[1]
@@ -119,7 +210,7 @@ class CredentialHandoffTests(unittest.TestCase):
                 self.assertNotIn(url, str(caught.exception))
 
     def test_all_added_modes_reject_missing_extra_duplicate_and_wrong_schema_fields(self):
-        for payload in EXTRA_PAYLOADS:
+        for payload in (*EXTRA_PAYLOADS, BUILDER_PAYLOAD):
             self.assertEqual(provision.decode_payload(json.dumps(payload).encode()), payload)
             field = next(iter(provision.FIELDS[payload["kind"]]))
             missing = {key: value for key, value in payload.items() if key != field}
@@ -149,7 +240,8 @@ class CredentialHandoffTests(unittest.TestCase):
 
     def test_mistaken_credential_arguments_are_not_echoed_by_parser(self):
         for arguments in ([BOT_TOKEN], ["telegram", "--token", BOT_TOKEN], ["wallet", "--key", KEY_ONE],
-                          ["clob", "--secret", CLOB_SECRET], ["relayer", RELAYER_KEY], ["rpc", RPC_URL]):
+                          ["clob", "--secret", CLOB_SECRET], ["builder", "--secret", CLOB_SECRET],
+                          ["relayer", RELAYER_KEY], ["rpc", RPC_URL]):
             errors = StringIO()
             with redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
                 provision.main(arguments)
@@ -160,9 +252,9 @@ class CredentialHandoffTests(unittest.TestCase):
                 self.assertNotIn(secret, errors.getvalue())
 
     def test_added_modes_send_all_credentials_only_as_stdin_and_never_activate(self):
-        for payload in EXTRA_PAYLOADS:
+        for payload in (*EXTRA_PAYLOADS, BUILDER_PAYLOAD):
             self.args.kind = payload["kind"]
-            inputs = [payload[field] for field in (("api_key", "api_secret", "api_passphrase") if self.args.kind == "clob"
+            inputs = [payload[field] for field in (("api_key", "api_secret", "api_passphrase") if self.args.kind in {"clob", "builder"}
                                                  else ("api_key", "key_address") if self.args.kind == "relayer" else ("url",))]
             calls = []
             result = {"ok": True, "kind": self.args.kind, "activation": "unchanged", "restart_required": provision.INACTIVE}
@@ -189,9 +281,9 @@ class CredentialHandoffTests(unittest.TestCase):
             self.assertIn("paused and gated", output.getvalue())
 
     def test_added_mode_transport_failure_malformed_or_secret_reply_is_redacted(self):
-        for payload in EXTRA_PAYLOADS:
+        for payload in (*EXTRA_PAYLOADS, BUILDER_PAYLOAD):
             self.args.kind = payload["kind"]
-            inputs = [payload[field] for field in (("api_key", "api_secret", "api_passphrase") if self.args.kind == "clob"
+            inputs = [payload[field] for field in (("api_key", "api_secret", "api_passphrase") if self.args.kind in {"clob", "builder"}
                                                  else ("api_key", "key_address") if self.args.kind == "relayer" else ("url",))]
             valid = {"ok": True, "kind": self.args.kind, "activation": "unchanged", "restart_required": provision.INACTIVE}
             if self.args.kind == "relayer":
@@ -361,6 +453,55 @@ class AtomicRuntimeTests(unittest.TestCase):
         with self.assertRaises(provision.ProvisionError): self.apply({"schema": 1, "kind": "wallet", "private_key": KEY_ONE})
         self.assertEqual(self.runtime.read_bytes(), before)
 
+    def test_builder_is_atomic_preserves_unrelated_values_and_refuses_both_auth_schemes(self):
+        from deploy_host import private_environment
+        self.apply(self.telegram)
+        before = private_environment(self.runtime)
+        original_profile = self.profile.read_bytes()
+        inode = self.runtime.stat().st_ino
+        unpadded = CLOB_SECRET.rstrip("=")
+        result = self.apply({**BUILDER_PAYLOAD, "api_secret": unpadded})
+        actual = private_environment(self.runtime)
+        for key, value in before.items():
+            self.assertEqual(actual[key], value)
+        self.assertEqual(actual["MM2_POLY_BUILDER_API_SECRET"], CLOB_SECRET)
+        self.assertEqual(actual["MM2_POLY_BUILDER_API_KEY"], CLOB_KEY)
+        self.assertEqual(actual["MM2_POLY_BUILDER_API_PASSPHRASE"], CLOB_PASSPHRASE)
+        self.assertNotEqual(self.runtime.stat().st_ino, inode)
+        self.assertEqual(stat.S_IMODE(self.runtime.stat().st_mode), 0o600)
+        self.assertEqual(self.runtime.stat().st_uid, 0)
+        self.assertEqual(self.profile.read_bytes(), original_profile)
+        self.assertEqual(result, {"kind": "builder", "activation": "unchanged", "restart_required": provision.INACTIVE})
+        configured = self.runtime.read_bytes()
+        with self.assertRaises(provision.ProvisionError):
+            self.apply(EXTRA_PAYLOADS[1])
+        self.assertEqual(self.runtime.read_bytes(), configured)
+        self.runtime.write_text(self.original)
+        self.apply(EXTRA_PAYLOADS[1])
+        configured = self.runtime.read_bytes()
+        with self.assertRaises(provision.ProvisionError):
+            self.apply(BUILDER_PAYLOAD)
+        self.assertEqual(self.runtime.read_bytes(), configured)
+        self.assertEqual(list(self.root.glob(".runtime-*")), [])
+
+    def test_conditional_update_checks_snapshot_under_lock_and_retains_new_credentials(self):
+        from deploy_host import private_environment
+        snapshot = private_environment(self.runtime)
+        self.apply(EXTRA_PAYLOADS[0])
+        current = self.runtime.read_bytes()
+        inode = self.runtime.stat().st_ino
+        with patch.object(provision.os, "replace") as replace, self.assertRaises(provision.ProvisionError) as caught:
+            provision.apply_update(EXTRA_PAYLOADS[0], self.root, self.profile, expected_environment=snapshot)
+        replace.assert_not_called()
+        self.assertEqual(self.runtime.read_bytes(), current)
+        self.assertEqual(self.runtime.stat().st_ino, inode)
+        self.assertEqual(list(self.root.glob(".runtime-*")), [])
+        for secret in (CLOB_KEY, CLOB_SECRET, CLOB_PASSPHRASE):
+            self.assertNotIn(secret, str(caught.exception))
+        result = provision.apply_update(BUILDER_PAYLOAD, self.root, self.profile,
+                                        expected_environment=private_environment(self.runtime))
+        self.assertEqual(result["activation"], "unchanged")
+
     def test_all_added_modes_atomically_preserve_old_environment_and_profile(self):
         from deploy_host import private_environment
 
@@ -440,7 +581,7 @@ class AtomicRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.read_text(), self.original)
 
     def test_failed_replace_retains_original_and_cleans_private_temporary(self):
-        for payload in (self.telegram, {"schema": 1, "kind": "wallet", "private_key": KEY_ONE}, *EXTRA_PAYLOADS):
+        for payload in (self.telegram, {"schema": 1, "kind": "wallet", "private_key": KEY_ONE}, *EXTRA_PAYLOADS, BUILDER_PAYLOAD):
             with patch.object(provision.os, "replace", side_effect=OSError("offline fixture")), self.assertRaises(OSError):
                 self.apply(payload)
             self.assertEqual(self.runtime.read_text(), self.original)

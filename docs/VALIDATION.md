@@ -1,6 +1,35 @@
 # Validation evidence
 
-## Current checkpoint: October 5, 2026 — public feed access, TLS startup and private venue setup
+## Current checkpoint: October 6, 2026 — Builder Relayer and existing CLOB setup
+
+The Relayer now accepts exactly one complete owner key/address pair or Builder
+HMAC triplet. Tests cover the official HMAC vector, all 32 presence combinations,
+controlling EOA binding, sensitive headers, GET pathname signing and exact durable
+POST bytes. Lost, rejected, malformed and redirected responses never cause a retry.
+The separate credential utility signs only CLOB L1 wallet-control authentication
+for Polygon 137 and nonce 0; it performs GET time and GET existing-key derivation.
+There is no key creation, revocation, funded order or transaction fallback.
+
+Review fixed a provisioning race by checking the original environment snapshot
+inside the existing update lock. The parent utility also requires a valid paused
+boot/control identity, uses the local Docker socket with a minimal environment,
+disables Docker logging, and captures private stdin/stdout. The Olympus Builder
+source passed strict process-local validation; no values were printed or copied
+into client files. Credentials have not yet been imported at this checkpoint.
+
+| Check | Confirmed scope |
+| --- | --- |
+| Rust | **235 workspace tests passed**, including five Builder tests, eight CLOB utility tests and two CLI tests. Pinned Rust 1.98.1, locked optimized workspace build, format and workspace/all-targets Clippy `-D warnings` passed. |
+| Operations/private setup | **114 Linux tests passed, no skips**, including safe Builder source parsing, exclusive auth selection, canonical padding, atomic stale-snapshot refusal, masked errors and private worker boundaries. |
+| Containers | **14 checks passed** on the optimized candidate engine and retained console, including the packaged credential binary refusing a foreign fixture wallet with network disabled. Zero live orders. Observed elapsed 25,218 ms, graceful stop 875 ms; these are local measurements, not an SLA. |
+| Actual AWS state | Verified through SSM: `eu-west-1`, retained `0bffb99` release, simulation paused, API and public feeds ready, no funded actor, `live_eligible=false`. Wallet key present; CLOB, owner Relayer, Builder and RPC settings absent. AWS CLI identity and pinned SSH/SSM access renewed and verified. |
+
+New exact-revision image export, selected-host rollout and authenticated existing
+credential acceptance are subsequent checks. This checkpoint does not establish
+venue/account eligibility or funded trading readiness. The current host's prior
+negative geoblock evidence remains unresolved; saving keys cannot override it.
+
+## Previous checkpoint: October 5, 2026 — public feed access, TLS startup and private venue setup
 
 The public source previously stopped before Gamma discovery whenever the
 order-placement geoblock endpoint was negative or unavailable. Public read-only
