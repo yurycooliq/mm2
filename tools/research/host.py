@@ -302,7 +302,9 @@ def _lifecycle_context(data):
     captured = data.get("captured_at_utc")
     if captured is not None:
         try:
-            utc(captured)
+            # Existing Python exporters use the explicit +00:00 UTC spelling.
+            stamp = captured[:-6] + "Z" if isinstance(captured, str) and captured.endswith("+00:00") else captured
+            utc(stamp)
         except (ResearchError, TypeError, ValueError):
             captured = None
     return {"captured_at_utc": captured, "unit": projected["unit"],

@@ -108,7 +108,7 @@ class HostCycleTest(unittest.TestCase):
                 "fingerprint": "d" * 64, "source": source, "observed_timestamp_us": stamp}
 
     def test_each_backfill_window_keeps_its_own_lifecycle_context_and_old_unknowns(self):
-        contexts = [None, {"captured_at_utc": "2026-10-06T10:04:00Z", "systemd": {"NRestarts": "0"},
+        contexts = [None, {"captured_at_utc": "2026-10-06T10:04:00+00:00", "systemd": {"NRestarts": "0"},
                           "containers": [{"service": "engine", "restarts": 0, "oom_killed": False}]},
                          {"captured_at_utc": "2026-10-06T10:04:02Z", "systemd": {"NRestarts": "7"},
                           "containers": [{"service": "engine", "restarts": 7, "oom_killed": True}]}]
