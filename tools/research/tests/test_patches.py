@@ -172,6 +172,33 @@ class PatchBoundaryTest(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertFalse(any(call.args[1] == "push" for call in git.call_args_list))
 
+    def test_candidate_with_parent_execution_changes_never_pushes(self):
+        prepared, receipt = self.publication()
+        base_command = self.git_for_publication(b"b" * 40 + b"\trefs/heads/codex/telegram-owner-miniapp\n")
+        def command(repo, *args, **kwargs):
+            if args[0] == "diff-tree":
+                return b"tools/research/example.py\ncrates/mm2-engine/src/runtime.rs\n"
+            return base_command(repo, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as temp, patch.object(patches, "git", side_effect=command) as git, patch.object(patches, "run_bounded") as run:
+            with self.assertRaises(ResearchError):
+                patches.publish_draft(prepared, receipt, expected_policy_hash="e" * 64, outbox_root=temp)
+            self.assertFalse(any(call.args[1] == "push" for call in git.call_args_list))
+            run.assert_not_called()
+
+    def test_baseline_race_after_create_stays_unconfirmed_and_requires_review(self):
+        import json
+        prepared, receipt = self.publication()
+        changed = {"headRefOid": "a" * 40, "baseRefName": "main", "baseRefOid": "f" * 40}
+        replies = [b"[]", b"https://github.com/yurycooliq/mm2/pull/3\n", json.dumps(changed).encode()]
+        remote = b"b" * 40 + b"\trefs/heads/codex/telegram-owner-miniapp\n"
+        with tempfile.TemporaryDirectory() as temp, patch.object(patches, "git", side_effect=self.git_for_publication(remote)), patch.object(patches, "run_bounded", side_effect=replies):
+            result = patches.publish_draft(prepared, receipt, expected_policy_hash="e" * 64, outbox_root=temp)
+            self.assertEqual(result["status"], "WAITING_REVIEW")
+            self.assertTrue(result["attach_artifact_required"])
+            self.assertFalse(result["blind_retry_allowed"])
+            self.assertFalse(any(Path(temp).glob("*.confirmed.json")))
+            self.assertTrue(any(Path(temp).glob("*.dispatched.json")))
+
 
 if __name__ == "__main__":
     unittest.main()
