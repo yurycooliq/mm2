@@ -2,6 +2,7 @@
 """Trusted desktop broker. Remote controller is sole database writer; gh stays local."""
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,56 @@ from tools.research.schema import ResearchError, canonical, digest, load_json, p
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = "sudo -u mm2research /opt/mm2-research/venv/bin/python -B /opt/mm2-research/current/scripts/research_bridge.py"
 MAX_RESPONSE = 8 * 1024 * 1024
+PACKET_BYTES = 4 * 1024 * 1024
+CHUNK_BYTES = 96 * 1024
+CHUNK_TEXT = 4 * (CHUNK_BYTES // 3)
+
+
+def decode_packet(content):
+    """Validate all transport lengths and hashes before creating any member file."""
+    manifest = content["manifest"]
+    members, encoded = manifest.get("files"), content.get("files")
+    if not isinstance(members, list) or not 1 <= len(members) <= 32 or not isinstance(encoded, dict):
+        raise ResearchError("invalid packet members")
+    names, total = set(), 0
+    for member in members:
+        name, size = member.get("path"), member.get("bytes")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", name) or name in {"manifest.json", ".", ".."} or name in names:
+            raise ResearchError("unsafe or duplicate desktop bundle member")
+        if type(size) is not int or not 0 <= size <= PACKET_BYTES or not re.fullmatch(r"[0-9a-f]{64}", member.get("sha256", "")):
+            raise ResearchError("invalid desktop member size/hash")
+        names.add(name)
+        total += size
+        if total > PACKET_BYTES:
+            raise ResearchError("desktop packet aggregate quota exceeded")
+    if set(encoded) != names:
+        raise ResearchError("transport members differ from manifest")
+    decoded = {}
+    for member in members:
+        size = member["bytes"]
+        chunks = encoded[member["path"]]
+        # Bounded compatibility for old small-member bridge responses only.
+        if isinstance(chunks, str):
+            chunks = [chunks] if size else ([] if chunks == "" else [chunks])
+        if not isinstance(chunks, list) or len(chunks) != (size + CHUNK_BYTES - 1) // CHUNK_BYTES:
+            raise ResearchError("desktop packet chunk count mismatch")
+        parts = []
+        for index, chunk in enumerate(chunks):
+            expected = min(CHUNK_BYTES, size - index * CHUNK_BYTES)
+            if not isinstance(chunk, str) or len(chunk) != 4 * ((expected + 2) // 3) or len(chunk) > CHUNK_TEXT:
+                raise ResearchError("desktop packet chunk length mismatch")
+            try:
+                part = base64.b64decode(chunk, validate=True)
+            except (ValueError, base64.binascii.Error):
+                raise ResearchError("invalid packet base64") from None
+            if len(part) != expected or base64.b64encode(part).decode("ascii") != chunk:
+                raise ResearchError("noncanonical packet chunk")
+            parts.append(part)
+        data = b"".join(parts)
+        if len(data) != size or hashlib.sha256(data).hexdigest() != member["sha256"]:
+            raise ResearchError("desktop member hash/length mismatch")
+        decoded[member["path"]] = data
+    return decoded
 
 
 def bridge(payload, run=subprocess.run):
@@ -64,6 +115,7 @@ def pull(stage, existing_ticket=None):
         content = bridge({"command": "bundle", "bundle_id": reference["bundle_id"]})
         if content["manifest"].get("bundle_id") != reference["bundle_id"] or digest(content["manifest"]) != reference["manifest_hash"]:
             raise ResearchError("desktop packet differs from exact claimed inputs")
+        decoded = decode_packet(content)
         path = directory / reference["bundle_id"]
         pending = directory / (reference["bundle_id"] + ".pending")
         if path.exists():
@@ -77,7 +129,7 @@ def pull(stage, existing_ticket=None):
             # Flat safe member names are rechecked by the immutable manifest verifier.
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", member["path"]) or member["path"] in {"manifest.json", ".", ".."}:
                 raise ResearchError("unsafe desktop bundle member")
-            data = base64.b64decode(content["files"][member["path"]], validate=True)
+            data = decoded[member["path"]]
             target = pending / member["path"]
             if target.exists():
                 if target.is_symlink() or target.read_bytes() != data:

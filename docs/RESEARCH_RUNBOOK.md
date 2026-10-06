@@ -85,6 +85,22 @@ The independent schedule uses exactly the policy-configured principal
 and separate review context match trusted configuration. Verified receipt flags
 record actual broker/spec checks; they are not GitHub required approvals.
 
+Always inspect `status.service_health` before treating an empty queue as a quiet
+run. It exposes only allowlisted `unit`, `status` (HEALTHY, RUNNING, FAILED or
+UNAVAILABLE), safe unavailable reason, active/sub state, result, exit status,
+last-started/exited UTC and fingerprint. An inactive oneshot with success and exit
+0 is HEALTHY; inactivity alone is not a failure. Fingerprints exclude timestamps:
+notify a new actionable failure signature, changed UNAVAILABLE condition or
+recovery, then stay quiet while unchanged. Health is a diagnostic signal, not
+permission to restart services, access raw logs/environment or alter trading.
+
+Desktop bundle transport returns each `files[member]` as a list of base64 chunks:
+at most 96 KiB raw / 128 KiB ASCII per chunk. MAX_RECORD remains unchanged. Before
+writing inbox files, the desktop broker verifies the exact frozen manifest SHA,
+chunk count, declared member sizes and total decoded payload at most 4 MiB;
+after reconstruction it verifies every member hash and the full bundle again.
+Transport framing does not relax accounting completeness or input provenance.
+
 GitHub publication uses an exact immutable marker/body, a durable fenced outbox
 and reconciliation. An unknown POST is never blindly retried. Issues require
 facts, unknowns, hypothesis/alternative, mechanism, target metric, concrete files,

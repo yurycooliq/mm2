@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """SSM/SSH authenticated controller bridge. JSON commands never become shell code."""
 import base64
+from datetime import datetime
+import hashlib
 from pathlib import Path
+import re
+import subprocess
 import sys
+import threading
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.research.archive import verify_bundle
@@ -12,6 +18,95 @@ from tools.research.schema import ResearchError, canonical, load_json, parse_jso
 
 MAX_REQUEST = 512 * 1024
 MAX_RESPONSE = 8 * 1024 * 1024
+PACKET_BYTES = 4 * 1024 * 1024
+CHUNK_BYTES = 96 * 1024
+SERVICE_UNIT = "mm2-research.service"
+SERVICE_FIELDS = ("ActiveState", "SubState", "Result", "ExecMainStatus", "ExecMainStartTimestamp", "ExecMainExitTimestamp")
+HEALTH_BYTES = 16 * 1024
+
+
+def _service_query():
+    """Read a fixed public unit projection with hard output and elapsed bounds."""
+    command = ["/usr/bin/systemctl", "show", SERVICE_UNIT, "--no-pager", "--property=" + ",".join(SERVICE_FIELDS)]
+    started = time.monotonic()
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"})
+    output = []
+    reader = threading.Thread(target=lambda: output.append(process.stdout.read(HEALTH_BYTES + 1)), daemon=True)
+    reader.start()
+    try:
+        reader.join(max(0, 3 - (time.monotonic() - started)))
+        if reader.is_alive():
+            raise subprocess.TimeoutExpired(command, 3)
+        if not output or len(output[0]) > HEALTH_BYTES:
+            raise ResearchError("QUERY_OUTPUT_QUOTA")
+        code = process.wait(timeout=max(0.001, 3 - (time.monotonic() - started)))
+        return output[0], code
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=1)
+        process.stdout.close()
+
+
+def service_health(query=None):
+    """No logs, command output, inherited credentials, or unknown values escape."""
+    base = {"schema_version": 1, "unit": SERVICE_UNIT}
+    try:
+        raw, code = (query or _service_query)()
+        if not isinstance(raw, bytes) or len(raw) > HEALTH_BYTES:
+            raise ResearchError("QUERY_OUTPUT_QUOTA")
+        if code != 0:
+            raise ResearchError("QUERY_FAILED")
+        values = {}
+        for line in raw.decode("ascii").splitlines():
+            name, value = line.split("=", 1)
+            if name not in SERVICE_FIELDS or name in values:
+                raise ValueError("invalid property")
+            values[name] = value
+        if set(values) != set(SERVICE_FIELDS):
+            raise ValueError("missing property")
+        active = values["ActiveState"]
+        sub = values["SubState"]
+        result = values["Result"]
+        if active not in {"active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing"} or sub not in {
+            "dead", "condition", "start-pre", "start", "start-post", "running", "exited", "reload", "reload-signal", "reload-notify",
+            "stop", "stop-watchdog", "stop-sigterm", "stop-sigkill", "stop-post", "final-watchdog", "final-sigterm", "final-sigkill",
+            "failed", "auto-restart", "auto-restart-queued", "cleaning"} or result not in {
+            "success", "resources", "timeout", "exit-code", "signal", "core-dump", "watchdog", "start-limit-hit", "protocol",
+            "oom-kill", "exec-condition", "condition", "assert", "dependency"}:
+            raise ResearchError("UNSUPPORTED_VALUE")
+        if not re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", values["ExecMainStatus"]) or int(values["ExecMainStatus"]) > 255:
+            raise ValueError("invalid exit status")
+        timestamps = []
+        for field in SERVICE_FIELDS[-2:]:
+            value = values[field]
+            if value == "":
+                timestamps.append(None)
+                continue
+            if not re.fullmatch(r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} UTC", value):
+                raise ValueError("invalid timestamp")
+            parsed = datetime.fromisoformat(value[4:-4])
+            if value[:3] != ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[parsed.weekday()]:
+                raise ValueError("invalid weekday")
+            timestamps.append(parsed.isoformat(timespec="seconds") + "Z")
+        exit_status = int(values["ExecMainStatus"])
+        status = "FAILED" if active == "failed" or result != "success" or exit_status != 0 else "HEALTHY"
+        health = {**base, "status": status, "active_state": active, "sub_state": sub, "result": result,
+                  "exit_status": exit_status, "last_started_utc": timestamps[0], "last_exited_utc": timestamps[1]}
+    except subprocess.TimeoutExpired:
+        health = {**base, "status": "UNAVAILABLE", "reason": "QUERY_TIMEOUT"}
+    except (OSError, subprocess.SubprocessError):
+        health = {**base, "status": "UNAVAILABLE", "reason": "QUERY_UNAVAILABLE"}
+    except ResearchError as exc:
+        reason = str(exc)
+        health = {**base, "status": "UNAVAILABLE", "reason": reason if reason in {
+            "QUERY_OUTPUT_QUOTA", "QUERY_FAILED", "UNSUPPORTED_VALUE"} else "MALFORMED_RESPONSE"}
+    except (ValueError, TypeError):
+        health = {**base, "status": "UNAVAILABLE", "reason": "MALFORMED_RESPONSE"}
+    # Repeated identical failures do not notify on each oneshot timestamp change.
+    signature = {key: value for key, value in health.items() if key not in {"last_started_utc", "last_exited_utc"}}
+    return {**health, "fingerprint": hashlib.sha256(canonical(signature)).hexdigest()}
 
 
 def effect_context(store, effect_id):
@@ -56,7 +151,8 @@ def handle(request, config):
             confirmed = [effect_context(store, row["id"]) for row in store.db.execute(
                 "SELECT id FROM outbox WHERE status='CONFIRMED' ORDER BY updated DESC,id LIMIT 40")]
             return {"jobs": store.list(40), "unknown_effects": store.unknown_effects(),
-                    "confirmed_effects": confirmed, "ready_code": ready_registry(store), "policy": policy, "policy_hash": policy_hash}
+                    "confirmed_effects": confirmed, "ready_code": ready_registry(store), "policy": policy, "policy_hash": policy_hash,
+                    "service_health": service_health()}
         if command == "claim":
             if request["stage"] not in policy["enabled_stages"]:
                 raise ResearchError("stage disabled by trusted policy")
@@ -106,9 +202,14 @@ def handle(request, config):
             total = 0
             for member in manifest["files"]:
                 total += member["bytes"]
-                if total > MAX_RESPONSE // 2:
+                if total > PACKET_BYTES:
                     raise ResearchError("desktop packet quota exceeded; use a compact research packet")
-                response["files"][member["path"]] = base64.b64encode((path / member["path"]).read_bytes()).decode()
+                with (path / member["path"]).open("rb") as stream:
+                    data = stream.read(member["bytes"] + 1)
+                if len(data) != member["bytes"] or hashlib.sha256(data).hexdigest() != member["sha256"]:
+                    raise ResearchError("verified packet changed during transport")
+                response["files"][member["path"]] = [base64.b64encode(data[offset:offset + CHUNK_BYTES]).decode("ascii")
+                    for offset in range(0, len(data), CHUNK_BYTES)]
             return response
         raise ResearchError("unsupported bridge operation")
 

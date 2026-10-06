@@ -23,3 +23,18 @@ notification. Notify meaningful findings, completion, failures or necessary
 owner action. Detailed daily reports only on explicit request. Secondary cleanup
 uses exact verified manifests with current pins/leases, never financial expiry
 or primary journals.
+
+Inspect status.service_health even when the job queue is empty. The allowlisted
+status is HEALTHY, RUNNING, FAILED or UNAVAILABLE, with safe reason/state/result/
+exit fields, UTC start/exit metadata and fingerprint. An inactive oneshot whose
+last result is success and exit status is 0 is healthy. Fingerprints exclude
+timestamps; notify only a new actionable failure signature, a materially changed
+UNAVAILABLE condition or recovery, and stay quiet while unchanged. This signal
+grants no restart, raw-log/environment access or trading authority.
+
+Frozen bundle transport uses files[member]=list[str] base64 chunks, bounded to
+96 KiB raw /128 KiB ASCII each. MAX_RECORD is unchanged. The desktop broker must
+verify frozen manifest SHA, bounded chunk counts, exact member bytes and decoded
+total <=4 MiB before saving, then verify each member hash and the full immutable
+bundle. Chunk framing is transport only; it cannot change the claimed input set,
+financial evidence class or completeness.

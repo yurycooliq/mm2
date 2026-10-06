@@ -1,5 +1,8 @@
 import base64
+import copy
+import io
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -9,7 +12,7 @@ from tools.research.archive import publish_bundle, verify_bundle
 from tools.research.controller import DEFAULT_POLICY, enqueue, load_policy, prepare_draft
 from tools.research.github import REQUIRED_SECTIONS
 from tools.research.jobs import JobStore
-from tools.research.schema import ResearchError, canonical, digest, load_json
+from tools.research.schema import ResearchError, canonical, digest, load_json, parse_json
 
 
 class DesktopBridgeTest(unittest.TestCase):
@@ -147,6 +150,110 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertEqual(result["status"], "WAITING_ACCESS")
         self.assertFalse(result["blind_retry_allowed"])
         self.assertIsNone(self.claim())
+
+    def large_packet(self):
+        bundle = publish_bundle(self.state / "archive", {"events.jsonl": [{"line": "x" * 80, "number": n} for n in range(4096)]},
+                                scope={"kind": "diagnostic"}, utc_range=self.manifest["utc_range"], quality=self.manifest["quality"])
+        manifest = verify_bundle(bundle)
+        content = parse_json(canonical(self.request("bundle", bundle_id=manifest["bundle_id"])))
+        return bundle, manifest, content
+
+    def test_large_member_chunk_transport_roundtrips_and_saves_verified_bundle(self):
+        bundle, manifest, content = self.large_packet()
+        member = manifest["files"][0]
+        self.assertGreater(member["bytes"], 256 * 1024)
+        self.assertGreater(len(content["files"][member["path"]]), 1)
+        self.assertTrue(all(len(chunk) <= 128 * 1024 for chunk in content["files"][member["path"]]))
+        self.assertEqual(research_desktop.decode_packet(content)[member["path"]], (bundle / member["path"]).read_bytes())
+        ticket = self.claim()
+        ticket["inputs"]["bundles"] = [{"bundle_id": manifest["bundle_id"], "manifest_hash": digest(manifest)}]
+        def remote(payload):
+            if payload["command"] == "claim":
+                return {"ticket": ticket, "policy": self.policy}
+            return parse_json(canonical(research_bridge.handle({"schema_version": 1, **payload}, self.config)))
+        with patch.object(research_desktop, "ROOT", self.root), patch.object(research_desktop, "bridge", side_effect=remote):
+            result = research_desktop.pull("analysis")
+        self.assertEqual(verify_bundle(result["bundles"][0]), manifest)
+
+    def test_chunk_tampering_count_and_aggregate_quota_fail_before_save(self):
+        _, _, content = self.large_packet()
+        name = content["manifest"]["files"][0]["path"]
+        bad = copy.deepcopy(content)
+        first = bad["files"][name][0]
+        bad["files"][name][0] = ("A" if first[0] != "A" else "B") + first[1:]
+        with self.assertRaises(ResearchError):
+            research_desktop.decode_packet(bad)
+        bad = copy.deepcopy(content)
+        bad["files"][name].pop()
+        with self.assertRaises(ResearchError):
+            research_desktop.decode_packet(bad)
+        bad = copy.deepcopy(content)
+        bad["manifest"]["files"] = [{"path": "one.jsonl", "bytes": research_desktop.PACKET_BYTES, "sha256": "a" * 64},
+                                     {"path": "two.jsonl", "bytes": 1, "sha256": "b" * 64}]
+        # Declared aggregate is refused before any decoding of untrusted data.
+        bad["files"] = {"one.jsonl": ["invalid"], "two.jsonl": ["invalid"]}
+        with self.assertRaisesRegex(ResearchError, "aggregate quota"):
+            research_desktop.decode_packet(bad)
+        bad = copy.deepcopy(content)
+        bad["files"]["extra.json"] = []
+        with self.assertRaisesRegex(ResearchError, "differ from manifest"):
+            research_desktop.decode_packet(bad)
+
+    def test_status_exposes_service_failure_even_without_pending_jobs(self):
+        ticket = self.claim()
+        with JobStore(self.state / "jobs.sqlite3") as store:
+            store.finish(ticket, "SUCCEEDED", {"status": "fixture"})
+        health = {"unit": "mm2-research.service", "status": "FAILED", "fingerprint": "c" * 64}
+        with patch.object(research_bridge, "service_health", return_value=health):
+            self.assertEqual(self.request("status")["service_health"], health)
+
+
+class ServiceHealthTest(unittest.TestCase):
+    def fixture(self, **updates):
+        values = {"ActiveState": "inactive", "SubState": "dead", "Result": "success", "ExecMainStatus": "0",
+                  "ExecMainStartTimestamp": "Tue 2026-10-06 10:00:00 UTC", "ExecMainExitTimestamp": "Tue 2026-10-06 10:00:01 UTC"}
+        values.update(updates)
+        return "\n".join(f"{key}={value}" for key, value in values.items()).encode("ascii") + b"\n"
+
+    def test_inactive_success_oneshot_is_healthy_and_failure_is_stable(self):
+        healthy = research_bridge.service_health(lambda: (self.fixture(), 0))
+        self.assertEqual(healthy["status"], "HEALTHY")
+        self.assertEqual(healthy["last_exited_utc"], "2026-10-06T10:00:01Z")
+        failure = research_bridge.service_health(lambda: (self.fixture(ActiveState="failed", SubState="failed", Result="exit-code", ExecMainStatus="1"), 0))
+        repeated = research_bridge.service_health(lambda: (self.fixture(ActiveState="failed", SubState="failed", Result="exit-code", ExecMainStatus="1", ExecMainExitTimestamp="Tue 2026-10-06 10:15:01 UTC"), 0))
+        self.assertEqual(failure["status"], "FAILED")
+        self.assertEqual(failure["fingerprint"], repeated["fingerprint"])
+
+    def test_unknown_unit_malformed_enum_and_timestamp_are_unavailable(self):
+        cases = [(b"ActiveState=inactive\n", 0), (self.fixture() + b"Result=success\n", 0),
+                 (self.fixture(Result=""), 0), (self.fixture(SubState="unknown-code"), 0),
+                 (self.fixture(ExecMainStatus="256"), 0), (self.fixture(ExecMainStartTimestamp="Tue 2026-99-06 10:00:00 UTC"), 0),
+                 (self.fixture(ExecMainStartTimestamp="Mon 2026-10-06 10:00:00 UTC"), 0),
+                 (self.fixture(), 1), (b"x" * (research_bridge.HEALTH_BYTES + 1), 0)]
+        for raw, code in cases:
+            with self.subTest(raw=raw[:32], code=code):
+                health = research_bridge.service_health(lambda: (raw, code))
+                self.assertEqual(health["status"], "UNAVAILABLE")
+                self.assertNotIn("last_started_utc", health)
+        def timeout():
+            raise subprocess.TimeoutExpired("must-not-escape", 3)
+        self.assertEqual(research_bridge.service_health(timeout)["reason"], "QUERY_TIMEOUT")
+
+    def test_fixed_unprivileged_query_has_minimal_environment_and_bounded_read(self):
+        raw = self.fixture()
+        class Process:
+            stdout = io.BytesIO(raw)
+            def poll(self): return 0
+            def wait(self, timeout): return 0
+            def kill(self): raise AssertionError("finished process must not be killed")
+        with patch.object(research_bridge.subprocess, "Popen", return_value=Process()) as launch:
+            health = research_bridge.service_health()
+        self.assertEqual(health["status"], "HEALTHY")
+        args, kwargs = launch.call_args
+        self.assertEqual(args[0][:3], ["/usr/bin/systemctl", "show", "mm2-research.service"])
+        self.assertEqual(args[0][-1], "--property=" + ",".join(research_bridge.SERVICE_FIELDS))
+        self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"})
+        self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
