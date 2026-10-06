@@ -39,6 +39,11 @@ hashes. Partial directories are not complete reports. No Telegram API call,
 execution command or primary-state mutation is performed. An optional controller
 snapshot has shape `{captured_at_utc, status}`; its observation cannot postdate
 cutoff. This is a timestamped service observation, not a daily uptime measure.
+Optional `--engine-snapshot` and `--diagnostic-snapshot` inputs preserve original
+observation timestamps. Allowlisted recent incidents are grouped as rows, never
+crash episodes. Fatal feed faults and a blocked server connection become explicit
+operational priorities in both views. Server eligibility is distinct from owner
+jurisdiction and does not introduce a laptop-IP gate.
 
 The public research packet does not yet contain a full authenticated MM2 ledger.
 Connecting bounded intent-linked receipts, opening/closing state, external flows,

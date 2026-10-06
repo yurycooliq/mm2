@@ -1,0 +1,75 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "MM2 desktop machine transport identity. Disabled until certificate enrollment and renewal/revocation acceptance. No engine instance or trading secrets access.",
+  "Parameters": {
+    "ResearchInstanceId": {"Type": "String", "Default": "i-030b39845ba1e0f78", "AllowedPattern": "i-[0-9a-f]{17}"},
+    "PublicCaCertificatePem": {"Type": "String", "Description": "Public certificate of the reviewed private CA; never submit a private key.", "MinLength": 128, "MaxLength": 4096},
+    "IssuerCommonName": {"Type": "String", "AllowedPattern": "[A-Za-z0-9_.-]{1,64}"},
+    "WorkerCommonName": {"Type": "String", "Default": "mm2-research-worker", "AllowedPattern": "[A-Za-z0-9_.-]{1,64}"},
+    "EnableMachineAccess": {"Type": "String", "Default": "false", "AllowedValues": ["false", "true"]}
+  },
+  "Conditions": {"MachineAccessEnabled": {"Fn::Equals": [{"Ref": "EnableMachineAccess"}, "true"]}},
+  "Resources": {
+    "WorkerTrustAnchor": {
+      "Type": "AWS::RolesAnywhere::TrustAnchor",
+      "Properties": {
+        "Name": "mm2-desktop-worker-ca",
+        "Enabled": {"Fn::If": ["MachineAccessEnabled", true, false]},
+        "Source": {"SourceType": "CERTIFICATE_BUNDLE", "SourceData": {"X509CertificateData": {"Ref": "PublicCaCertificatePem"}}}
+      }
+    },
+    "WorkerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "mm2-desktop-research-transport",
+        "MaxSessionDuration": 3600,
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "rolesanywhere.amazonaws.com"},
+            "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
+            "Condition": {
+              "ArnEquals": {"aws:SourceArn": {"Fn::GetAtt": ["WorkerTrustAnchor", "TrustAnchorArn"]}},
+              "StringEquals": {
+                "aws:SourceAccount": {"Ref": "AWS::AccountId"},
+                "aws:PrincipalTag/x509Subject/CN": {"Ref": "WorkerCommonName"},
+                "aws:PrincipalTag/x509Issuer/CN": {"Ref": "IssuerCommonName"},
+                "sts:SourceIdentity": {"Ref": "WorkerCommonName"}
+              }
+            }
+          }]
+        },
+        "Policies": [{
+          "PolicyName": "research-instance-ssh-only",
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {"Sid": "ResearchSshTransport", "Effect": "Allow", "Action": "ssm:StartSession", "Resource": [
+                {"Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${ResearchInstanceId}"},
+                {"Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartSSHSession"}
+              ]},
+              {"Sid": "OwnSessionCleanup", "Effect": "Allow", "Action": ["ssm:TerminateSession", "ssm:ResumeSession"], "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:session/${!aws:userid}-*"
+              }}
+            ]
+          }
+        }]
+      }
+    },
+    "WorkerProfile": {
+      "Type": "AWS::RolesAnywhere::Profile",
+      "Properties": {
+        "Name": "mm2-desktop-research-transport",
+        "Enabled": {"Fn::If": ["MachineAccessEnabled", true, false]},
+        "DurationSeconds": 1800,
+        "RoleArns": [{"Fn::GetAtt": ["WorkerRole", "Arn"]}]
+      }
+    }
+  },
+  "Outputs": {
+    "RoleArn": {"Value": {"Fn::GetAtt": ["WorkerRole", "Arn"]}},
+    "TrustAnchorArn": {"Value": {"Fn::GetAtt": ["WorkerTrustAnchor", "TrustAnchorArn"]}},
+    "ProfileArn": {"Value": {"Fn::GetAtt": ["WorkerProfile", "ProfileArn"]}}
+  }
+}

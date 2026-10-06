@@ -5,6 +5,7 @@ from decimal import Decimal
 import hashlib
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from collections import Counter
 
 from .archive import read_member, verify_bundle
 from .schema import ResearchError, canonical, integer, load_json, utc
@@ -15,7 +16,7 @@ def metric(value, unit, lane, quality, reason, source, population, count=None):
             "source_refs": [source], "population": population, "sample_count": count}
 
 
-def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", controller=None):
+def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", controller=None, engine=None, diagnostic_snapshot=None):
     manifest = verify_bundle(bundle)
     if manifest["scope"].get("kind") != "research-packet" or manifest["scope"].get("lane") != "public-benchmark":
         raise ResearchError("control report requires a verified public research packet")
@@ -30,14 +31,18 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
     if not isinstance(accounts, dict) or set(accounts) != {"mm2-public", "mo-money"}:
         raise ResearchError("expected exactly the two registered public-account summaries")
     source = manifest["bundle_id"]
+    identity = {"bundle_id": source, "cutoff_utc": cutoff_utc, "display_timezone": display_timezone,
+                "controller": controller, "engine": engine, "diagnostic_snapshot": diagnostic_snapshot}
+    report_id = "mm2-control-" + hashlib.sha256(canonical(identity)).hexdigest()
     sources = {source: {"kind": "verified_research_packet", "bundle_id": source,
                        "manifest_sha256": hashlib.sha256((Path(bundle) / "manifest.json").read_bytes()).hexdigest(),
                        "application_sha": manifest.get("source_revision"),
                        "source_at_utc": manifest["created_at_utc"]}}
-    report = {"schema_version": 2, "report_id": "mm2-control-" + source,
+    report = {"schema_version": 2, "report_id": report_id,
               "cutoff_utc": cutoff_utc, "created_at_utc": datetime.now(timezone.utc).isoformat(),
               "period": manifest["utc_range"], "period_closed": utc(manifest["utc_range"]["end"]) <= cutoff,
               "display_timezone": display_timezone, "display_cutoff": cutoff.astimezone(zone).isoformat(),
+              "packet_age_seconds": int((cutoff - created).total_seconds()),
               "scope": "public research; no authenticated bot-only live ledger",
               "sources": sources, "metrics": {}, "account_observations": {},
               "profitability_verdict": "INCONCLUSIVE", "primary_mutations": False}
@@ -101,6 +106,38 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
                                           "quality": "OBSERVED_SNAPSHOT_NOT_UPTIME"})
         report["sources"]["controller"] = {"kind": "captured_read_only_controller_status",
                                            "sha256": hashlib.sha256(canonical(controller)).hexdigest()}
+    if engine is not None:
+        observed = utc(engine["captured_at_utc"])
+        if observed > cutoff:
+            raise ResearchError("engine snapshot postdates cutoff")
+        from scripts.research_export import safe_health
+        health = safe_health(engine.get("health", {}))
+        safe = {key: health.get(key) for key in ("execution_mode", "mode", "api_ready", "feed_ready", "live_eligible", "fault_class", "published_at_ms")}
+        report["engine_snapshot"] = {"quality": "PARTIAL", "current_health": None,
+                                     "reason": "OBSERVED_SNAPSHOT_NOT_CONTINUOUS_UPTIME",
+                                     "observed_at_utc": engine["captured_at_utc"],
+                                     "age_seconds": int((cutoff - observed).total_seconds()), "observed_state": safe}
+        report["host_eligibility"] = {key: engine.get("geoblock", {}).get(key) for key in ("blocked", "country", "region")}
+        report["sources"]["engine"] = {"kind": "allowlisted_authenticated_cached_engine_snapshot",
+                                       "sha256": hashlib.sha256(canonical(engine)).hexdigest()}
+    if diagnostic_snapshot is not None:
+        observed = utc(diagnostic_snapshot["captured_at_utc"])
+        if observed > cutoff:
+            raise ResearchError("diagnostic snapshot postdates cutoff")
+        from scripts.research_export import safe_diagnostics
+        safe = safe_diagnostics(diagnostic_snapshot)
+        counts = Counter((row["source"], row["message"]) for row in safe["incidents"])
+        report["recent_diagnostics"] = {
+            "observed_at_utc": diagnostic_snapshot["captured_at_utc"],
+            "age_seconds": int((cutoff - observed).total_seconds()),
+            "hours": safe["hours"], "systemd": safe["systemd"], "containers": safe["containers"],
+            "engine_source_revision": safe.get("engine_source_revision"),
+            "observed_rows": len(safe["incidents"]), "crash_episode_count": None,
+            "quality": "PARTIAL", "historic_root_cause_proven": False,
+            "groups": [{"source": source, "message": message, "rows": count}
+                       for (source, message), count in sorted(counts.items())]}
+        report["sources"]["recent_diagnostics"] = {"kind": "bounded_allowlisted_incident_capture",
+                                                   "sha256": hashlib.sha256(canonical(diagnostic_snapshot)).hexdigest()}
     report["next_actions"] = [
         {"priority": 1, "action": "Получить полный журнал MM2: начало/конец периода, движения средств, исполнения и связь с заявками.",
          "done_when": "Сверены деньги/позиции и полнота; каждое исполнение связано с MM2."},
@@ -108,6 +145,17 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
          "done_when": "Нет подстановки нулей и переноса новых counters на старые события."},
         {"priority": 3, "action": "Сравнить зарегистрированный кандидат с baseline на новых данных.",
          "done_when": "Учтены расходы, задержки, конечный капитал и худшие потери; отдельный экономический verdict."}]
+    operational_actions = []
+    recent = report.get("recent_diagnostics", {})
+    if any("fatal=true" in row["message"] for row in recent.get("groups", [])):
+        operational_actions.append({"action": "Установить причину fatal feed-сбоев: различить переполнение очереди и закрытие потребителя; сопоставить с lifecycle и нагрузкой.",
+                                    "done_when": "Проверена причина, исправление прошло нагрузочную проверку и длительную приемку без потери событий."})
+    if report.get("host_eligibility", {}).get("blocked") is True:
+        operational_actions.append({"action": "Проверить разрешенность серверного подключения у площадки и выбрать поддерживаемое размещение.",
+                                    "done_when": "Получено подтверждение допуска; серверная проверка blocked=false. Локальный IP не управляет engine."})
+    report["next_actions"] = operational_actions + report["next_actions"]
+    for priority, action in enumerate(report["next_actions"], 1):
+        action["priority"] = priority
     all_metrics = list(metrics.values())
     for account in report["account_observations"].values():
         all_metrics += [value for value in account.values() if isinstance(value, dict) and "unit" in value]
@@ -133,6 +181,7 @@ def render_full(report):
     rows = ["# MM2: контрольный отчет", "",
             f"Период UTC: {report['period']['start']} — {report['period']['end']} (правая граница исключена).",
             f"Срез: {report['display_cutoff']}. Источник: `{report['report_id']}`.", "",
+            f"Возраст исследовательского пакета на срез: {report['packet_age_seconds']} s. Метрики относятся к указанному периоду, а не ко всему дню.", "",
             "**Реальная доходность MM2 не установлена:** источник содержит публичные наблюдения, а не полный журнал собственного бота.", "",
             "| Показатель собственного бота | Значение | Качество |", "| --- | --- | --- |"]
     names = {"live_bot_net_pnl": "Чистый финансовый результат", "live_bot_unique_fills": "Подтвержденные исполнения",
@@ -148,13 +197,27 @@ def render_full(report):
                  f"Наблюденные события: {display(item['observed_activity_events'])}; не число сделок собственного бота.",
                  "Причины неполноты: " + (", ".join(item["reasons"]) or "отсутствие атрибуции собственному боту") + "."]
     diag = report["diagnostics"]
-    rows += ["", "## Состояние и сбои", "",
-             "Текущее состояние engine и суточная доступность неизвестны: нужен timestamp и полный heartbeat interval.",
+    snapshot = report["engine_snapshot"]
+    engine_text = "Состояние engine неизвестно: нужен timestamp; суточная доступность требует полного heartbeat interval."
+    if "observed_state" in snapshot:
+        state = snapshot["observed_state"]
+        engine_text = f"Срез engine {snapshot['observed_at_utc']}: {state['execution_mode']} / {state['mode']}, API ready={state['api_ready']}, feeds ready={state['feed_ready']}, live eligible={state['live_eligible']}. Возраст {snapshot['age_seconds']} s; это не суточный uptime."
+    rows += ["", "## Состояние и сбои", "", engine_text,
              f"Диагностических строк: {diag['observed_incident_rows']}; окон backfill: {diag['backfill_windows']}.",
              "Количество отдельных падений и историческая причина неизвестны; строки не равны падениям."]
     if "research_service" in report:
         service = report["research_service"]
         rows.append(f"Research service: {service.get('status')}; наблюдение {service['observed_at_utc']}, возраст {service['age_seconds']} s. Это срез, не uptime.")
+    if "host_eligibility" in report:
+        venue = report["host_eligibility"]
+        rows.append(f"Ответ площадки для сервера: blocked={venue['blocked']}, country={venue['country']}, region={venue['region']}; это не юридическое заключение о владельце счета.")
+    if "recent_diagnostics" in report:
+        recent = report["recent_diagnostics"]
+        rows += [f"Свежая диагностика: {recent['observed_at_utc']}, окно {recent['hours']} h, строк {recent['observed_rows']}.",
+                 f"Наблюдаемый systemd NRestarts={recent['systemd'].get('NRestarts', 'неизвестно')}; это не число падений за отчетный период.",
+                 "", "| Источник | Диагностический код | Строк |", "| --- | --- | --- |"]
+        for group in recent["groups"]:
+            rows.append(f"| {group['source']} | {group['message']} | {group['rows']} |")
     rows += ["", "## Следующие действия", ""]
     for action in report["next_actions"]:
         rows.append(f"{action['priority']}. {action['action']} Готово, когда: {action['done_when']}")
@@ -163,12 +226,20 @@ def render_full(report):
 
 def render_telegram(report):
     result = display(report["metrics"]["live_bot_net_pnl"])
+    state = report["engine_snapshot"].get("observed_state")
+    operation = (f"Engine: {state['execution_mode']} / {state['mode']} (срез {report['engine_snapshot']['observed_at_utc']}).\n" if state else "")
+    if report.get("host_eligibility", {}).get("blocked") is True:
+        operation += "Площадка сообщает blocked=true для серверного подключения.\n"
+    recent = report.get("recent_diagnostics", {})
+    if any("fatal=true" in row["message"] for row in recent.get("groups", [])):
+        operation += "В свежей диагностике есть fatal feed-сбои; причина требует проверки.\n"
     return (f"MM2 · срез {report['display_cutoff']}\n"
             f"Период UTC: {report['period']['start']} — {report['period']['end']}\n"
+            f"{operation}"
             f"Чистый результат собственного бота: {result}.\n"
             "Нет полного журнала исполнений и атрибуции MM2. Публичная активность не доказывает прибыль.\n"
             f"Диагностических строк: {report['diagnostics']['observed_incident_rows']}; число падений неизвестно.\n"
-            "Дальше: полный учет средств и позиций, затем проверка экономического кандидата.\n"
+            f"Первый приоритет: {report['next_actions'][0]['action']}\n"
             f"Источник: {report['report_id']}")
 
 
@@ -179,9 +250,13 @@ def main():
     parser.add_argument("--cutoff-utc", required=True)
     parser.add_argument("--timezone", default="Europe/Lisbon")
     parser.add_argument("--controller-snapshot")
+    parser.add_argument("--engine-snapshot")
+    parser.add_argument("--diagnostic-snapshot")
     args = parser.parse_args()
     report = build_report(args.bundle, cutoff_utc=args.cutoff_utc, display_timezone=args.timezone,
-                          controller=load_json(args.controller_snapshot) if args.controller_snapshot else None)
+                          controller=load_json(args.controller_snapshot) if args.controller_snapshot else None,
+                          engine=load_json(args.engine_snapshot) if args.engine_snapshot else None,
+                          diagnostic_snapshot=load_json(args.diagnostic_snapshot) if args.diagnostic_snapshot else None)
     target = Path(args.out)
     target.mkdir(parents=True, exist_ok=False)
     for name, data in (("report.json", canonical(report) + b"\n"),

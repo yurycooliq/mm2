@@ -50,7 +50,11 @@ class ControlReportTests(unittest.TestCase):
         self.assertIn("это не прибыль MM2", render_full(report))
 
     def test_full_and_telegram_views_share_cutoff_identity_and_unknown_live_result(self):
-        report = build_report(self.bundle(), cutoff_utc="2026-10-07T00:01:00Z")
+        bundle = self.bundle()
+        report = build_report(bundle, cutoff_utc="2026-10-07T00:01:00Z")
+        later = build_report(bundle, cutoff_utc="2026-10-07T00:02:00Z")
+        self.assertNotEqual(report["report_id"], later["report_id"])
+        self.assertEqual(report["packet_age_seconds"], 59)
         for text in (render_full(report), render_telegram(report)):
             self.assertIn(report["report_id"], text)
             self.assertIn(report["display_cutoff"], text)
@@ -72,6 +76,32 @@ class ControlReportTests(unittest.TestCase):
             "source_window_complete": True, "missing_cost_bound": 0, "cost_bound_records": 19}
         report = build_report(self.bundle(accounts), cutoff_utc="2026-10-07T00:01:00Z")
         self.assertEqual(report["account_observations"]["mm2-public"]["declared_event_cost_bound"]["value"], "0")
+
+    def test_allowlisted_engine_snapshot_has_time_and_never_becomes_daily_uptime_or_profit(self):
+        engine = {"captured_at_utc": "2026-10-07T00:00:30Z", "health": {"mode": "paused", "execution_mode": "simulation",
+                  "api_ready": True, "feed_ready": True, "unapproved_internal_field": "quarantined"},
+                  "geoblock": {"blocked": True, "country": "IE", "region": "L", "ip": "quarantined"}}
+        report = build_report(self.bundle(), cutoff_utc="2026-10-07T00:01:00Z", engine=engine)
+        self.assertEqual(report["engine_snapshot"]["age_seconds"], 30)
+        self.assertIn("simulation / paused", render_full(report))
+        self.assertNotIn("quarantined", str(report))
+        self.assertIsNone(report["engine_snapshot"]["current_health"])
+        self.assertIsNone(report["metrics"]["live_bot_net_pnl"]["value"])
+
+    def test_recent_diagnostics_prioritize_fatal_feed_failure_without_claiming_crashes(self):
+        capture = {"captured_at_utc": "2026-10-07T00:00:30Z", "unit": "mm2.service", "hours": 1,
+                   "systemd": {"NRestarts": "19", "private_field": "quarantined"},
+                   "incidents": [{"source": "docker_engine", "message": "diagnostic_code=feed_queue_unavailable source=binance fatal=true"}] * 10}
+        report = build_report(self.bundle(), cutoff_utc="2026-10-07T00:01:00Z", diagnostic_snapshot=capture)
+        self.assertEqual(report["recent_diagnostics"]["observed_rows"], 10)
+        self.assertEqual(report["recent_diagnostics"]["systemd"], {"NRestarts": "19"})
+        self.assertIsNone(report["recent_diagnostics"]["crash_episode_count"])
+        self.assertIn("fatal feed", report["next_actions"][0]["action"])
+        self.assertIn("NRestarts=19", render_full(report))
+        self.assertIn("fatal feed", render_telegram(report))
+        self.assertNotIn("quarantined", str(report))
+        with self.assertRaises(ResearchError):
+            build_report(self.bundle(), cutoff_utc="2026-10-07T00:00:10Z", diagnostic_snapshot=capture)
 
 
 if __name__ == "__main__":
