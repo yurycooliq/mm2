@@ -118,6 +118,24 @@ def publish(ticket, spec, gh=None):
         "remote_url": found["html_url"], "verified_body_hash": effect["body_hash"]})
 
 
+def reconcile(effect_id, gh=None):
+    """Recover a possibly committed POST without a current worker lease or any POST."""
+    gh = gh or GhClient()
+    effect = bridge({"command": "effect", "effect_id": effect_id})
+    if not effect:
+        raise ResearchError("unknown durable publication effect")
+    matches = [item for item in gh.all_issues() if f"<!-- {effect['marker']} -->" in (item.get("body") or "")]
+    if len(matches) > 1:
+        raise ResearchError("ambiguous remote markers require owner reconciliation")
+    if not matches:
+        return {"status": "WAITING_ACCESS", "effect_id": effect_id, "blind_retry_allowed": False}
+    remote_id, remote_url = _receipt(effect, matches[0])
+    confirmed = bridge({"command": "confirm", "effect_id": effect_id, "remote_id": remote_id,
+                        "remote_url": remote_url, "verified_body_hash": effect["body_hash"]})
+    resumed = bridge({"command": "wake-publication", "effect_id": effect_id})
+    return {"status": "CONFIRMED", "effect": confirmed, "parent": resumed}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -125,6 +143,7 @@ def main():
     p = commands.add_parser("pull"); p.add_argument("--stage", choices=["analysis", "reliability", "coding"], required=True)
     p = commands.add_parser("resume"); p.add_argument("--ticket", required=True)
     p = commands.add_parser("effect"); p.add_argument("--effect-id", required=True)
+    p = commands.add_parser("reconcile"); p.add_argument("--effect-id", required=True)
     p = commands.add_parser("ready-code")
     p.add_argument("--effect-id", required=True); p.add_argument("--review", required=True)
     p.add_argument("--baseline-sha", required=True); p.add_argument("--path", action="append", required=True)
@@ -141,6 +160,7 @@ def main():
         elif args.command == "pull": result = pull(args.stage)
         elif args.command == "resume": result = pull(None, args.ticket)
         elif args.command == "effect": result = bridge({"command": "effect", "effect_id": args.effect_id})
+        elif args.command == "reconcile": result = reconcile(args.effect_id)
         elif args.command == "ready-code": result = bridge({"command": "ready-code", "effect_id": args.effect_id,
             "review": load_json(args.review), "baseline_sha": args.baseline_sha, "paths": args.path})
         elif args.command == "enqueue-coding": result = bridge({"command": "enqueue-coding", "ready_id": args.ready_id})

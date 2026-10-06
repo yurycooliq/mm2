@@ -62,6 +62,8 @@ PUBLIC_FILES += (
     'research/policies/performance.json',
     'research/policies/retention.json',
     'research/prompts/analyst.md',
+    'research/prompts/automation-analysis.md',
+    'research/prompts/automation-development.md',
     'research/prompts/controller.md',
     'research/prompts/developer.md',
     'research/prompts/reviewer.md',

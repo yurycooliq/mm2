@@ -64,7 +64,8 @@ def safe_health(state):
         "fault_class": {"durability_fault", "capacity_fault", "runtime_fault", "simulation_invariant_fault",
                          "source_fault", "external_acknowledgement_unknown"},
     }.items():
-        safe[key] = state.get(key) if state.get(key) in allowed else None
+        value = state.get(key)
+        safe[key] = value if isinstance(value, str) and value in allowed else None
     diagnostics = state.get("feed_diagnostics")
     if isinstance(diagnostics, dict):
         from scripts.incident_capture import SAFE_CODES
@@ -73,15 +74,24 @@ def safe_health(state):
             item = diagnostics.get(source)
             if not isinstance(item, dict):
                 continue
-            projected = {key: value for key, value in item.items()
-                if key in {"attempts", "reconnects", "transport_disconnects", "bootstrap_timeouts",
-                    "native_snapshots_received", "native_snapshots_cutoff_dropped", "last_failure_at_mono_ms",
-                    "last_failure_fatal", "rest_cutoff_up_ms", "rest_cutoff_down_ms"}
-                and (value is None or type(value) in (int, bool))}
-            if item.get("last_failure") in SAFE_CODES:
-                projected["last_failure"] = item["last_failure"]
-            if item.get("phase") in {"idle", "connecting", "rest_refresh", "bootstrap", "streaming", "retrying", "stopped"}:
-                projected["phase"] = item["phase"]
+            def counter(value):
+                return type(value) is int and 0 <= value <= 2**64 - 1
+            projected = {key: item[key] for key in ("attempts", "transport_disconnects", "bootstrap_timeouts",
+                "backoff_resets", "retry_delay_ms", "last_failure_at_mono_ms")
+                if key in item and (counter(item[key]) or (key == "last_failure_at_mono_ms" and item[key] is None))}
+            for key in ("snapshots_seen", "snapshots_discarded_before_cutoff", "bootstrap_cutoff_exchange_ms"):
+                value = item.get(key)
+                if isinstance(value, list) and len(value) == 2 and all(counter(part) for part in value):
+                    projected[key] = list(value)
+            if type(item.get("last_failure_fatal")) is bool:
+                projected["last_failure_fatal"] = item["last_failure_fatal"]
+            failure = item.get("last_failure")
+            if isinstance(failure, str) and failure in SAFE_CODES:
+                projected["last_failure"] = failure
+            phase = item.get("phase")
+            if isinstance(phase, str) and phase in {"idle", "connecting", "rest_recovery", "awaiting_native_snapshot",
+                                                  "streaming", "retrying", "faulted", "stopped"}:
+                projected["phase"] = phase
             safe["feed_diagnostics"][source] = projected
     return safe
 

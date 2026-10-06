@@ -120,6 +120,13 @@ def git(repo, *args, maximum=MAX_OUTPUT):
                         "-c", "core.autocrlf=false", "-C", str(repo), *args], maximum=maximum)
 
 
+def branch_name(value):
+    if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,200}", value)
+            or ".." in value or "//" in value or value.endswith(("/", ".", ".lock"))):
+        raise ResearchError("named exact baseline branch required; detached or ambiguous base is blocked")
+    return value
+
+
 def preview(repo, patch_path, *, baseline_sha, issue_number, issue_spec_hash, policy_hash):
     git_sha(baseline_sha)
     sha(issue_spec_hash, "frozen issue spec hash")
@@ -136,7 +143,10 @@ def preview(repo, patch_path, *, baseline_sha, issue_number, issue_spec_hash, po
     remote = git(repo, "remote", "get-url", "origin").decode().strip()
     if remote not in {f"https://github.com/{DEFAULT_REPOSITORY}", f"https://github.com/{DEFAULT_REPOSITORY}.git", f"git@github.com:{DEFAULT_REPOSITORY}.git"}:
         raise ResearchError("source repository differs from trusted mm2 identity")
-    body = {"schema_version": 1, "baseline_sha": baseline_sha, "issue_number": issue_number,
+    baseline_branch = branch_name(git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").decode().strip())
+    if git(repo, "rev-parse", "HEAD").decode().strip() != baseline_sha:
+        raise ResearchError("named baseline branch does not point at the frozen baseline SHA")
+    body = {"schema_version": 1, "baseline_sha": baseline_sha, "baseline_branch": baseline_branch, "issue_number": issue_number,
             "issue_spec_hash": issue_spec_hash, "policy_hash": policy_hash, **patch,
             "repository": DEFAULT_REPOSITORY, "automatic_merge": False, "funded_authorization": False}
     return {**body, "proposal_id": digest(body)}
@@ -204,10 +214,13 @@ def docker_command(image, candidate, trusted, command):
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65532:65532",
             "--cpus", "1", "--memory", "768m", "--pids-limit", "128",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,uid=65532,gid=65532",
-            "--tmpfs", "/trusted/output:rw,noexec,nosuid,size=256m,uid=65532,gid=65532",
+            # Logical scratch headroom must exceed the production archive's
+            # worst-case reservation (~1.48 GiB) in fixtures. The unchanged
+            # 768 MiB cgroup memory limit still bounds actual tmpfs consumption.
+            "--tmpfs", "/trusted/output:rw,noexec,nosuid,size=2g,uid=65532,gid=65532",
             "--mount", f"type=bind,source={candidate},target=/candidate,readonly",
             "--mount", f"type=bind,source={trusted},target=/trusted,readonly",
-            "--workdir", "/candidate", "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "PYTHONPATH=/candidate",
+            "--workdir", "/trusted/output", "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "PYTHONPATH=/candidate",
             "--env", "HOME=/tmp", image, *command]
 
 
@@ -231,6 +244,22 @@ print(json.dumps({'status':'PASS','denials':['production-network','runtime-secre
 """
 
 
+TRUSTED_TEST_RUNNER = """import os,tempfile,unittest
+# Historical Windows fixtures requested a repository-local temp directory.
+# Source mounts stay immutable: relocate only those exact fixture roots into
+# bounded container scratch. Production archive/quota/path APIs are untouched.
+original_mkdtemp=tempfile.mkdtemp
+def fixture_mkdtemp(suffix=None,prefix=None,dir=None):
+ if dir is not None and os.path.normpath(os.fspath(dir)) in ('/trusted','/candidate'):
+  dir='/trusted/output'
+ return original_mkdtemp(suffix=suffix,prefix=prefix,dir=dir)
+tempfile.mkdtemp=fixture_mkdtemp
+suite=unittest.defaultTestLoader.discover('/trusted/tools/research/tests',pattern='test_*.py')
+result=unittest.TextTestRunner(verbosity=2).run(suite)
+raise SystemExit(0 if result.wasSuccessful() else 1)
+"""
+
+
 def validate(repo, prepared, snapshot_root, image, timeout=180):
     worktree = Path(prepared["worktree"])
     head = git(worktree, "rev-parse", "HEAD").decode().strip()
@@ -250,14 +279,15 @@ def validate(repo, prepared, snapshot_root, image, timeout=180):
     # Only clean tracked snapshots are mounted. No ignored output/private.env,
     # .git common directory, owner home, credentials or Docker socket exist here.
     probe = run_bounded(docker_command(image, candidate, trusted, ["python", "-B", "-c", DENIAL_PROBE]), timeout=30)
-    tests = run_bounded(docker_command(image, candidate, trusted, ["python", "-B", "-m", "unittest", "discover",
-                         "-s", "/trusted/tools/research/tests", "-p", "test_*.py", "-v"]), timeout=timeout)
+    tests = run_bounded(docker_command(image, candidate, trusted, ["python", "-B", "-c", TRUSTED_TEST_RUNNER]), timeout=timeout)
     body = {"schema_version": 1, "status": "PASS", "candidate_sha": head,
             "baseline_sha": prepared["proposal"]["baseline_sha"], "proposal_id": prepared["proposal"]["proposal_id"],
+            "baseline_branch": prepared["proposal"].get("baseline_branch"),
             "patch_hash": prepared["proposal"]["patch_hash"], "policy_hash": prepared["proposal"]["policy_hash"],
             "candidate_snapshot_hash": candidate_hash, "trusted_snapshot_hash": baseline_hash, "image": image,
             "denial_probe_output_hash": hashlib.sha256(probe).hexdigest(), "trusted_tests_output_hash": hashlib.sha256(tests).hexdigest(),
-            "check_principal": "trusted-offline-patch-broker", "suite": "frozen baseline tools/research/tests", "automatic_merge": False}
+            "check_principal": "trusted-offline-patch-broker", "suite": "frozen baseline tools/research/tests",
+            "runner_hash": hashlib.sha256(TRUSTED_TEST_RUNNER.encode()).hexdigest(), "automatic_merge": False}
     return {**body, "receipt_hash": digest(body)}
 
 
@@ -283,11 +313,29 @@ def publish_draft(prepared, receipt, *, expected_policy_hash, outbox_root, gh="g
            "baseline_sha": plan["baseline_sha"], "proposal_id": plan["proposal_id"], "patch_hash": plan["patch_hash"],
            "policy_hash": expected_policy_hash, "check_principal": "trusted-offline-patch-broker"}.items()):
         raise ResearchError("draft PR receipt belongs to another candidate/policy/run")
+    baseline_branch = branch_name(plan.get("baseline_branch"))
+    if receipt.get("baseline_branch") != baseline_branch:
+        raise ResearchError("validation receipt does not bind the exact intended baseline branch")
     worktree = Path(prepared["worktree"])
     if git(worktree, "rev-parse", "HEAD").decode().strip() != prepared["candidate_sha"]:
         raise ResearchError("head changed after validation")
     if git(worktree, "status", "--porcelain=v1").strip():
         raise ResearchError("candidate dirty after validation")
+    if git(worktree, "merge-base", plan["baseline_sha"], prepared["candidate_sha"]).decode().strip() != plan["baseline_sha"]:
+        raise ResearchError("candidate is not descended from its exact frozen baseline")
+    changed = git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", plan["baseline_sha"], prepared["candidate_sha"]).decode().splitlines()
+    if not changed or sorted(changed) != sorted(plan["paths"]):
+        raise ResearchError("candidate includes changes outside the frozen patch scope")
+    for path in changed:
+        allowed_path(path)
+
+    def verify_remote_base():
+        lines = git(worktree, "ls-remote", "--heads", "origin", f"refs/heads/{baseline_branch}").decode().splitlines()
+        expected = f"{plan['baseline_sha']}\trefs/heads/{baseline_branch}"
+        if lines != [expected]:
+            raise ResearchError("remote intended baseline is missing, ambiguous or changed; never fall back to main")
+
+    verify_remote_base()
     outbox = Path(outbox_root).absolute()
     for parent in (outbox, *outbox.parents):
         if parent.exists() and parent.is_symlink():
@@ -298,14 +346,15 @@ def publish_draft(prepared, receipt, *, expected_policy_hash, outbox_root, gh="g
     # A stable branch is the external idempotency key; enumerate all PR states
     # before any POST. Unknown gh response requires this reconciliation again.
     prior = run_bounded([gh, "pr", "list", "--repo", DEFAULT_REPOSITORY, "--state", "all", "--head", prepared["branch"],
-                         "--json", "url,headRefOid,state", "--limit", "100"])
+                         "--json", "url,headRefOid,baseRefName,baseRefOid,state", "--limit", "100"])
     import json
     matches = json.loads(prior)
     if len(matches) > 1:
         raise ResearchError("duplicate proposal PRs need reconciliation")
     if matches:
-        if matches[0].get("headRefOid") != prepared["candidate_sha"]:
-            raise ResearchError("existing remote PR head differs from validated candidate")
+        if (matches[0].get("headRefOid") != prepared["candidate_sha"] or matches[0].get("baseRefName") != baseline_branch
+                or matches[0].get("baseRefOid") != plan["baseline_sha"]):
+            raise ResearchError("existing remote PR head/base differs from the exact validated candidate/baseline")
         result = {"status": "CONFIRMED", "url": matches[0]["url"], "candidate_sha": prepared["candidate_sha"],
                   "receipt_hash": receipt["receipt_hash"], "attach_artifact_required": True}
         _durable_file(outbox / f"{prefix}.confirmed.json", result)
@@ -319,21 +368,32 @@ def publish_draft(prepared, receipt, *, expected_policy_hash, outbox_root, gh="g
             "Financial/production code, policy and CI are outside this patch scope. Independent human review remains required.\n")
     request = {"proposal_id": prefix, "candidate_sha": prepared["candidate_sha"], "branch": prepared["branch"],
                "receipt_hash": receipt["receipt_hash"], "body": text, "title": f"Research proposal #{plan['issue_number']}",
-               "repository": DEFAULT_REPOSITORY, "draft": True, "base": "main"}
+               "repository": DEFAULT_REPOSITORY, "draft": True, "base": baseline_branch, "base_sha": plan["baseline_sha"]}
     _durable_file(outbox / f"{prefix}.prepared.json", request)
     git(worktree, "push", "origin", f"{prepared['candidate_sha']}:refs/heads/{prepared['branch']}")
+    verify_remote_base()
     with tempfile.TemporaryDirectory(prefix="mm2-pr-body-") as temp:
         body_file = Path(temp) / "body.md"
         body_file.write_text(text, encoding="utf-8")
         _durable_file(dispatched_path, {"request_hash": digest(request), "candidate_sha": prepared["candidate_sha"]})
         try:
-            url = run_bounded([gh, "pr", "create", "--repo", DEFAULT_REPOSITORY, "--draft", "--base", "main",
+            url = run_bounded([gh, "pr", "create", "--repo", DEFAULT_REPOSITORY, "--draft", "--base", baseline_branch,
                               "--head", prepared["branch"], "--title", f"Research proposal #{plan['issue_number']}",
                               "--body-file", str(body_file)]).decode().strip()
         except ResearchError:
             return {"status": "UNKNOWN", "branch": prepared["branch"], "blind_retry_allowed": False}
     if not re.fullmatch(r"https://github.com/yurycooliq/mm2/pull/[0-9]+", url):
         raise ResearchError("draft PR response unknown; reconcile stable branch")
+    try:
+        observed = json.loads(run_bounded([gh, "pr", "view", url, "--repo", DEFAULT_REPOSITORY,
+                                          "--json", "headRefOid,baseRefName,baseRefOid"]))
+        if (observed.get("headRefOid") != prepared["candidate_sha"] or observed.get("baseRefName") != baseline_branch
+                or observed.get("baseRefOid") != plan["baseline_sha"]):
+            return {"status": "WAITING_REVIEW", "url": url, "reason": "remote PR head or baseline changed",
+                    "blind_retry_allowed": False, "attach_artifact_required": True}
+    except (ResearchError, ValueError, TypeError):
+        return {"status": "UNKNOWN", "url": url, "branch": prepared["branch"], "blind_retry_allowed": False,
+                "attach_artifact_required": True}
     result = {"status": "CONFIRMED", "url": url, "candidate_sha": prepared["candidate_sha"],
               "receipt_hash": receipt["receipt_hash"], "attach_artifact_required": True}
     _durable_file(outbox / f"{prefix}.confirmed.json", result)

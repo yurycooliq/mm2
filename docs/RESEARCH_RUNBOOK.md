@@ -48,6 +48,43 @@ revoked credentials produce waiting states, not fictitious completed analysis.
 Notify only meaningful findings/failures/owner actions; daily reports require a
 separate owner request. No model runs on the trading host.
 
+Two independent native schedules use the complete task prompts in
+`research/prompts/automation-analysis.md` (hourly reliability/analysis queue poll)
+and `research/prompts/automation-development.md` (review/coding every two hours).
+Each pins Astra/max in native settings. Polling cadence is separate from the
+controller's six-hour frozen analysis window; an idle hourly run creates no issue
+or report. Review may prepare evidence under A0, while coding waits for current
+A1 policy and actual sandbox/independent-broker receipts. A second model context
+is not a GitHub approval or a self-issued check principal.
+The trusted native settings view is sufficient configuration proof; cryptographic
+provider attestation is not required. Record available execution metadata honestly
+and fail closed on missing settings, unavailable selected model or reported
+settings mismatch. A ticket declaration alone is not the native settings view.
+
+The bridge grants 1800-second leases; renew at least every ten minutes and before
+external effects. Original tickets/checkpoints remain immutable: save renewal
+replies separately and obey current server generation. Preserve analysis/spec
+artifact hashes and paths, source bundle/policy hashes, effect identity and exact
+confirmed publication receipt in job completion so the other schedule can review
+the frozen proposal. Retained local specs must match those hashes. Missing frozen
+specs or missing independent receipt means WAITING_DATA/REVIEW, not reconstruction
+from mutable issue prose. Missing actual model/sandbox proof means WAITING_RESOURCE.
+Unknown publication effects require broker reconciliation; never retry a POST or
+mark the job successful while its effect remains unresolved. If the current
+bridge cannot perform a needed recovery/read-only operation, retain the waiting
+state and exact artifacts for the trusted broker.
+
+`status` returns frozen `confirmed_effects` and `ready_code` registry items.
+`effect --effect-id ID` returns the confirmed outbox plus frozen issue-spec/hash,
+parent input references/hash and original source policy. `reconcile --effect-id ID`
+requires no lease and never POSTs: it checks current exact GitHub marker/body,
+including closed issues, confirms the effect and performs a scoped wake only for
+its WAITING_ACCESS parent after CONFIRMED. Negative visibility remains waiting.
+The independent schedule uses exactly the policy-configured principal
+`mm2-independent-review-<nativeAutomationId>` only after its native ID/settings
+and separate review context match trusted configuration. Verified receipt flags
+record actual broker/spec checks; they are not GitHub required approvals.
+
 GitHub publication uses an exact immutable marker/body, a durable fenced outbox
 and reconciliation. An unknown POST is never blindly retried. Issues require
 facts, unknowns, hypothesis/alternative, mechanism, target metric, concrete files,
@@ -63,6 +100,15 @@ an exact offline container with no production/home mounts, credentials or Docker
 socket, read-only source, non-root UID and resource caps. Trusted baseline tests
 are mounted separately. A real denial probe and exact SHA receipt are mandatory.
 The broker can publish a draft PR; automatic merge/deployment are disabled.
+`ready-code` binds the CONFIRMED source effect, frozen spec, source/current policy,
+exact clean baseline, reviewed paths and a real independent broker receipt.
+`enqueue-coding` accepts only that registry item under A1; arbitrary issues/labels
+grant no coding capability. Patch broker `preview`, `prepare`, `validate` and
+`publish-draft` are described with their exact commands in the development
+automation prompt. Candidate code runs only inside its pinned offline container;
+dirty owner checkout or advanced baseline pauses preparation without stashing or
+resetting anyone's work. Current autonomous patch scope excludes executor,
+financial permissions, CI, policy and broker self-modification.
 
 ## Diagnostics and retention
 

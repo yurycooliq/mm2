@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from scripts import research_bridge, research_desktop
 from tools.research.archive import publish_bundle, verify_bundle
-from tools.research.controller import DEFAULT_POLICY, enqueue, load_policy
+from tools.research.controller import DEFAULT_POLICY, enqueue, load_policy, prepare_draft
+from tools.research.github import REQUIRED_SECTIONS
 from tools.research.jobs import JobStore
 from tools.research.schema import ResearchError, canonical, digest, load_json
 
@@ -33,6 +34,22 @@ class DesktopBridgeTest(unittest.TestCase):
 
     def claim(self):
         return self.request("claim", stage="analysis", owner="desktop", run_id="run-1", model="gpt-6-astra", reasoning="max")["ticket"]
+
+    def effect(self, unknown=False):
+        ticket = self.claim()
+        spec = {"schema_version": 1, "policy_hash": self.policy_hash, "title": "Fixture bounded diagnostics",
+                "scope": {"account_id": "owner", "lane": "shadow", "component": "diagnostics"},
+                "failure_family": "fixture", "version_epoch": "epoch-fixture", "mechanism_id": "bounded-stage",
+                "evidence": [{"bundle_id": self.manifest["bundle_id"], "artifact": "facts.json", "sha256": self.manifest["files"][0]["sha256"]}],
+                "labels": ["needs-evidence"], "sections": {name: "Test fixture only; bounded evidence and no economic claim." for name in REQUIRED_SECTIONS}}
+        with JobStore(self.state / "jobs.sqlite3") as store:
+            effect = prepare_draft(store, ticket, spec, self.policy, self.policy_hash)
+            if unknown:
+                store.dispatch_publication(ticket, effect["id"])
+                store.publication_unknown(effect["id"])
+            else:
+                store.confirm_publication(effect["id"], "9", "https://github.com/yurycooliq/mm2/issues/9", effect["body_hash"])
+        return ticket, effect, spec
 
     def test_overlapping_bridge_claims_and_no_model_fallback(self):
         first = self.claim()
@@ -75,6 +92,61 @@ class DesktopBridgeTest(unittest.TestCase):
         with patch.object(research_desktop, "bridge", return_value=effect):
             with self.assertRaises(ResearchError):
                 research_desktop.publish({}, {}, Client())
+
+    def test_server_effect_context_and_status_recover_frozen_review_inputs(self):
+        ticket, effect, spec = self.effect()
+        recovered = self.request("effect", effect_id=effect["id"])
+        self.assertEqual(recovered["issue_spec"], spec)
+        self.assertEqual(recovered["issue_spec_hash"], digest(spec))
+        self.assertEqual(recovered["parent_inputs"], ticket["inputs"])
+        self.assertEqual(recovered["parent_inputs_hash"], ticket["inputs_hash"])
+        status = self.request("status")
+        self.assertEqual(status["confirmed_effects"][0]["id"], effect["id"])
+
+    def test_ready_code_bridge_passes_keyword_contract_and_exposes_registry(self):
+        ticket, effect, spec = self.effect()
+        review = {"effect_id": effect["id"], "body_hash": effect["body_hash"], "spec_hash": digest(spec),
+                  "source_policy_hash": self.policy_hash, "policy_hash": self.policy_hash, "baseline_sha": "b" * 40,
+                  "paths": ["tools/research/example.py"], "status": "PASS", "broker_verified": True,
+                  "principal": "trusted-research-review-broker", "model": "gpt-6-astra", "actual_settings_verified": True,
+                  "artifact_hash": "c" * 64}
+        ready = self.request("ready-code", effect_id=effect["id"], review=review, baseline_sha="b" * 40, paths=review["paths"])
+        status = self.request("status")
+        self.assertEqual(status["ready_code"][0]["ready_id"], ready["ready_id"])
+        self.assertEqual(status["ready_code"][0]["issue_number"], 9)
+        with self.assertRaises(ResearchError):
+            self.request("ready-code", effect_id=effect["id"], review={**review, "principal": "desktop"}, baseline_sha="b" * 40, paths=review["paths"])
+
+    def test_unknown_reconciliation_is_lease_independent_and_never_resends(self):
+        ticket, effect, spec = self.effect(unknown=True)
+        with self.assertRaises(ResearchError):
+            self.request("wake-publication", effect_id=effect["id"])
+        remote = {**effect["body"], "number": 9, "html_url": "https://github.com/yurycooliq/mm2/issues/9", "state": "closed"}
+        class Client:
+            def all_issues(self):
+                return [remote]
+            def create_issue(self, _):
+                raise AssertionError("reconciliation must never POST")
+        def remote_bridge(payload):
+            return research_bridge.handle({"schema_version": 1, **payload}, self.config)
+        with patch.object(research_desktop, "bridge", side_effect=remote_bridge):
+            result = research_desktop.reconcile(effect["id"], Client())
+        self.assertEqual(result["status"], "CONFIRMED")
+        self.assertEqual(result["parent"]["job"]["status"], "PENDING")
+        self.assertIsNotNone(self.claim())
+
+    def test_negative_remote_visibility_leaves_unknown_parent_waiting(self):
+        ticket, effect, _ = self.effect(unknown=True)
+        class Client:
+            def all_issues(self):
+                return []
+            def create_issue(self, _):
+                raise AssertionError("no retry allowed")
+        with patch.object(research_desktop, "bridge", side_effect=lambda payload: research_bridge.handle({"schema_version": 1, **payload}, self.config)):
+            result = research_desktop.reconcile(effect["id"], Client())
+        self.assertEqual(result["status"], "WAITING_ACCESS")
+        self.assertFalse(result["blind_retry_allowed"])
+        self.assertIsNone(self.claim())
 
 
 if __name__ == "__main__":
