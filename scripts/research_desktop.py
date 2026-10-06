@@ -173,7 +173,7 @@ def main():
                 if args.command == "checkpoint": payload["name"] = args.name
                 if args.command == "complete": payload["status"] = args.status
                 result = bridge(payload)
-        print(canonical(result).decode()); return 0
+        sys.stdout.buffer.write(canonical(result) + b"\n"); return 0
     except Exception:
         print("research_desktop_operation_failed; preserve immutable tickets/receipts and inspect scoped controller status", file=sys.stderr)
         return 1
