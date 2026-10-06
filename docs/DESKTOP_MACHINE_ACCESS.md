@@ -18,6 +18,10 @@ policy. Account/region are resolved from deployment; the default research instan
 was verified from the existing scoped configuration. Deployment requires a reviewed
 CA's **public** PEM and certificate enrollment. No CA, key, profile, IAM role or
 trust was created or activated while preparing the template.
+Validate with cfn-lint, AWS validate-template and `infra/aws/desktop-access.guard`.
+Guard checks default-disabled access, short sessions, exact transport scope and
+certificate/anchor trust. It does not replace resolved-policy simulation or
+certificate/session-name acceptance against the enrolled identity.
 
 ## Enrollment and acceptance
 

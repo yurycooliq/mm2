@@ -1,0 +1,35 @@
+rule disabled_until_enrollment {
+  Parameters.EnableMachineAccess.Default == "false"
+  Resources.WorkerTrustAnchor.Properties.Enabled.'Fn::If'[0] == "MachineAccessEnabled"
+  Resources.WorkerTrustAnchor.Properties.Enabled.'Fn::If'[2] == false
+  Resources.WorkerProfile.Properties.Enabled.'Fn::If'[0] == "MachineAccessEnabled"
+  Resources.WorkerProfile.Properties.Enabled.'Fn::If'[2] == false
+}
+
+rule short_machine_sessions {
+  Resources.WorkerRole.Properties.MaxSessionDuration == 3600
+  Resources.WorkerProfile.Properties.DurationSeconds == 1800
+}
+
+rule research_transport_only {
+  Resources.WorkerRole.Properties.ManagedPolicyArns !exists
+  Resources.WorkerRole.Properties.Policies[1] !exists
+  Resources.WorkerRole.Properties.Policies[0].PolicyDocument.Statement[2] !exists
+  Resources.WorkerRole.Properties.Policies[0].PolicyDocument.Statement[0].Action == "ssm:StartSession"
+  Resources.WorkerRole.Properties.Policies[0].PolicyDocument.Statement[0].Resource[0].'Fn::Sub' == 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${ResearchInstanceId}'
+  Resources.WorkerRole.Properties.Policies[0].PolicyDocument.Statement[0].Resource[1].'Fn::Sub' == 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartSSHSession'
+  Resources.WorkerRole.Properties.Policies[0].PolicyDocument.Statement[0].Resource[2] !exists
+  Resources.WorkerRole.Properties.Policies[0].PolicyDocument.Statement[1].Action == ["ssm:TerminateSession", "ssm:ResumeSession"]
+  Resources.WorkerRole.Properties.Policies[0].PolicyDocument.Statement[1].Resource.'Fn::Sub' == 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:session/${!aws:userid}-*'
+}
+
+rule bind_anchor_and_certificate_identity {
+  Resources.WorkerRole.Properties.AssumeRolePolicyDocument.Statement[1] !exists
+  Resources.WorkerRole.Properties.AssumeRolePolicyDocument.Statement[0].Principal.Service == "rolesanywhere.amazonaws.com"
+  Resources.WorkerRole.Properties.AssumeRolePolicyDocument.Statement[0].Action == ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]
+  Resources.WorkerRole.Properties.AssumeRolePolicyDocument.Statement[0].Condition.ArnEquals.'aws:SourceArn'.'Fn::GetAtt' == ["WorkerTrustAnchor", "TrustAnchorArn"]
+  Resources.WorkerRole.Properties.AssumeRolePolicyDocument.Statement[0].Condition.StringEquals.'aws:SourceAccount'.Ref == "AWS::AccountId"
+  Resources.WorkerRole.Properties.AssumeRolePolicyDocument.Statement[0].Condition.StringEquals.'aws:PrincipalTag/x509Subject/CN'.Ref == "WorkerCommonName"
+  Resources.WorkerRole.Properties.AssumeRolePolicyDocument.Statement[0].Condition.StringEquals.'aws:PrincipalTag/x509Issuer/CN'.Ref == "IssuerCommonName"
+  Resources.WorkerRole.Properties.AssumeRolePolicyDocument.Statement[0].Condition.StringEquals.'sts:SourceIdentity'.Ref == "WorkerCommonName"
+}

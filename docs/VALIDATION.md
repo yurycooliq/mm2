@@ -1,5 +1,40 @@
 # Validation evidence
 
+## Owner-directed recovery checkpoint: October 7, 2026 (Lisbon)
+
+The recovery candidate addresses Telegram launch-data expiry with a live bound
+session, missing cost declarations, per-window diagnostic context and control
+reporting. Queue overflow and a closed consumer now have distinct fixed diagnostic
+codes; queue size, whole-frame reservation, fault latching and stopping behavior
+are unchanged. This diagnostic change does not claim to fix production restarts.
+
+Verified application revision at this checkpoint:
+`458764d2aaa99b1a568e10c86b3bc329ef4b1117`, based on `66ec7df`.
+Subsequent documentation/guard changes do not replace exact-revision CI evidence.
+See [draft PR 5](https://github.com/yurycooliq/mm2/pull/5) for final-head check status.
+
+| Check | Confirmed scope |
+| --- | --- |
+| Python CI | 414 passed: console 80, data 21, latency 34, ops 140, research 139. Pinned Python 3.13; root-required atomic-runtime fixtures executed in CI. |
+| Offline isolation | 359 candidate tests: 348 passed, 11 root-only skips. Separately mounted unchanged baseline: 128 passed. Real network/source-write/home/credentials/Docker-socket denial probes passed. This is owner-directed validation, not an independent broker receipt. |
+| Dashboard and parity | Dashboard 16 tests and production build passed; 19 reference and 6 strategy parity checks passed in CI. |
+| Rendered UI | Local Playwright API fixtures, desktop 1280×800 and mobile 390×844: expiry/reopen rendering, no relevant browser errors or width overflow, pending identity preserved, zero control/limits submissions. Not real Telegram acceptance. |
+| AWS preparation | Read-only STS/access preflight verified after authorized human login. Disabled Roles Anywhere/SSM template passed AWS validate-template and cfn-lint 1.57.1; cfn-guard 3.2.1 checks default-disabled state, bounded sessions, exact transport actions/resources and certificate/anchor identity. No resources deployed. |
+| Rust and containers | Locked workspace format/Clippy/tests/release and real container smoke remain required; final-head CI runs and their individual receipts in PR 5 are the authority. Do not infer these results from Python or UI passes. |
+
+Production remained `e294475`, simulation paused, at the 23:50:10 UTC October 6
+read-only snapshot. Both public feeds were streaming, `live_eligible=false` and
+venue host geoblock reported `blocked=true` (IE/L). Bounded diagnosis observed
+NRestarts 19 then 20 and fatal Binance `feed_queue_unavailable` rows; legacy codes
+cannot distinguish overflow from closed consumer or establish historical causality.
+
+Windows archive publication WinError 5 remains unresolved. Independent final-head
+review, paused rollout/state preservation, real Telegram Desktop long-session
+acceptance, machine certificate enrollment/renewal/revocation, venue eligibility,
+full authenticated MM2 attribution/accounting, economic holdout and funded canary
+remain separate gates. No automatic merge, state reset, approvals or trading
+activation occurred. Prior checkpoints below remain dated historical evidence.
+
 ## Current checkpoint: October 6, 2026 — Builder Relayer and existing CLOB setup
 
 The Relayer now accepts exactly one complete owner key/address pair or Builder
