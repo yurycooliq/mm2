@@ -78,7 +78,7 @@ class ControlReportTests(unittest.TestCase):
         self.assertEqual(report["account_observations"]["mm2-public"]["declared_event_cost_bound"]["value"], "0")
 
     def test_allowlisted_engine_snapshot_has_time_and_never_becomes_daily_uptime_or_profit(self):
-        engine = {"captured_at_utc": "2026-10-07T00:00:30Z", "health": {"mode": "paused", "execution_mode": "simulation",
+        engine = {"captured_at_utc": "2026-10-07T00:00:30+00:00", "health": {"mode": "paused", "execution_mode": "simulation",
                   "api_ready": True, "feed_ready": True, "unapproved_internal_field": "quarantined"},
                   "geoblock": {"blocked": True, "country": "IE", "region": "L", "ip": "quarantined"}}
         report = build_report(self.bundle(), cutoff_utc="2026-10-07T00:01:00Z", engine=engine)

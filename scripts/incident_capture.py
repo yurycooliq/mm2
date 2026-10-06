@@ -84,6 +84,11 @@ def classify(message: str) -> str:
 
 def diagnostic_message(raw: str) -> str:
     """Only fixed diagnostic codes leave the host; arbitrary log text is quarantined."""
+    # Export/report layers may project an already sanitized incident again.
+    # Preserve only this exact fixed-code grammar, never append arbitrary text.
+    fixed = re.fullmatch(r"diagnostic_code=([a-z_]+)(?: source=(clob|binance))?(?: fatal=(true|false))?", raw)
+    if fixed and fixed.group(1) in SAFE_CODES:
+        return raw
     start = raw.find("{")
     if start >= 0:
         try:

@@ -16,6 +16,13 @@ def metric(value, unit, lane, quality, reason, source, population, count=None):
             "source_refs": [source], "population": population, "sample_count": count}
 
 
+def snapshot_utc(value):
+    # Python collectors use +00:00; archive contracts use Z. Both are explicit UTC.
+    if isinstance(value, str) and value.endswith("+00:00"):
+        value = value[:-6] + "Z"
+    return utc(value)
+
+
 def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", controller=None, engine=None, diagnostic_snapshot=None):
     manifest = verify_bundle(bundle)
     if manifest["scope"].get("kind") != "research-packet" or manifest["scope"].get("lane") != "public-benchmark":
@@ -94,7 +101,7 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
                                  "reason": "SNAPSHOT_CAPTURE_TIME_AND_HEARTBEAT_COVERAGE_REQUIRED",
                                  "retained_mode": health.get("mode") if isinstance(health, dict) else None}
     if controller is not None:
-        observed = utc(controller["captured_at_utc"])
+        observed = snapshot_utc(controller["captured_at_utc"])
         if observed > cutoff:
             raise ResearchError("controller snapshot postdates cutoff")
         health = controller["status"].get("service_health", {})
@@ -107,7 +114,7 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
         report["sources"]["controller"] = {"kind": "captured_read_only_controller_status",
                                            "sha256": hashlib.sha256(canonical(controller)).hexdigest()}
     if engine is not None:
-        observed = utc(engine["captured_at_utc"])
+        observed = snapshot_utc(engine["captured_at_utc"])
         if observed > cutoff:
             raise ResearchError("engine snapshot postdates cutoff")
         from scripts.research_export import safe_health
@@ -121,7 +128,7 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
         report["sources"]["engine"] = {"kind": "allowlisted_authenticated_cached_engine_snapshot",
                                        "sha256": hashlib.sha256(canonical(engine)).hexdigest()}
     if diagnostic_snapshot is not None:
-        observed = utc(diagnostic_snapshot["captured_at_utc"])
+        observed = snapshot_utc(diagnostic_snapshot["captured_at_utc"])
         if observed > cutoff:
             raise ResearchError("diagnostic snapshot postdates cutoff")
         from scripts.research_export import safe_diagnostics

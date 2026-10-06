@@ -7,6 +7,13 @@ from incident_capture import MAX_BYTES, bounded_command, collect, diagnostic_mes
 
 
 class IncidentCaptureTests(unittest.TestCase):
+    def test_fixed_diagnostic_projection_is_idempotent_without_arbitrary_suffixes(self):
+        safe = "diagnostic_code=feed_queue_unavailable source=binance fatal=true"
+        self.assertEqual(diagnostic_message(safe), safe)
+        hostile = safe + " token=SECRET_CANARY"
+        self.assertEqual(diagnostic_message(hostile), "diagnostic_code=feed_queue_unavailable")
+        self.assertEqual(diagnostic_message("diagnostic_code=unknown_private_code source=binance fatal=true"), "")
+
     def test_private_values_and_url_paths_are_removed(self):
         private = "token=secret-value https://polygon-mainnet.g.alchemy.com/v2/private-url 123456789:" + "a" * 35
         private += " 0x" + "b" * 64 + " MM2_POLY_PRIVATE_KEY=private-wallet"
