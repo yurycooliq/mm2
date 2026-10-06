@@ -184,6 +184,30 @@ def display(metric_value):
     return str(value)
 
 
+REASON_TEXT = {
+    "ACTUAL_TRADE_FEES_UNKNOWN": "Не подтверждены фактические комиссии сделок",
+    "CASH_UNKNOWN": "Не подтвержден остаток денежных средств",
+    "CLOSING_SNAPSHOT_NOT_AT_WINDOW_BOUNDARY": "Конечный срез не совпадает с границей периода",
+    "CLOSING_STATE_UNVERIFIED": "Не подтверждено состояние счета в конце периода",
+    "COMPLETE_SET_TOKEN_MAPPING_REQUIRED": "Нужно сопоставить парные токены рынка",
+    "CONDITIONAL_POSITION_VALUATION": "Оценка открытых позиций зависит от неподтвержденных условий",
+    "EVENT_ACCOUNTING_AUTHORITY_UNPROVEN": "Нет первичного подтверждения финансовых событий",
+    "OPENING_STATE_UNKNOWN": "Не известно состояние счета в начале периода",
+    "PROFILE_ATTRIBUTION_REVERIFY_REQUIRED": "Нужно повторно подтвердить связь профиля и счета",
+    "PUBLIC_ACTIVITY_NOT_CANONICAL_RECEIPT": "Публичная активность не заменяет подтверждения исполнений",
+    "PUBLIC_ACTIVITY_RECONCILIATION_REQUIRED": "Публичные события еще не сверены с финансовым журналом",
+    "PUBLIC_CASH_UNKNOWN": "Публичный источник не подтверждает денежный остаток",
+    "PUBLIC_OWNER_ACTIVITY_MM2_ATTRIBUTION_UNPROVEN": "Не доказано, что действия счета совершил MM2",
+    "SNAPSHOT_MISSING": "Отсутствует необходимый срез счета",
+    "SOURCE_FINANCIAL_COMPLETENESS_UNPROVEN": "Полнота финансовых данных не подтверждена",
+    "STARTING_CAPITAL_UNKNOWN": "Не подтвержден начальный капитал",
+    "MM2_ORDER_INTENT_ATTRIBUTION_REQUIRED": "Исполнения нужно связать с заявками собственного бота",
+    "REDEMPTION_FINALITY_UNVERIFIED": "Не подтверждено окончательное погашение позиций",
+    "REDEMPTION_TOKEN_MAPPING_REQUIRED": "Погашение нужно сопоставить с токенами",
+    "REPORTED_PRICE_NOT_NATIVE_MICRO_ALIGNED": "Цена источника не соответствует точности площадки",
+}
+
+
 def render_full(report):
     rows = ["# MM2: контрольный отчет", "",
             f"Период UTC: {report['period']['start']} — {report['period']['end']} (правая граница исключена).",
@@ -202,7 +226,10 @@ def render_full(report):
                  f"Граница заявленных затрат: {display(item['declared_event_cost_bound'])}.",
                  f"Известная часть границ затрат: {display(item['observed_cost_bound_subtotal'])}.",
                  f"Наблюденные события: {display(item['observed_activity_events'])}; не число сделок собственного бота.",
-                 "Причины неполноты: " + (", ".join(item["reasons"]) or "отсутствие атрибуции собственному боту") + "."]
+                 "Причины неполноты:"]
+        rows += ["- " + REASON_TEXT.get(reason, "Не пройден контроль данных: " + reason) + "." for reason in item["reasons"]]
+        if not item["reasons"]:
+            rows.append("- Не подтверждена связь событий с собственным ботом.")
     diag = report["diagnostics"]
     snapshot = report["engine_snapshot"]
     engine_text = "Состояние engine неизвестно: нужен timestamp; суточная доступность требует полного heartbeat interval."
