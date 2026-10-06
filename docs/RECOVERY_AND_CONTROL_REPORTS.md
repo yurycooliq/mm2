@@ -9,6 +9,11 @@ or a funded authorization. Keep the original checkout clean for existing jobs.
 - Backfilled diagnostic windows retain their own sanitized lifecycle context.
   Missing old counters/capture timestamps remain unknown. Current metadata does
   not identify the revision or cause of historical incidents.
+- Future engine diagnostics distinguish `feed_queue_overflow` from
+  `feed_consumer_closed`. Old `feed_queue_unavailable` rows remain ambiguous.
+  Whole-frame reservation, fault latching, queue capacities and stopping behavior
+  are unchanged. This exposes evidence for a subsequent throughput/root-cause fix;
+  it does not claim to have eliminated the observed production restarts.
 - Accounting exposes observed cost-bound subtotal separately. A complete declared
   bound requires complete source-window evidence and an explicit bound (including
   true zero) on every reconciled event. Legacy absent declarations and non-trade

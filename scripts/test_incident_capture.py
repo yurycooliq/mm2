@@ -13,6 +13,11 @@ class IncidentCaptureTests(unittest.TestCase):
         hostile = safe + " token=SECRET_CANARY"
         self.assertEqual(diagnostic_message(hostile), "diagnostic_code=feed_queue_unavailable")
         self.assertEqual(diagnostic_message("diagnostic_code=unknown_private_code source=binance fatal=true"), "")
+        for code in ("feed_queue_overflow", "feed_consumer_closed"):
+            raw = json.dumps({"level": "WARN", "fields": {"code": code, "source": "binance", "fatal": True, "private_value": "SECRET_CANARY"}})
+            safe = "diagnostic_code=" + code + " source=binance fatal=true"
+            self.assertEqual(diagnostic_message(raw), safe)
+            self.assertEqual(diagnostic_message(safe), safe)
 
     def test_private_values_and_url_paths_are_removed(self):
         private = "token=secret-value https://polygon-mainnet.g.alchemy.com/v2/private-url 123456789:" + "a" * 35

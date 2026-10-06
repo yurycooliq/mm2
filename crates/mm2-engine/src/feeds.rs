@@ -140,7 +140,8 @@ fn failure_code(reason: &str, fatal: bool) -> u8 {
         | "public recovery heartbeat send failed"
         | "public pong send failed"
         | "public subscription send failed" => 6,
-        "feed queue overflow" | "feed consumer closed" => 7,
+        "feed queue overflow" => 16,
+        "feed consumer closed" => 17,
         "public WebSocket exceeds capacity limit" | "public REST book exceeds 256 KiB" => 8,
         "invalid public WebSocket protocol" | "unsupported public WebSocket frame" => 9,
         reason if reason.contains("tick") => 12,
@@ -188,6 +189,8 @@ fn failure_name(code: u8) -> Option<&'static str> {
         13 => Some("invalid_exchange_clock"),
         14 => Some("invalid_market_identity"),
         15 => Some("invalid_book_input"),
+        16 => Some("feed_queue_overflow"),
+        17 => Some("feed_consumer_closed"),
         _ => Some("transport_unavailable"),
     }
 }
@@ -1366,6 +1369,28 @@ mod transport_tests {
         assert!(!exported.contains("private response"));
     }
 
+    #[test]
+    fn queue_full_and_closed_have_distinct_codes_without_partial_frames() {
+        let event = || FeedEvent::Disconnect {
+            source: FeedSource::Binance,
+            reason: "test frame".into(),
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let (fault, observed) = watch::channel(None);
+        let reason = enqueue_frame(&tx, vec![event(), event()], &fault).unwrap_err();
+        assert_eq!(reason, "feed queue overflow");
+        assert_eq!(input_failure_class(&reason), "feed_queue_overflow");
+        assert_eq!(observed.borrow().as_deref(), Some("feed queue overflow"));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        let (fault, observed) = watch::channel(None);
+        let reason = enqueue_frame(&tx, vec![event()], &fault).unwrap_err();
+        assert_eq!(reason, "feed consumer closed");
+        assert_eq!(input_failure_class(&reason), "feed_consumer_closed");
+        assert_eq!(observed.borrow().as_deref(), Some("feed consumer closed"));
+        assert_eq!(failure_name(7), Some("feed_queue_unavailable"));
+    }
+
     #[tokio::test]
     async fn stable_native_stream_resets_backoff_after_consecutive_failed_connections() {
         let selected = market();
@@ -1947,7 +1972,7 @@ mod transport_tests {
         );
         assert_eq!(state.borrow().as_deref(), Some("feed queue overflow"));
         let sample = observed.snapshot();
-        assert_eq!(sample.clob.last_failure, Some("feed_queue_unavailable"));
+        assert_eq!(sample.clob.last_failure, Some("feed_queue_overflow"));
         assert!(sample.clob.last_failure_fatal);
         assert_eq!(sample.clob.phase, "faulted");
         assert_eq!(sample.clob.attempts, 1);
