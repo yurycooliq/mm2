@@ -16,7 +16,9 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig},
+    tungstenite::{
+        Error as WebSocketError, Message, error::ProtocolError, protocol::WebSocketConfig,
+    },
 };
 
 pub const CLOB_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -28,6 +30,148 @@ const MAX_MEMBERS: usize = 4096;
 const MAX_DEPTH: usize = 10_000;
 const UINT256_MAX: &str =
     "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+const UNCLEAN_WEBSOCKET_CLOSE: &str = "public WebSocket closed without closing handshake";
+// Append-only fixed categories: never format protocol variants or retain their
+// headers, payloads, URLs or nested error messages in secondary diagnostics.
+const PROTOCOL_FAILURES: [(&str, &str); 26] = [
+    (
+        "invalid public WebSocket protocol: wrong_http_method",
+        "websocket_protocol_wrong_http_method",
+    ),
+    (
+        "invalid public WebSocket protocol: wrong_http_version",
+        "websocket_protocol_wrong_http_version",
+    ),
+    (
+        "invalid public WebSocket protocol: missing_connection_upgrade",
+        "websocket_protocol_missing_connection_upgrade",
+    ),
+    (
+        "invalid public WebSocket protocol: missing_websocket_upgrade",
+        "websocket_protocol_missing_websocket_upgrade",
+    ),
+    (
+        "invalid public WebSocket protocol: missing_websocket_version",
+        "websocket_protocol_missing_websocket_version",
+    ),
+    (
+        "invalid public WebSocket protocol: missing_websocket_key",
+        "websocket_protocol_missing_websocket_key",
+    ),
+    (
+        "invalid public WebSocket protocol: accept_key_mismatch",
+        "websocket_protocol_accept_key_mismatch",
+    ),
+    (
+        "invalid public WebSocket protocol: subprotocol",
+        "websocket_protocol_subprotocol",
+    ),
+    (
+        "invalid public WebSocket protocol: junk_after_request",
+        "websocket_protocol_junk_after_request",
+    ),
+    (
+        "invalid public WebSocket protocol: custom_response_successful",
+        "websocket_protocol_custom_response_successful",
+    ),
+    (
+        "invalid public WebSocket protocol: invalid_header",
+        "websocket_protocol_invalid_header",
+    ),
+    (
+        "invalid public WebSocket protocol: handshake_incomplete",
+        "websocket_protocol_handshake_incomplete",
+    ),
+    (
+        "invalid public WebSocket protocol: http_parse",
+        "websocket_protocol_http_parse",
+    ),
+    (
+        "invalid public WebSocket protocol: send_after_closing",
+        "websocket_protocol_send_after_closing",
+    ),
+    (
+        "invalid public WebSocket protocol: received_after_closing",
+        "websocket_protocol_received_after_closing",
+    ),
+    (
+        "invalid public WebSocket protocol: nonzero_reserved_bits",
+        "websocket_protocol_nonzero_reserved_bits",
+    ),
+    (
+        "invalid public WebSocket protocol: unmasked_client_frame",
+        "websocket_protocol_unmasked_client_frame",
+    ),
+    (
+        "invalid public WebSocket protocol: masked_server_frame",
+        "websocket_protocol_masked_server_frame",
+    ),
+    (
+        "invalid public WebSocket protocol: fragmented_control_frame",
+        "websocket_protocol_fragmented_control_frame",
+    ),
+    (
+        "invalid public WebSocket protocol: control_frame_too_big",
+        "websocket_protocol_control_frame_too_big",
+    ),
+    (
+        "invalid public WebSocket protocol: unknown_control_frame",
+        "websocket_protocol_unknown_control_frame",
+    ),
+    (
+        "invalid public WebSocket protocol: unknown_data_frame",
+        "websocket_protocol_unknown_data_frame",
+    ),
+    (
+        "invalid public WebSocket protocol: unexpected_continue_frame",
+        "websocket_protocol_unexpected_continue_frame",
+    ),
+    (
+        "invalid public WebSocket protocol: expected_fragment",
+        "websocket_protocol_expected_fragment",
+    ),
+    (
+        "invalid public WebSocket protocol: invalid_opcode",
+        "websocket_protocol_invalid_opcode",
+    ),
+    (
+        "invalid public WebSocket protocol: invalid_close_sequence",
+        "websocket_protocol_invalid_close_sequence",
+    ),
+];
+
+fn websocket_protocol_reason(error: ProtocolError) -> &'static str {
+    let index = match error {
+        ProtocolError::WrongHttpMethod => 0,
+        ProtocolError::WrongHttpVersion => 1,
+        ProtocolError::MissingConnectionUpgradeHeader => 2,
+        ProtocolError::MissingUpgradeWebSocketHeader => 3,
+        ProtocolError::MissingSecWebSocketVersionHeader => 4,
+        ProtocolError::MissingSecWebSocketKey => 5,
+        ProtocolError::SecWebSocketAcceptKeyMismatch => 6,
+        ProtocolError::SecWebSocketSubProtocolError(_) => 7,
+        ProtocolError::JunkAfterRequest => 8,
+        ProtocolError::CustomResponseSuccessful => 9,
+        ProtocolError::InvalidHeader(_) => 10,
+        ProtocolError::HandshakeIncomplete => 11,
+        ProtocolError::HttparseError(_) => 12,
+        ProtocolError::SendAfterClosing => 13,
+        ProtocolError::ReceivedAfterClosing => 14,
+        ProtocolError::NonZeroReservedBits => 15,
+        ProtocolError::UnmaskedFrameFromClient => 16,
+        ProtocolError::MaskedFrameFromServer => 17,
+        ProtocolError::FragmentedControlFrame => 18,
+        ProtocolError::ControlFrameTooBig => 19,
+        ProtocolError::UnknownControlFrameType(_) => 20,
+        ProtocolError::UnknownDataFrameType(_) => 21,
+        ProtocolError::UnexpectedContinueFrame => 22,
+        ProtocolError::ExpectedFragment(_) => 23,
+        ProtocolError::ResetWithoutClosingHandshake => return UNCLEAN_WEBSOCKET_CLOSE,
+        ProtocolError::InvalidOpcode(_) => 24,
+        ProtocolError::InvalidCloseSequence => 25,
+    };
+    PROTOCOL_FAILURES[index].0
+}
 
 /// Optional diagnostics never enter the financial/feed queue or require a network/disk write.
 /// Fixed categories are used rather than response bodies, URLs or exception text.
@@ -126,7 +270,11 @@ impl FeedDiagnostics {
 }
 
 fn failure_code(reason: &str, fatal: bool) -> u8 {
+    if let Some(index) = PROTOCOL_FAILURES.iter().position(|entry| entry.0 == reason) {
+        return 20 + index as u8;
+    }
     match reason {
+        UNCLEAN_WEBSOCKET_CLOSE => 18,
         "fresh both-outcome snapshot bootstrap timeout" => 1,
         "public WebSocket connection failed" | "public WebSocket connect timeout" => 2,
         "public REST book transport failed"
@@ -191,6 +339,10 @@ fn failure_name(code: u8) -> Option<&'static str> {
         15 => Some("invalid_book_input"),
         16 => Some("feed_queue_overflow"),
         17 => Some("feed_consumer_closed"),
+        18 => Some("websocket_unclean_disconnect"),
+        20..=45 => PROTOCOL_FAILURES
+            .get(usize::from(code - 20))
+            .map(|entry| entry.1),
         _ => Some("transport_unavailable"),
     }
 }
@@ -1080,7 +1232,8 @@ async fn session(
                 let message = match received {
                     Some(Ok(message)) => message,
                     Some(Err(WebSocketError::Capacity(_))) => return SessionResult::Fatal("public WebSocket exceeds capacity limit".into()),
-                    Some(Err(WebSocketError::Protocol(_))) => return SessionResult::Fatal("invalid public WebSocket protocol".into()),
+                    Some(Err(WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake))) => return SessionResult::Transport(UNCLEAN_WEBSOCKET_CLOSE),
+                    Some(Err(WebSocketError::Protocol(error))) => return SessionResult::Fatal(websocket_protocol_reason(error).into()),
                     Some(Err(_)) => return SessionResult::Transport("public WebSocket read failed"),
                     None => return SessionResult::Transport("public WebSocket ended"),
                 };
@@ -1328,6 +1481,7 @@ pub async fn run_public_with_diagnostics(
 mod transport_tests {
     use super::*;
     use crate::domain::{Action, Core, CoreConfig, StopReason};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
@@ -1419,6 +1573,7 @@ mod transport_tests {
         closed: bool,
         prior_fault: Option<&str>,
         invalid_input: bool,
+        unclean_close: bool,
     ) {
         let selected = market();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1432,6 +1587,10 @@ mod transport_tests {
                     .send(Message::Text("{invalid fixture JSON".into()))
                     .await
                     .unwrap();
+            } else if unclean_close {
+                socket.get_mut().shutdown().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                drop(socket);
             } else {
                 socket.close(None).await.unwrap();
             }
@@ -1514,20 +1673,28 @@ mod transport_tests {
 
     #[tokio::test]
     async fn disconnect_queue_full_is_a_fatal_source_failure_without_replacing_prior_fault() {
-        disconnect_queue_failure(false, None, false).await;
-        disconnect_queue_failure(false, Some("prior durability fault"), false).await;
+        disconnect_queue_failure(false, None, false, false).await;
+        disconnect_queue_failure(false, Some("prior durability fault"), false, false).await;
     }
 
     #[tokio::test]
     async fn disconnect_queue_closed_is_a_fatal_source_failure_without_replacing_prior_fault() {
-        disconnect_queue_failure(true, None, false).await;
-        disconnect_queue_failure(true, Some("prior durability fault"), false).await;
+        disconnect_queue_failure(true, None, false, false).await;
+        disconnect_queue_failure(true, Some("prior durability fault"), false, false).await;
     }
 
     #[tokio::test]
     async fn disconnect_queue_failure_preserves_the_sessions_first_fatal_input_cause() {
-        disconnect_queue_failure(false, None, true).await;
-        disconnect_queue_failure(true, None, true).await;
+        disconnect_queue_failure(false, None, true, false).await;
+        disconnect_queue_failure(true, None, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn unclean_disconnect_admission_failure_remains_fatal_and_preserves_first_fault() {
+        for closed in [false, true] {
+            disconnect_queue_failure(closed, None, false, true).await;
+            disconnect_queue_failure(closed, Some("prior durability fault"), false, true).await;
+        }
     }
 
     #[tokio::test]
@@ -2057,6 +2224,277 @@ mod transport_tests {
                 .is_ok()
         );
         tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unclean_websocket_close_reconnects_and_requires_both_fresh_books() {
+        let selected = market();
+        let base = selected.window_start_ms;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let diagnostics = Arc::new(FeedDiagnostics::default());
+        let observed = diagnostics.clone();
+        let server_market = selected.clone();
+        let server_diagnostics = diagnostics.clone();
+        let (allow_down, wait_down) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut wait_down = Some(wait_down);
+            for connection in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let subscription = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                let subscription: Value = serde_json::from_str(&subscription).unwrap();
+                assert_eq!(
+                    subscription["assets_ids"],
+                    json!([server_market.up_token, server_market.down_token])
+                );
+                for (index, token) in [&server_market.up_token, &server_market.down_token]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if connection == 1 && index == 1 {
+                        wait_down.take().unwrap().await.unwrap();
+                    }
+                    let mut full = snapshot(&server_market);
+                    full["asset_id"] = token.as_str().into();
+                    full["timestamp"] = (base + 201 + connection * 100).to_string().into();
+                    socket
+                        .send(Message::Text(full.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                if connection == 0 {
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while server_diagnostics.snapshot().clob.phase != "streaming" {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    // A TCP EOF without a WebSocket Close is a routine lost
+                    // transport, not permission to reuse either cached book.
+                    // Keep the read half alive briefly: bare drop with unread
+                    // heartbeat bytes can produce TCP RST instead of EOF.
+                    socket.get_mut().shutdown().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    drop(socket);
+                } else {
+                    while let Some(Ok(message)) = socket.next().await {
+                        if matches!(message, Message::Close(_)) {
+                            break;
+                        }
+                        if matches!(&message, Message::Text(text) if text.as_str() == "PING")
+                            && socket.send(Message::Text("PONG".into())).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let (fault, fault_state) = watch::channel(None);
+        let (shutdown, control) = watch::channel(false);
+        let start = Instant::now();
+        let client = tokio::spawn(run_feed(
+            Endpoint {
+                source: FeedSource::Clob,
+                url,
+                settings: fast_settings(),
+                tick_refresh: TickRefresh::Fixture([base + 100; 2]),
+                diagnostics: Some(diagnostics),
+            },
+            selected.clone(),
+            start,
+            tx,
+            fault,
+            control,
+        ));
+        let mut core = Core::new(CoreConfig {
+            initial_collateral_micro: 1_000_000_000,
+            max_imbalance_micro: 10_000_000,
+            lot_micro: 5_000_000,
+            half_width_micro: 10_000,
+            max_feed_age_ms: 1000,
+        })
+        .unwrap();
+        core.set_market(selected).unwrap();
+        core.control(Action::Resume).unwrap();
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&event, FeedEvent::Snapshot { .. }));
+            core.apply(event).unwrap();
+        }
+        assert_eq!(
+            core.evaluate(base + 400, start.elapsed().as_millis() as u64)
+                .intents
+                .len(),
+            2
+        );
+        let reset = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let reason = match &reset {
+            FeedEvent::Disconnect {
+                source: FeedSource::Clob,
+                reason,
+            } => reason,
+            _ => panic!("disconnect event required"),
+        };
+        assert_eq!(reason, "public WebSocket closed without closing handshake");
+        core.apply(reset).unwrap();
+        let decision = core.evaluate(base + 400, start.elapsed().as_millis() as u64);
+        assert!(decision.intents.is_empty());
+        assert!(
+            decision
+                .stop_reasons
+                .contains(&StopReason::ClobDisconnected)
+        );
+        assert!(
+            decision
+                .stop_reasons
+                .contains(&StopReason::MissingBook(Outcome::Up))
+        );
+        assert!(
+            decision
+                .stop_reasons
+                .contains(&StopReason::MissingBook(Outcome::Down))
+        );
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &first,
+            FeedEvent::Snapshot {
+                outcome: Outcome::Up,
+                ..
+            }
+        ));
+        core.apply(first).unwrap();
+        let decision = core.evaluate(base + 400, start.elapsed().as_millis() as u64);
+        assert!(decision.intents.is_empty());
+        assert!(
+            decision
+                .stop_reasons
+                .contains(&StopReason::MissingBook(Outcome::Down))
+        );
+        assert_eq!(observed.snapshot().clob.phase, "awaiting_native_snapshot");
+        assert_eq!(
+            observed.snapshot().clob.last_failure,
+            Some("websocket_unclean_disconnect")
+        );
+        assert!(!observed.snapshot().clob.last_failure_fatal);
+        assert!(fault_state.borrow().is_none());
+        allow_down.send(()).unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &second,
+            FeedEvent::Snapshot {
+                outcome: Outcome::Down,
+                ..
+            }
+        ));
+        core.apply(second).unwrap();
+        assert_eq!(
+            core.evaluate(base + 400, start.elapsed().as_millis() as u64)
+                .intents
+                .len(),
+            2
+        );
+        assert_eq!(observed.snapshot().clob.phase, "streaming");
+        assert_eq!(observed.snapshot().clob.attempts, 2);
+        shutdown.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_websocket_opcode_remains_fatal_and_exports_a_static_subcode() {
+        let selected = market();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            // FIN + reserved opcode 3, with a zero-length unmasked payload.
+            socket.get_mut().write_all(&[0x83, 0]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let diagnostics = Arc::new(FeedDiagnostics::default());
+        let observed = diagnostics.clone();
+        let (tx, mut rx) = mpsc::channel(4);
+        let (fault, fault_state) = watch::channel(None);
+        let (_shutdown, control) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_feed(
+                Endpoint {
+                    source: FeedSource::Clob,
+                    url: url.clone(),
+                    settings: fast_settings(),
+                    tick_refresh: TickRefresh::Skip,
+                    diagnostics: Some(diagnostics),
+                },
+                selected,
+                Instant::now(),
+                tx,
+                fault,
+                control,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.as_ref().err().map(String::as_str),
+            Some("invalid public WebSocket protocol: invalid_opcode")
+        );
+        assert_eq!(
+            fault_state.borrow().as_deref(),
+            Some("invalid public WebSocket protocol: invalid_opcode")
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            FeedEvent::Disconnect {
+                source: FeedSource::Clob,
+                ..
+            }
+        ));
+        let sample = observed.snapshot();
+        assert_eq!(
+            sample.clob.last_failure,
+            Some("websocket_protocol_invalid_opcode")
+        );
+        assert!(sample.clob.last_failure_fatal);
+        assert_eq!(sample.clob.phase, "faulted");
+        assert_eq!(sample.clob.attempts, 1);
+        let exported = serde_json::to_string(&sample).unwrap();
+        assert!(!exported.contains("ws://"));
+        assert!(!exported.contains(&url));
+        tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .unwrap()
             .unwrap();

@@ -1,5 +1,50 @@
 # Validation evidence
 
+## Established WebSocket recovery: October 8, 2026
+
+After its earlier successful 16-minute public-feed simulation, the retained
+`144143f` preview exited while paused at 19:01:33 UTC: native CLOB diagnostics
+reported `invalid_websocket_protocol`, fatal, exit code 1, OOM false. The
+preterminal cached sample did not contain that later fault; it is not a terminal
+receipt or proof of continued health. Bounded native logs and a byte-hashed
+stopped backup preserve this event. Its exact protocol subtype is unknown.
+
+The established-socket reader previously treated every tungstenite protocol
+error as fatal, including `ResetWithoutClosingHandshake`, which denotes a lost
+connection without the closing handshake ([pinned upstream contract](https://docs.rs/tungstenite/0.28.0/tungstenite/error/enum.ProtocolError.html#variant.ResetWithoutClosingHandshake)).
+Only that variant now takes the existing recoverable transport path: mandatory
+Disconnect admission, backoff, REST cutoffs and new native snapshots for both
+outcomes. Other protocol violations, capacity violations, malformed data and
+failed disconnect admission remain fatal. Static protocol categories preserve
+diagnostic detail without formatting headers, payloads or nested exceptions.
+This fixes a reproduced classification defect; it does not prove the subtype
+or cause of the earlier production or local event.
+
+Controlled loopback TCP FIN reproduces the old fatal classification. Three
+new real-wire regressions check reconnect with cleared books and no intents
+until both fresh books arrive, invalid opcode remaining fatal, and full/closed
+Disconnect admission preserving the first fault. All 17 transport checks and
+93 engine checks pass. Workspace formatting and engine all-target Clippy with
+`-D warnings` pass; final-head CI is required before acceptance. An earlier bare socket-drop assertion was
+ambiguous because unread data can produce a TCP reset instead of an EOF; it
+does not establish the classification reproduction.
+
+Virtual before/after testing exposed a stale Cargo artifact in the local shared
+BuildKit target cache. A forced recompilation corrected the test builder; final
+local image acceptance must first clean only the cached mm2-engine package,
+then use the normal production Dockerfile and verify new test counts, release
+compilation, exact revision labels and actual runtime behavior. No engine
+journal or capital reset is part of that build-cache operation.
+
+Both push and PR CI for the earlier `81028a0` history candidate passed 803
+automated checks without skips (250 Rust, 498 Python, 30 dashboard, 19 reference,
+6 parity) plus 14 container checks and zero live orders
+([push](https://github.com/yurycooliq/mm2/actions/runs/37829183818),
+[PR](https://github.com/yurycooliq/mm2/actions/runs/37829189473)). Final-head
+checks in [PR 5](https://github.com/yurycooliq/mm2/pull/5) must independently
+establish this subsequent WebSocket candidate. AWS rollout, real Telegram,
+continuous host capacity and economic/funded acceptance remain separate gates.
+
 ## Restarted simulation action history: October 8, 2026, 19:04 UTC
 
 Actual-container acceptance on `144143f` first passed the desktop/mobile
