@@ -10,7 +10,7 @@ USDC. Entry basis is report-only and fee-exclusive. Public fees/PnL are never
 promoted to authenticated ledger facts. Schema errors abort publication.
 """
 from collections import Counter
-from decimal import Decimal
+from decimal import Decimal, DecimalException, Inexact, localcontext
 import hashlib
 import http.client
 import time
@@ -164,7 +164,11 @@ def _pnl_amount(value):
     # OpenAPI says JSON numeric USDC; strings or binary floats are schema changes.
     if type(value) is not int and not isinstance(value, Decimal):
         raise ResearchError("V2 PnL numeric schema changed")
-    amount = int(units(value, PICO, "reported PnL USDC", signed=True))
+    # An extreme exponent must not underflow to a fabricated zero inside the
+    # shared fixed-point converter's Decimal context.
+    with localcontext() as context:
+        context.traps[Inexact] = True
+        amount = int(units(value, PICO, "reported PnL USDC", signed=True))
     sign, (whole, fraction) = ("-" if amount < 0 else ""), divmod(abs(amount), PICO)
     return sign + str(whole) + (("." + str(fraction).zfill(12).rstrip("0")) if fraction else "")
 
@@ -239,7 +243,7 @@ def project_reported_pnl(evidence, account_id):
         if any(point.get(key) is None for point in data["points"] for key in ("deposits", "withdrawals", "cashflow_net")):
             result["warnings"].append("PNL_CASHFLOWS_UNKNOWN")
         return result
-    except (ResearchError, ValueError, TypeError, KeyError, OverflowError):
+    except (ResearchError, DecimalException, ValueError, TypeError, KeyError, OverflowError):
         return empty_reported_pnl(account_id, "INVALID", "PNL_SOURCE_INVALID")
 
 
@@ -406,7 +410,7 @@ def observe_account(client, account, start, end, *, page_size=500, max_rows=MAX_
                 projected = project_reported_pnl(evidence, account_id)
                 evidence["status"] = projected["status"]
                 evidence["reason"] = "PNL_SOURCE_INVALID" if projected["status"] == "INVALID" else None
-        except (ResearchError, OSError, ValueError, TypeError, KeyError):
+        except (ResearchError, DecimalException, OSError, ValueError, TypeError, KeyError):
             captured = getattr(client, "pnl_evidence", None)
             if captured:
                 evidence.update(captured, status="INVALID", reason="PNL_SOURCE_INVALID")

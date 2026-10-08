@@ -218,6 +218,37 @@ class V2ObserverTests(unittest.TestCase):
         self.assertFalse(view["coverage"]["financial_complete"])
         self.assertIsNone(view["metrics"]["net_pnl_usd"]["value"])
 
+    def test_optional_decimal_extremes_keep_activity_and_verified_publication(self):
+        class API(FixtureAPI):
+            def get(self, endpoint, parameters):
+                if endpoint != "user-pnl":
+                    return super().get(endpoint, parameters)
+                self.requests.append((endpoint, deepcopy(parameters)))
+                self.pnl_evidence = deepcopy(evidence)
+                return {}, self.pnl_evidence["receipt"]
+        for source, replacement in (('"economic_pnl":100', '"economic_pnl":1e1000000'),
+                                    ('"wallet_income":0', '"wallet_income":1e-10000000')):
+            with self.subTest(replacement=replacement):
+                raw = pnl_evidence()["raw_body_utf8"].replace(source, replacement, 1)
+                evidence = pnl_evidence(raw_override=raw)
+                self.assertEqual(project_reported_pnl(evidence, ACCOUNT)["status"], "INVALID")
+                result = self.capture(API([page([activity(10)])]), include_reported_pnl=True)
+                self.assertEqual(len(result["events"]), 1)
+                self.assertTrue(result["coverage"]["activity_complete"])
+                self.assertEqual(result["reported_pnl_evidence"]["status"], "INVALID")
+                with tempfile.TemporaryDirectory() as temporary:
+                    observer = publish_bundle(Path(temporary), {"events.jsonl": result["events"], "closing.json": result["snapshot"],
+                        "coverage.json": result["coverage"], "source-reported-pnl.json": result["reported_pnl_evidence"]},
+                        scope={"kind": "one-public-account", "lane": "public-benchmark", "account_id": ACCOUNT, "chain_id": 137},
+                        utc_range={"start": epoch_utc(1), "end": epoch_utc(20)}, quality=result["quality"], created_at_utc=epoch_utc(10000))
+                    view, _ = build_reference(observer)
+                self.assertEqual(len(view["actions"]), 1)
+                self.assertTrue(view["coverage"]["actions_complete"])
+                self.assertEqual(view["reported_performance"]["status"], "INVALID")
+                self.assertIsNone(view["reported_performance"]["latest"]["economic_pnl_usd"])
+                self.assertFalse(view["coverage"]["financial_complete"])
+                self.assertIsNone(view["metrics"]["net_pnl_usd"]["value"])
+
 
 class PnlProjectionTests(unittest.TestCase):
     def test_zero_and_nullable_reported_amounts_remain_distinct(self):

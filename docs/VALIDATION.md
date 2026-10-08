@@ -30,9 +30,9 @@ preserving durable writes and control/fault priority. Disconnection enqueue
 failures retain overflow/closed classifications and the first fatal cause.
 These reproductions do not establish the cause of historical AWS restarts.
 
-Local Windows validation plus targeted final-review regressions: 485 Python
-checks, 460 passed and 25 platform/dependency skips (console 106, data 21,
-latency 34, operations 148, research 176). The six new
+Local Windows validation plus targeted final-review regressions: 486 Python
+checks, 461 passed and 25 platform/dependency skips (console 106, data 21,
+latency 34, operations 148, research 177). The six new
 engine regression checks passed with 90 engine tests, formatting and targeted
 Clippy. Dashboard 29 checks, production build, rendered fixture desktop/mobile
 interaction and exact JSON-download parity passed. Full locked Rust/workspace,
@@ -46,6 +46,10 @@ position scope warnings. Requested-feed completeness is now distinguished from
 all wallet activity. Legacy samples without known boot identity cannot establish
 a continuous gain or connecting chart line; current samples from separate boots
 never join.
+Final review reproduced extreme optional PnL decimal overflow and silent
+underflow. Both now yield an invalid optional source with null amounts while
+valid activity still publishes. The regression verifies the full evidence chain;
+the saved real provider response retains its exact values.
 The primary screen also exposes sampled engine/simulation/live faults and
 warning/critical/full journal capacity without expanding diagnostics. Rendered
 desktop/mobile fault and capacity fixtures passed with no control submissions.
