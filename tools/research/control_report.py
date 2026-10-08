@@ -3,6 +3,7 @@ import argparse
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
+import re
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from collections import Counter
@@ -23,7 +24,7 @@ def snapshot_utc(value):
     return utc(value)
 
 
-def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", controller=None, engine=None, diagnostic_snapshot=None):
+def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", controller=None, engine=None, diagnostic_snapshot=None, access=None):
     manifest = verify_bundle(bundle)
     if manifest["scope"].get("kind") != "research-packet" or manifest["scope"].get("lane") != "public-benchmark":
         raise ResearchError("control report requires a verified public research packet")
@@ -39,7 +40,7 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
         raise ResearchError("expected exactly the two registered public-account summaries")
     source = manifest["bundle_id"]
     identity = {"bundle_id": source, "cutoff_utc": cutoff_utc, "display_timezone": display_timezone,
-                "controller": controller, "engine": engine, "diagnostic_snapshot": diagnostic_snapshot}
+                "controller": controller, "engine": engine, "diagnostic_snapshot": diagnostic_snapshot, "access": access}
     report_id = "mm2-control-" + hashlib.sha256(canonical(identity)).hexdigest()
     sources = {source: {"kind": "verified_research_packet", "bundle_id": source,
                        "manifest_sha256": hashlib.sha256((Path(bundle) / "manifest.json").read_bytes()).hexdigest(),
@@ -145,6 +146,22 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
                        for (source, message), count in sorted(counts.items())]}
         report["sources"]["recent_diagnostics"] = {"kind": "bounded_allowlisted_incident_capture",
                                                    "sha256": hashlib.sha256(canonical(diagnostic_snapshot)).hexdigest()}
+    if access is not None:
+        observed = snapshot_utc(access["captured_at_utc"])
+        if observed > cutoff:
+            raise ResearchError("access snapshot postdates cutoff")
+        statuses = {"AUTHENTICATED", "EXPIRED", "UNCONFIGURED", "DENIED", "UNREACHABLE",
+                    "CLI_UNAVAILABLE", "AUTH_ERROR", "INVALID_IDENTITY_RESPONSE"}
+        if (access.get("status") not in statuses
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", str(access.get("profile", "")))
+                or not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]", str(access.get("region", "")))):
+            raise ResearchError("invalid access snapshot")
+        report["research_access"] = {key: access[key] for key in ("status", "profile", "region")}
+        report["research_access"].update({"observed_at_utc": access["captured_at_utc"],
+                                           "age_seconds": int((cutoff - observed).total_seconds()),
+                                           "scope": "AUTHENTICATION_ONLY_NOT_ENGINE_HEALTH"})
+        report["sources"]["research_access"] = {"kind": "read_only_access_preflight",
+                                                   "sha256": hashlib.sha256(canonical(access)).hexdigest()}
     report["next_actions"] = [
         {"priority": 1, "action": "Получить полный журнал MM2: начало/конец периода, движения средств, исполнения и связь с заявками.",
          "done_when": "Сверены деньги/позиции и полнота; каждое исполнение связано с MM2."},
@@ -153,6 +170,9 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
         {"priority": 3, "action": "Сравнить зарегистрированный кандидат с baseline на новых данных.",
          "done_when": "Учтены расходы, задержки, конечный капитал и худшие потери; отдельный экономический verdict."}]
     operational_actions = []
+    if "research_access" in report and report["research_access"]["status"] != "AUTHENTICATED":
+        operational_actions.append({"action": "Восстановить исследовательский AWS-доступ и получить новые срезы сервера и controller.",
+                                    "done_when": "STS и read-only проверки успешны; отдельно проверены состояние engine и время источников."})
     recent = report.get("recent_diagnostics", {})
     if any("fatal=true" in row["message"] for row in recent.get("groups", [])):
         operational_actions.append({"action": "Установить причину fatal feed-сбоев: различить переполнение очереди и закрытие потребителя; сопоставить с lifecycle и нагрузкой.",
@@ -242,12 +262,15 @@ def render_full(report):
     if "research_service" in report:
         service = report["research_service"]
         rows.append(f"Research service: {service.get('status')}; наблюдение {service['observed_at_utc']}, возраст {service['age_seconds']} s. Это срез, не uptime.")
+    if "research_access" in report:
+        access = report["research_access"]
+        rows.append(f"Исследовательский AWS-доступ ({access['profile']}, {access['region']}): {access['status']}; проверка {access['observed_at_utc']}, возраст {access['age_seconds']} s. Ошибка доступа не доказывает остановку engine.")
     if "host_eligibility" in report:
         venue = report["host_eligibility"]
         rows.append(f"Ответ площадки для сервера: blocked={venue['blocked']}, country={venue['country']}, region={venue['region']}; это не юридическое заключение о владельце счета.")
     if "recent_diagnostics" in report:
         recent = report["recent_diagnostics"]
-        rows += [f"Свежая диагностика: {recent['observed_at_utc']}, окно {recent['hours']} h, строк {recent['observed_rows']}.",
+        rows += [f"Последняя доступная диагностика: {recent['observed_at_utc']}, возраст {recent['age_seconds']} s, окно {recent['hours']} h, строк {recent['observed_rows']}.",
                  f"Наблюдаемый systemd NRestarts={recent['systemd'].get('NRestarts', 'неизвестно')}; это не число падений за отчетный период.",
                  "", "| Источник | Диагностический код | Строк |", "| --- | --- | --- |"]
         for group in recent["groups"]:
@@ -261,14 +284,18 @@ def render_full(report):
 def render_telegram(report):
     result = display(report["metrics"]["live_bot_net_pnl"])
     state = report["engine_snapshot"].get("observed_state")
-    operation = (f"Engine: {state['execution_mode']} / {state['mode']} (срез {report['engine_snapshot']['observed_at_utc']}).\n" if state else "")
+    operation = (f"Engine: {state['execution_mode']} / {state['mode']} (срез {report['engine_snapshot']['observed_at_utc']}, возраст {report['engine_snapshot']['age_seconds']} s).\n" if state else "Текущее состояние engine неизвестно.\n")
+    if "research_access" in report:
+        access = report["research_access"]
+        operation += f"AWS-доступ: {access['status']} (проверка {access['observed_at_utc']}, возраст {access['age_seconds']} s). Ошибка доступа не доказывает остановку engine.\n"
     if report.get("host_eligibility", {}).get("blocked") is True:
-        operation += "Площадка сообщает blocked=true для серверного подключения.\n"
+        operation += "На указанном срезе сервера площадка сообщила blocked=true.\n"
     recent = report.get("recent_diagnostics", {})
     if any("fatal=true" in row["message"] for row in recent.get("groups", [])):
-        operation += "В свежей диагностике есть fatal feed-сбои; причина требует проверки.\n"
+        operation += f"Диагностика {recent['observed_at_utc']} (возраст {recent['age_seconds']} s): наблюдались fatal feed-сбои; причина требует проверки.\n"
     return (f"MM2 · срез {report['display_cutoff']}\n"
             f"Период UTC: {report['period']['start']} — {report['period']['end']}\n"
+            f"Возраст исследовательского пакета: {report['packet_age_seconds']} s.\n"
             f"{operation}"
             f"Чистый результат собственного бота: {result}.\n"
             "Нет полного журнала исполнений и атрибуции MM2. Публичная активность не доказывает прибыль.\n"
@@ -286,11 +313,13 @@ def main():
     parser.add_argument("--controller-snapshot")
     parser.add_argument("--engine-snapshot")
     parser.add_argument("--diagnostic-snapshot")
+    parser.add_argument("--access-snapshot")
     args = parser.parse_args()
     report = build_report(args.bundle, cutoff_utc=args.cutoff_utc, display_timezone=args.timezone,
                           controller=load_json(args.controller_snapshot) if args.controller_snapshot else None,
                           engine=load_json(args.engine_snapshot) if args.engine_snapshot else None,
-                          diagnostic_snapshot=load_json(args.diagnostic_snapshot) if args.diagnostic_snapshot else None)
+                          diagnostic_snapshot=load_json(args.diagnostic_snapshot) if args.diagnostic_snapshot else None,
+                          access=load_json(args.access_snapshot) if args.access_snapshot else None)
     target = Path(args.out)
     target.mkdir(parents=True, exist_ok=False)
     for name, data in (("report.json", canonical(report) + b"\n"),

@@ -12,6 +12,42 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class ControlReportTests(unittest.TestCase):
+    def test_expired_access_is_separate_from_engine_and_precedes_historical_faults(self):
+        access = {"captured_at_utc": "2026-10-08T00:00:30Z", "profile": "mm2",
+                  "region": "eu-west-1", "status": "EXPIRED", "identity_arn": "quarantined"}
+        capture = {"captured_at_utc": "2026-10-07T00:00:30Z", "hours": 1,
+                   "incidents": [{"source": "docker_engine", "message": "diagnostic_code=feed_queue_unavailable source=binance fatal=true"}]}
+        bundle = self.bundle()
+        report = build_report(bundle, cutoff_utc="2026-10-08T00:01:00Z", access=access, diagnostic_snapshot=capture)
+        without_access = build_report(bundle, cutoff_utc="2026-10-08T00:01:00Z", diagnostic_snapshot=capture)
+        self.assertNotEqual(report["report_id"], without_access["report_id"])
+        self.assertEqual(report["research_access"]["age_seconds"], 30)
+        self.assertEqual(report["recent_diagnostics"]["age_seconds"], 86430)
+        self.assertIn("AWS-доступ", report["next_actions"][0]["action"])
+        self.assertIsNone(report["engine_snapshot"]["current_health"])
+        self.assertNotIn("quarantined", str(report))
+        for text in (render_full(report), render_telegram(report)):
+            self.assertIn("EXPIRED", text)
+            self.assertIn("86430", text)
+            self.assertIn("не доказывает остановку engine", text)
+            self.assertNotIn("свеж", text.lower())
+        self.assertLess(len(render_telegram(report)), 4096)
+
+    def test_future_or_invalid_access_snapshot_is_rejected(self):
+        access = {"captured_at_utc": "2026-10-07T00:00:30Z", "profile": "mm2", "region": "eu-west-1", "status": "AUTHENTICATED"}
+        bundle = self.bundle()
+        for change in ({"captured_at_utc": "2026-10-07T00:02:00Z"}, {"status": "HEALTHY"},
+                       {"profile": "untrusted\ntext"}, {"region": "untrusted"}):
+            with self.subTest(change=change), self.assertRaises(ResearchError):
+                build_report(bundle, cutoff_utc="2026-10-07T00:01:00Z", access={**access, **change})
+
+    def test_authenticated_access_never_proves_engine_health(self):
+        access = {"captured_at_utc": "2026-10-07T00:00:30+00:00", "profile": "mm2", "region": "eu-west-1", "status": "AUTHENTICATED"}
+        report = build_report(self.bundle(), cutoff_utc="2026-10-07T00:01:00Z", access=access)
+        self.assertIsNone(report["engine_snapshot"]["current_health"])
+        self.assertIsNone(report["metrics"]["live_bot_net_pnl"]["value"])
+        self.assertNotIn("AWS-доступ", report["next_actions"][0]["action"])
+
     def setUp(self):
         (ROOT / "output").mkdir(exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / "output", prefix="report-test-")

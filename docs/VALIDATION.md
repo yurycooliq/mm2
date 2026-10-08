@@ -13,8 +13,13 @@ There is no archive deletion or retry of collection, journal writes or requests.
 
 The final local Windows research suite ran 144 tests: 143 passed, one Linux-only
 skip. Five new cross-platform fault-injection checks cover these failure modes.
-The current Python suite contains 419 checks: console 80, data 21, latency 34,
-ops 140, research 144. Full Linux results for the latest candidate must be read
+The report generator now includes an allowlisted AWS preflight snapshot and
+timestamps/ages in both views. It prioritizes restoring failed research access
+without calling that failure an engine outage; historical diagnostics are never
+labeled fresh. All 10 report tests passed locally, including three new access,
+future-time and historical-age regression checks.
+The current Python suite contains 422 checks: console 80, data 21, latency 34,
+ops 140, research 147. Full Linux results for the latest candidate must be read
 from [PR 5](https://github.com/yurycooliq/mm2/pull/5), rather than inferred from
 the local Windows result. The preceding exact `cd51558` CI completed successfully:
 244 Rust tests plus format/Clippy/release build, 414 Python tests without skips,
