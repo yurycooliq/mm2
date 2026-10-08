@@ -33,6 +33,7 @@ class Config:
     miniapp_url: str = ""
     telegram_only: bool = False
     trusted_proxy_header: bool = False
+    research_view_dir: Path | None = None
 
     @classmethod
     def from_env(cls):
@@ -83,7 +84,8 @@ class Config:
                    Path(os.environ.get("MM2_CONSOLE_STATIC_DIR", "/app/dashboard")), allowed,
                    os.environ.get("MM2_CONSOLE_HOST", "0.0.0.0"), int(os.environ.get("MM2_CONSOLE_PORT", "8080")),
                    token, telegram_owner, miniapp, bool(token and telegram_owner) or telegram_policy == "true",
-                   proxy_policy == "true")
+                   proxy_policy == "true",
+                   Path(os.environ["MM2_CONSOLE_RESEARCH_VIEW_DIR"]) if os.environ.get("MM2_CONSOLE_RESEARCH_VIEW_DIR") else None)
 
     @property
     def secret_values(self):

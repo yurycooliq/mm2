@@ -205,6 +205,10 @@ class Handler(BaseHTTPRequestHandler):
                 limit = int(query.get("limit", ["120"])[0])
                 if path == "/api/state" and self.command == "GET":
                     self._send(200, app.state())
+                elif path == "/api/comparison" and self.command == "GET":
+                    if set(query) - {"period"} or len(query.get("period", [])) > 1:
+                        raise ValueError("unsupported comparison query")
+                    self._send(200, app.comparison(query.get("period", ["1h"])[0]))
                 elif path == "/api/history" and self.command == "GET":
                     self._send(200, {"samples": app.store.history(limit)})
                 elif path == "/api/logs" and self.command == "GET":

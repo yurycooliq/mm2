@@ -1,6 +1,7 @@
 import { AccountBand, Activity, History, Limits, Login, Orders, Overview, Receipt } from './components';
 import { safeVersion } from './model';
 import { useConsole } from './useConsole';
+import { Comparison } from './Comparison';
 
 export default function App() {
   const console = useConsole();
@@ -15,8 +16,8 @@ export default function App() {
   const state = console.envelope?.state ?? null;
   const disabled = console.busy || !!console.storageError || !!console.pending || !console.envelope?.connected || !safeVersion(state) || !state?.api_ready;
   return <div className="app-shell"><header><div className="brand"><span className="wordmark">mm2</span><span>Operator console</span></div><div className="owner"><span>Owner session</span><button className="text-button" onClick={() => void console.logout()}>Sign out</button></div></header>
-    <main><Overview envelope={console.envelope} disabled={disabled} command={console.command} /><AccountBand state={state} />
+    <main><Comparison envelope={console.envelope} /><details className="operator-details"><summary>Управление и диагностика движка</summary><Overview envelope={console.envelope} disabled={disabled} command={console.command} /><AccountBand state={state} />
       <div className="workspace"><div className="left-column"><Orders state={state} /><Activity logs={console.logs} /></div><aside><Limits state={state} disabled={disabled} apply={console.limits} />
         <Receipt receipt={console.receipt} pending={console.pending} busy={console.busy} error={console.error} retry={console.retry} /></aside></div>
-      <History samples={console.history} envelope={console.envelope} /></main><footer>Engine decisions do not depend on this console.</footer></div>;
+      <History samples={console.history} envelope={console.envelope} /></details></main><footer>Engine decisions do not depend on this console.</footer></div>;
 }

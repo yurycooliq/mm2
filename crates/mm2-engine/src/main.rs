@@ -156,9 +156,7 @@ async fn run() -> Result<(), String> {
             source_shutdown.clone(),
         )
         .await;
-        if result.is_err() && !*source_shutdown.borrow() {
-            source_fault.send_replace(Some("public/demo source owner stopped".into()));
-        }
+        record_source_exit(&source_fault, &result, *source_shutdown.borrow());
         result
     });
     let mut server_shutdown = shutdown_rx.clone();
@@ -214,6 +212,23 @@ async fn run() -> Result<(), String> {
     tracing::info!("mm2 engine stopped; acknowledged actions are durable");
     result
 }
+fn record_source_exit(
+    fault: &watch::Sender<Option<String>>,
+    result: &Result<(), String>,
+    stopping: bool,
+) {
+    if result.is_err() && !stopping {
+        fault.send_if_modified(|first| {
+            if first.is_some() {
+                false
+            } else {
+                *first = Some("public/demo source owner stopped".into());
+                true
+            }
+        });
+    }
+}
+
 async fn signal() {
     #[cfg(unix)]
     {
@@ -225,4 +240,31 @@ async fn signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod source_exit_tests {
+    use super::*;
+
+    #[test]
+    fn source_exit_preserves_first_fault_instead_of_replacing_it_with_generic_owner_stop() {
+        let (fault, observed) = watch::channel(Some("feed queue overflow".to_owned()));
+        record_source_exit(&fault, &Err("feed queue overflow".into()), false);
+        assert_eq!(observed.borrow().as_deref(), Some("feed queue overflow"));
+    }
+
+    #[test]
+    fn source_exit_fallback_only_applies_to_unexpected_unclassified_failure() {
+        for (result, stopping) in [(Ok(()), false), (Err("shutdown".into()), true)] {
+            let (fault, observed) = watch::channel(None);
+            record_source_exit(&fault, &result, stopping);
+            assert!(observed.borrow().is_none());
+        }
+        let (fault, observed) = watch::channel(None);
+        record_source_exit(&fault, &Err("source task failed".into()), false);
+        assert_eq!(
+            observed.borrow().as_deref(),
+            Some("public/demo source owner stopped")
+        );
+    }
 }

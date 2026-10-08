@@ -285,6 +285,18 @@ class AccountingTests(unittest.TestCase):
 
 
 class ObserverTests(unittest.TestCase):
+    def test_cosmetic_public_title_does_not_change_financial_event_identity(self):
+        first = activity(1)
+        first["title"] = "Bitcoin Up or Down"
+        second = deepcopy(first)
+        second["title"] = "Updated public market title"
+        one = observe_account(FixtureAPI([first]), {"account_id": ACCOUNT}, epoch_utc(1), epoch_utc(2))
+        two = observe_account(FixtureAPI([second]), {"account_id": ACCOUNT}, epoch_utc(1), epoch_utc(2))
+        self.assertEqual(one["events"], two["events"])
+        self.assertEqual(one["activity_rows"][0]["display_title"], first["title"])
+        self.assertEqual(two["activity_rows"][0]["display_title"], second["title"])
+        self.assertNotIn("title", one["activity_rows"][0]["row"])
+
     def test_activity_half_open_dense_windows_split_and_keep_multiplicity(self):
         rows = [activity(second, second * 10 + i) for second in (1, 2, 3) for i in (0, 1)]
         api = FixtureAPI(rows)

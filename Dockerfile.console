@@ -12,9 +12,11 @@ LABEL org.opencontainers.image.revision=$MM2_SOURCE_REVISION
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/console
 WORKDIR /app
 COPY apps/console ./console
+COPY tools/research ./tools/research
+COPY scripts/refresh_comparison.py ./scripts/refresh_comparison.py
 COPY --from=frontend /build/dist ./dashboard
 RUN python -m unittest discover -s console/tests -p 'test_*.py' \
-    && mkdir /data && chown 10002:10002 /data
+    && mkdir /data /research-view && chown 10002:10002 /data /research-view
 USER 10002:10002
 EXPOSE 8080
 STOPSIGNAL SIGTERM

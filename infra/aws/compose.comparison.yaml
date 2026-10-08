@@ -1,0 +1,25 @@
+# Separate project: never becomes an engine-supervisor member or reads credentials.
+name: mm2-comparison
+services:
+  reference-refresh:
+    image: ${MM2_CONSOLE_IMAGE:?Verified release image ID required}
+    pull_policy: never
+    init: true
+    user: "10002:10002"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: ["python", "-B", "scripts/refresh_comparison.py", "--out", "/data", "--loop", "--interval-seconds", "300"]
+    healthcheck: {disable: true}
+    volumes:
+      - type: bind
+        source: /srv/mm2/console/research-view
+        target: /data
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    pids_limit: 16
+    cpus: 0.1
+    mem_limit: 192m
+    stop_grace_period: 20s
+    restart: "no"
+    logging: {driver: json-file, options: {max-size: "2m", max-file: "2"}}

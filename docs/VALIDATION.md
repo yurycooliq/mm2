@@ -1,5 +1,42 @@
 # Validation evidence
 
+## Simulation/comparison preparation: October 8, 2026, 17:30 UTC
+
+The owner console now has separate MM2 simulation and mo-money public-observation
+lanes, exact decimal values, source clocks, selected-period aggregates, recent
+actions, positions, sampled NAV continuity and a complete sanitized JSON export.
+Incomplete public accounting and bounded synthetic audit remain explicit;
+neither turnover nor sampled NAV is claimed as authenticated bot profit.
+
+An actual read-only v2 capture covered October 7 17:23:36 through October 8
+17:23:36 UTC: 4,424 normalized events, 10 public GET requests, 3,840,424 received
+bytes. Activity pagination completed, while financial completeness and MM2
+attribution remain false. Observer ID:
+`3922cb6d28d0dfc8d0e53613106487745994768b3f963c6be7870be7665b7621`.
+The new dedicated comparison cache retains two verified hot copies plus
+immutable daily rolling-window checkpoints, with explicit gaps and finite
+quotas. Existing research archives and engine state were not pruned.
+
+Deterministic engine tests reproduced timer starvation when durable periodic
+work exceeds 100 ms. Overrun recovery now gives ready feeds an intake interval,
+preserving durable writes and control/fault priority. Disconnection enqueue
+failures retain overflow/closed classifications and the first fatal cause.
+These reproductions do not establish the cause of historical AWS restarts.
+
+Local Windows validation: 467 Python checks, 442 passed and 25 platform/dependency
+skips (console 97, data 21, latency 34, operations 147, research 168). The six new
+engine regression checks passed with 90 engine tests, formatting and targeted
+Clippy. Dashboard 22 checks, production build, rendered fixture desktop/mobile
+interaction and exact JSON-download parity passed. Full locked Rust/workspace,
+Python Linux, parity/reference, new exact-image container acceptance and final
+independent review remain required for this candidate; use final-head PR checks
+for authoritative full-suite results.
+
+AWS STS was verified expired on October 8. Ordinary console sign-in now loads in
+the owner's browser; human authentication is pending. No candidate rollout,
+real Telegram acceptance, cloud certificate trust or funded order occurred.
+The historical checkpoints below retain their original dates and scope.
+
 ## Owner-directed preparation checkpoint: October 8, 2026 (Lisbon)
 
 Windows research publication reproduced two transient directory-rename denials

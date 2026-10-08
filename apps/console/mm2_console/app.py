@@ -4,6 +4,7 @@ import threading
 import time
 
 from .auth import RateLimiter, Sessions
+from .comparison import comparison
 from .engine import EngineClient, Reply, redact
 from .observability import execution_summary, health_identity, health_log, history_projection
 from .store import Store
@@ -146,6 +147,13 @@ class App:
         self.log("INFO" if 200 <= reply.status < 300 else "WARN",
                  f"Owner {'limits' if limits else value['action']} command {value['id']}: HTTP {reply.status}; durable receipt required")
         return Reply(reply.status, redact(reply.payload, self.config.secret_values))
+
+    def comparison(self, period="1h"):
+        # Only cached engine state, secondary SQLite and a bounded public artifact.
+        # No engine request, venue request, command or Telegram send is permitted.
+        return redact(comparison(self.state(), self.store,
+                                 self.config.research_view_dir or self.config.state_dir / "research-view",
+                                 int(time.time() * 1000), period), self.config.secret_values)
 
     def start(self):
         with self._lock:

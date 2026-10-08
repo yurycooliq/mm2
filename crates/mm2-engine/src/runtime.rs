@@ -153,6 +153,7 @@ pub struct Actor {
     publication_duration_ns: u64,
     simulation_books: [(u64, u64); 2],
     execution_noop_ticks: u64,
+    execution_periodic_overruns: u64,
     publication_gate: Arc<tokio::sync::Semaphore>,
     publication_task: Option<tokio::task::JoinHandle<()>>,
     simulation_condition: Option<String>,
@@ -165,6 +166,8 @@ pub struct Actor {
     paper: Option<Handle>,
     paper_error: Option<String>,
     paper_fault: Option<watch::Sender<Option<String>>>,
+    #[cfg(test)]
+    timer_work_delay: Duration,
 }
 
 struct Publication {
@@ -193,6 +196,7 @@ struct Publication {
     coalesced_publications: u64,
     publication_duration_ns: u64,
     execution_noop_ticks: u64,
+    execution_periodic_overruns: u64,
     simulation_condition: Option<String>,
     execution_mode: String,
     desired_quotes: Vec<mm2_core::DesiredQuote>,
@@ -319,6 +323,7 @@ pub fn prepare(
         publication_duration_ns: 0,
         simulation_books: [(0, 0); 2],
         execution_noop_ticks: 0,
+        execution_periodic_overruns: 0,
         publication_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         publication_task: None,
         simulation_condition,
@@ -331,6 +336,8 @@ pub fn prepare(
         paper: None,
         paper_error: None,
         paper_fault: None,
+        #[cfg(test)]
+        timer_work_delay: Duration::ZERO,
     };
     actor.publish();
     Ok((
@@ -627,6 +634,7 @@ impl Actor {
             coalesced_publications: self.coalesced_publications,
             publication_duration_ns: self.publication_duration_ns,
             execution_noop_ticks: self.execution_noop_ticks,
+            execution_periodic_overruns: self.execution_periodic_overruns,
             simulation_condition: self.simulation_condition.clone(),
             execution_mode: self.execution_mode.clone(),
             desired_quotes: self.desired_quotes.clone(),
@@ -1204,7 +1212,8 @@ impl Actor {
         Ok(json!({"receipt":receipt,"state":self.state.borrow().as_ref(),"replayed":false}))
     }
     pub async fn run(mut self) {
-        let mut timer = tokio::time::interval(Duration::from_millis(100));
+        let tick_period = Duration::from_millis(100);
+        let mut timer = tokio::time::interval(tick_period);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let initial_fault = self.fault.borrow().clone();
         if let Some(reason) = initial_fault {
@@ -1244,7 +1253,21 @@ impl Actor {
                         None => break,
                     }
                 }
-                _ = timer.tick() => { self.evaluate(); self.drive_live(); self.simulation_step(false).await;self.publish_if_due(); }
+                _ = timer.tick() => {
+                    let began = tokio::time::Instant::now();
+                    self.evaluate(); self.drive_live(); self.simulation_step(false).await;
+                    #[cfg(test)]
+                    tokio::time::sleep(self.timer_work_delay).await;
+                    self.publish_if_due();
+                    if began.elapsed() >= tick_period {
+                        // An overdue durability step must not make the biased
+                        // timer permanently ready ahead of feed intake. Keep
+                        // control/fault priority and the normal cadence; after
+                        // an overrun allow one period of intake before retrying.
+                        self.execution_periodic_overruns = self.execution_periodic_overruns.saturating_add(1);
+                        timer.reset();
+                    }
+                }
                 event = self.feeds.recv() => {
                     match event {
                         Some(event) => {
@@ -1369,6 +1392,7 @@ impl Publication {
             "telemetry_periodic_max_hz":4,"telemetry_coalesced":self.coalesced_publications,"last_snapshot_copy_ns":self.publication_duration_ns,
             "telemetry_policy":"periodic formatting on one-slot background worker; owner command, source and fault transitions publish immediately",
             "execution_noop_ticks":self.execution_noop_ticks,
+            "execution_periodic_overruns":self.execution_periodic_overruns,
             "decision_ns_p50":percentile(50),"decision_ns_p99":if ordered.len()>=1000 {percentile(99)} else {None},
             "measurement":"core and strategy evaluation; excludes transport, parsing, queue wait, execution durability and snapshot publication"});
         let diagnostics = json!({
@@ -1485,6 +1509,70 @@ fn reason_name(reason: &StopReason) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn overdue_periodic_work_does_not_starve_ready_feeds_or_override_fault_priority() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            mode: "simulation".into(),
+            feed_source: crate::config::FeedSource::Public,
+            listen: "127.0.0.1:8088".parse().unwrap(),
+            allow_remote_http: false,
+            state_dir: directory.path().into(),
+            live_state_dir: None,
+            journal_max_bytes: 1_048_576,
+            journal: None,
+            strategy: mm2_strategy::Rules::default(),
+            live: None,
+            command_capacity: 8,
+            feed_capacity: 16,
+            limits: Limits {
+                initial_collateral_usd: "100".into(),
+                max_imbalance_shares: "10".into(),
+                lot_shares: "5".into(),
+                half_width: "0.01".into(),
+                max_feed_age_ms: 1000,
+            },
+        };
+        let (tx, rx) = mpsc::channel(16);
+        let (fault, observed_fault) = watch::channel(None);
+        let (shutdown, control) = watch::channel(false);
+        let (handle, mut actor) =
+            prepare(&config, Instant::now(), rx, observed_fault, control).unwrap();
+        actor.timer_work_delay = Duration::from_millis(150);
+        for _ in 0..4 {
+            tx.try_send(FeedEvent::Reference {
+                exchange_ms: wall_ms(),
+                observed_mono_ms: mono_ms(actor.start),
+                price_micro: 80_000_000_000,
+            })
+            .unwrap();
+        }
+        let task = tokio::spawn(actor.run());
+        tokio::task::yield_now().await;
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_millis(150)).await;
+            tokio::task::yield_now().await;
+        }
+        fault.send_replace(Some("journal writer stopped; reconcile on restart".into()));
+        tokio::time::advance(Duration::from_millis(150)).await;
+        tokio::task::yield_now().await;
+        shutdown.send_replace(true);
+        task.await.unwrap();
+        let final_state = handle.state.borrow();
+        assert_eq!(final_state["metrics"]["feed_events"], 4);
+        assert!(
+            final_state["metrics"]["execution_periodic_overruns"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(final_state["fault_class"], "durability_fault");
+        assert_eq!(final_state["mode"], "paused");
+        assert_eq!(final_state["api_ready"], false);
+        assert_eq!(final_state["command_version"], 0);
+        assert_eq!(final_state["journal"]["execution_operations"], 0);
+    }
+
     #[tokio::test]
     async fn classified_durability_fault_remains_latched_after_valid_source_input() {
         let directory = tempfile::tempdir().unwrap();

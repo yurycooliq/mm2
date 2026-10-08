@@ -1109,6 +1109,58 @@ async fn session(
     }
 }
 
+fn record_failure(
+    endpoint: &Endpoint,
+    start: Instant,
+    reason: &str,
+    fatal: bool,
+    retry: Duration,
+    reset_backoff: bool,
+) {
+    let Some(diagnostics) = &endpoint.diagnostics else {
+        return;
+    };
+    let diagnostics = diagnostics.source(endpoint.source);
+    let code = failure_code(reason, fatal);
+    let at = u64::try_from(start.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .min(u64::MAX >> 9);
+    diagnostics.last_failure.store(
+        (at << 9) | u64::from(code) | if fatal { 256 } else { 0 },
+        Ordering::Relaxed,
+    );
+    diagnostics
+        .phase
+        .store(if fatal { 6 } else { 5 }, Ordering::Relaxed);
+    if !fatal {
+        increment(&diagnostics.transport_disconnects);
+    }
+    if code == 1 {
+        increment(&diagnostics.bootstrap_timeouts);
+    }
+    if reset_backoff {
+        increment(&diagnostics.backoff_resets);
+    }
+    diagnostics.retry_delay_ms.store(
+        if fatal {
+            0
+        } else {
+            u64::try_from(retry.as_millis()).unwrap_or(u64::MAX)
+        },
+        Ordering::Relaxed,
+    );
+    tracing::warn!(
+        source = if endpoint.source == FeedSource::Clob {
+            "clob"
+        } else {
+            "binance"
+        },
+        code = failure_name(code).unwrap_or("unclassified"),
+        fatal,
+        "public feed session ended"
+    );
+}
+
 async fn run_feed(
     endpoint: Endpoint,
     market: Market,
@@ -1153,57 +1205,29 @@ async fn run_feed(
             && ready_since
                 .is_some_and(|ready: Instant| ready.elapsed() >= endpoint.settings.stable);
         retry = reconnect_delay(retry, &endpoint.settings, reset_backoff);
-        if let Some(diagnostics) = &endpoint.diagnostics {
-            let diagnostics = diagnostics.source(source);
-            let code = failure_code(&reason, fatal);
-            let at = u64::try_from(start.elapsed().as_millis())
-                .unwrap_or(u64::MAX)
-                .min(u64::MAX >> 9);
-            diagnostics.last_failure.store(
-                (at << 9) | u64::from(code) | if fatal { 256 } else { 0 },
-                Ordering::Relaxed,
-            );
-            diagnostics
-                .phase
-                .store(if fatal { 6 } else { 5 }, Ordering::Relaxed);
-            if !fatal {
-                increment(&diagnostics.transport_disconnects);
-            }
-            if code == 1 {
-                increment(&diagnostics.bootstrap_timeouts);
-            }
-            if reset_backoff {
-                increment(&diagnostics.backoff_resets);
-            }
-            diagnostics.retry_delay_ms.store(
-                if fatal {
-                    0
-                } else {
-                    u64::try_from(retry.as_millis()).unwrap_or(u64::MAX)
-                },
-                Ordering::Relaxed,
-            );
-            tracing::warn!(
-                source = if source == FeedSource::Clob {
-                    "clob"
-                } else {
-                    "binance"
-                },
-                code = failure_name(code).unwrap_or("unclassified"),
-                fatal,
-                "public feed session ended"
-            );
+        record_failure(&endpoint, start, &reason, fatal, retry, reset_backoff);
+        if fatal {
+            // A secondary Disconnect failure must not replace the session's
+            // first fatal cause in the independent fault channel.
+            latch_fault(&fault, reason.clone());
         }
-        enqueue_frame(
+        if let Err(queue_error) = enqueue_frame(
             &tx,
             vec![FeedEvent::Disconnect {
                 source,
                 reason: reason.clone(),
             }],
             &fault,
-        )?;
+        ) {
+            // Even a recoverable transport loss becomes fatal if its disconnect
+            // cannot reach the actor. Preserve source/code/fatal diagnostics for
+            // that secondary queue failure rather than exporting a retry phase.
+            if !fatal || queue_error != reason {
+                record_failure(&endpoint, start, &queue_error, true, Duration::ZERO, false);
+            }
+            return Err(queue_error);
+        }
         if fatal {
-            latch_fault(&fault, reason.clone());
             return Err(reason);
         }
         tokio::select! {
@@ -1389,6 +1413,121 @@ mod transport_tests {
         assert_eq!(input_failure_class(&reason), "feed_consumer_closed");
         assert_eq!(observed.borrow().as_deref(), Some("feed consumer closed"));
         assert_eq!(failure_name(7), Some("feed_queue_unavailable"));
+    }
+
+    async fn disconnect_queue_failure(
+        closed: bool,
+        prior_fault: Option<&str>,
+        invalid_input: bool,
+    ) {
+        let selected = market();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            if invalid_input {
+                socket
+                    .send(Message::Text("{invalid fixture JSON".into()))
+                    .await
+                    .unwrap();
+            } else {
+                socket.close(None).await.unwrap();
+            }
+        });
+        let (tx, rx) = mpsc::channel(1);
+        if !closed {
+            tx.try_send(FeedEvent::Reference {
+                exchange_ms: 1,
+                observed_mono_ms: 1,
+                price_micro: 1,
+            })
+            .unwrap();
+        }
+        let retained_receiver = if closed {
+            drop(rx);
+            None
+        } else {
+            Some(rx)
+        };
+        let (fault, state) = watch::channel(prior_fault.map(str::to_owned));
+        let (_shutdown, control) = watch::channel(false);
+        let diagnostics = Arc::new(FeedDiagnostics::default());
+        let reason = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_feed(
+                Endpoint {
+                    source: FeedSource::Clob,
+                    url,
+                    settings: fast_settings(),
+                    tick_refresh: TickRefresh::Skip,
+                    diagnostics: Some(diagnostics.clone()),
+                },
+                selected,
+                Instant::now(),
+                tx,
+                fault,
+                control,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let expected = if closed {
+            "feed consumer closed"
+        } else {
+            "feed queue overflow"
+        };
+        assert_eq!(reason, expected);
+        let first = if invalid_input {
+            "invalid CLOB JSON"
+        } else {
+            expected
+        };
+        assert_eq!(
+            state.borrow().as_deref(),
+            Some(prior_fault.unwrap_or(first))
+        );
+        let sample = diagnostics.snapshot();
+        assert_eq!(
+            sample.clob.last_failure,
+            Some(input_failure_class(expected))
+        );
+        assert!(sample.clob.last_failure_fatal);
+        assert_eq!(sample.clob.phase, "faulted");
+        assert_eq!(sample.clob.retry_delay_ms, 0);
+        assert_eq!(
+            sample.clob.transport_disconnects,
+            if invalid_input { 0 } else { 1 }
+        );
+        assert_eq!(sample.binance.last_failure, None);
+        if let Some(mut rx) = retained_receiver {
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                FeedEvent::Reference { .. }
+            ));
+            assert!(rx.try_recv().is_err());
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_queue_full_is_a_fatal_source_failure_without_replacing_prior_fault() {
+        disconnect_queue_failure(false, None, false).await;
+        disconnect_queue_failure(false, Some("prior durability fault"), false).await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_queue_closed_is_a_fatal_source_failure_without_replacing_prior_fault() {
+        disconnect_queue_failure(true, None, false).await;
+        disconnect_queue_failure(true, Some("prior durability fault"), false).await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_queue_failure_preserves_the_sessions_first_fatal_input_cause() {
+        disconnect_queue_failure(false, None, true).await;
+        disconnect_queue_failure(true, None, true).await;
     }
 
     #[tokio::test]
