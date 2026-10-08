@@ -1,5 +1,36 @@
 # Validation evidence
 
+## Owner-directed preparation checkpoint: October 8, 2026 (Lisbon)
+
+Windows research publication reproduced two transient directory-rename denials
+on the unchanged `cd51558` candidate. Diagnostic-only retries of the same verified
+staging directories succeeded after 62/63 ms with unchanged manifests. The lock
+holder was not identified. Publication now retries only WinError 5 with an absent
+destination and verified unchanged staging data, at most four rename attempts
+with 50/150/300 ms delays. Permanent denial, corrupted staging, conflicting
+publication and mutation during backoff still fail and retain staging evidence.
+There is no archive deletion or retry of collection, journal writes or requests.
+
+The final local Windows research suite ran 144 tests: 143 passed, one Linux-only
+skip. Five new cross-platform fault-injection checks cover these failure modes.
+The current Python suite contains 419 checks: console 80, data 21, latency 34,
+ops 140, research 144. Full Linux results for the latest candidate must be read
+from [PR 5](https://github.com/yurycooliq/mm2/pull/5), rather than inferred from
+the local Windows result. The preceding exact `cd51558` CI completed successfully:
+244 Rust tests plus format/Clippy/release build, 414 Python tests without skips,
+16 dashboard tests/build, 19 reference checks, 6 parity checks, 14 container smoke
+checks and zero live orders ([run 37549266326](https://github.com/yurycooliq/mm2/actions/runs/37549266326)).
+
+The separately authorized local MM2 CA and worker certificate are now enrolled
+in the current user's Windows certificate store. RSA-3072/SHA256 software CNG
+keys have nonexportable policies; this is not TPM evidence. Public chain and
+official helper 1.8.5 signature verification passed. No cloud trust or machine
+profile is enabled. October 8 STS reports the human session expired; two renewed
+login flows returned browser 400 as reported by the owner. Latest server health
+therefore remains unverified, and October 6 snapshots below remain dated evidence.
+Independent review, paused rollout, real Telegram acceptance, machine access
+renewal/revocation and financial/venue acceptance remain pending.
+
 ## Owner-directed recovery checkpoint: October 7, 2026 (Lisbon)
 
 The recovery candidate addresses Telegram launch-data expiry with a live bound

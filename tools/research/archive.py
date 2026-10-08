@@ -4,11 +4,13 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import time
 import uuid
 from .schema import VERSION, MAX_FILE, ResearchError, canonical, digest, load_json, parse_json, utc, utc_now, window
 
 MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 MAX_FILES = 32
+WINDOWS_RENAME_DELAYS = (0.05, 0.15, 0.3)
 
 
 def _name(value):
@@ -82,16 +84,28 @@ def publish_bundle(root, files, *, scope, utc_range, quality, source_revision="u
         _sync_write(staging / name, data)
     _sync_write(staging / "manifest.json", canonical(manifest) + b"\n")
     _sync_directory(staging)
-    try:
-        os.rename(staging, final)
-    except OSError:
-        # Destination-exists errors are platform dependent: Windows may return
-        # AccessDenied for a nonempty directory, Linux may return ENOTEMPTY.
-        # Adopt a competing publication only after full content verification.
-        if not final.is_dir():
-            raise
-        if verify_bundle(final) != manifest:
-            raise ResearchError("concurrent publication conflict")
+    for attempt in range(len(WINDOWS_RENAME_DELAYS) + 1):
+        if attempt and verify_bundle(staging) != manifest:
+            raise ResearchError("staged publication changed")
+        try:
+            os.rename(staging, final)
+            break
+        except OSError as error:
+            # Destination-exists errors are platform dependent. Adopt a
+            # competing publication only after full content verification.
+            if final.is_dir():
+                if verify_bundle(final) != manifest:
+                    raise ResearchError("concurrent publication conflict")
+                break
+            # Windows can briefly deny rename of a just-written directory.
+            # Retry only this exact error, an absent destination and unchanged
+            # verified staging data. Never rewrite/delete data or retry I/O.
+            if (getattr(error, "winerror", None) != 5 or final.exists() or final.is_symlink()
+                    or attempt == len(WINDOWS_RENAME_DELAYS)):
+                raise
+            if verify_bundle(staging) != manifest:
+                raise ResearchError("staged publication changed")
+            time.sleep(WINDOWS_RENAME_DELAYS[attempt])
     _sync_directory(root)
     return final
 

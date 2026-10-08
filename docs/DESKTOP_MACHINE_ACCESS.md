@@ -1,4 +1,20 @@
-# Desktop machine access: prepared configuration, enrollment not completed
+# Desktop machine access: local enrollment verified, cloud acceptance pending
+
+As of October 8, the owner-authorized dedicated MM2 CA and 90-day worker
+certificate are enrolled in `CurrentUser\\My`. Both keys use RSA-3072/SHA256,
+Microsoft Software Key Storage Provider and nonexportable CNG policies. Public
+chain/constraints, local signatures, helper 1.8.5 checksum/Authenticode, exact
+certificate selection and helper-generated public signature verification passed.
+This does not establish TPM storage, cloud trust, renewal or unattended runtime
+availability. Enrollment receipts and public PEM files stay in ignored output;
+no private key was exported. The worker expires January 5, 2027 UTC; the CA key
+is bound to this Windows user/device, so device loss requires controlled new-CA
+enrollment. Public certificate files cannot restore either private key.
+
+The human AWS session expired on October 8. Both regular and remote login flows
+returned browser 400 as reported by the owner; ordinary console login must be
+checked before new cloud pre-deployment validation. No prepared CloudFormation
+change set has been executed and no machine profile is enabled.
 
 Read-only AWS inspection on 7 October Lisbon found no Roles Anywhere trust anchors
 or profiles in eu-west-1. The current human profile `mm2` was reauthenticated, but
@@ -16,8 +32,9 @@ sessions to work around a failed check.
 This is infrastructure for named CLI operations, not an inferred boto3 application
 policy. Account/region are resolved from deployment; the default research instance
 was verified from the existing scoped configuration. Deployment requires a reviewed
-CA's **public** PEM and certificate enrollment. No CA, key, profile, IAM role or
-trust was created or activated while preparing the template.
+CA's **public** PEM and certificate enrollment. Local certificates were created
+after the owner selected a dedicated CA; no cloud profile, IAM role or trust
+has been created or activated as of this checkpoint.
 Validate with cfn-lint, AWS validate-template and `infra/aws/desktop-access.guard`.
 Guard checks default-disabled access, short sessions, exact transport scope and
 certificate/anchor trust. It does not replace resolved-policy simulation or

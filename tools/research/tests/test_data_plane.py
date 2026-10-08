@@ -389,6 +389,80 @@ class ObserverTests(unittest.TestCase):
 
 
 class ArchiveComparisonTests(unittest.TestCase):
+    @staticmethod
+    def windows_access_denied():
+        error = PermissionError("simulated Windows rename access denied")
+        error.winerror = 5
+        return error
+
+    def test_transient_windows_rename_reuses_verified_staging_without_rewriting(self):
+        original = archive.os.rename
+        calls = []
+        def transient(source, target):
+            calls.append((source, target))
+            if len(calls) == 1:
+                raise self.windows_access_denied()
+            return original(source, target)
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            with patch.object(archive.os, "rename", side_effect=transient), patch.object(archive.time, "sleep") as sleep:
+                bundle = publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                    utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(calls[0], calls[1])
+            sleep.assert_called_once_with(0.05)
+            self.assertEqual(verify_bundle(bundle)["bundle_id"], bundle.name)
+            self.assertEqual(len(list(Path(temp).iterdir())), 1)
+
+    def test_permanent_windows_denial_is_bounded_and_retains_verified_staging(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            with patch.object(archive.os, "rename", side_effect=self.windows_access_denied()) as rename, patch.object(archive.time, "sleep") as sleep:
+                with self.assertRaises(PermissionError):
+                    publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                        utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(rename.call_count, 4)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.05, 0.15, 0.3])
+            staging = list(Path(temp).glob("publishing-*"))
+            self.assertEqual(len(staging), 1)
+            verify_bundle(staging[0])
+            self.assertEqual(len(list(Path(temp).iterdir())), 1)
+
+    def test_changed_staging_after_windows_denial_cannot_publish(self):
+        def corrupt(source, target):
+            (source / "events.jsonl").write_bytes(b"{}\n")
+            raise self.windows_access_denied()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            with patch.object(archive.os, "rename", side_effect=corrupt) as rename, patch.object(archive.time, "sleep") as sleep:
+                with self.assertRaises(ResearchError):
+                    publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                        utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(rename.call_count, 1)
+            sleep.assert_not_called()
+            self.assertEqual(len(list(Path(temp).glob("publishing-*"))), 1)
+
+    def test_windows_denial_with_conflicting_destination_never_retries_or_adopts(self):
+        def conflict(source, target):
+            shutil.copytree(source, target)
+            (target / "events.jsonl").write_bytes(b"{}\n")
+            raise self.windows_access_denied()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            with patch.object(archive.os, "rename", side_effect=conflict) as rename, patch.object(archive.time, "sleep") as sleep:
+                with self.assertRaises(ResearchError):
+                    publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                        utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(rename.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_staging_mutation_during_windows_backoff_is_rejected_before_next_rename(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            def mutate_during_backoff(_):
+                staging = next(Path(temp).glob("publishing-*"))
+                (staging / "events.jsonl").write_bytes(b"{}\n")
+            with patch.object(archive.os, "rename", side_effect=self.windows_access_denied()) as rename, patch.object(archive.time, "sleep", side_effect=mutate_during_backoff):
+                with self.assertRaises(ResearchError):
+                    publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                        utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(rename.call_count, 1)
+            self.assertEqual(len(list(Path(temp).glob("publishing-*"))), 1)
+
     def test_bundle_integrity_idempotency_and_no_path_escape(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
             args = {"scope": SCOPE, "utc_range": RANGE, "quality": COMPLETE, "created_at_utc": END}
