@@ -129,6 +129,10 @@ export function Comparison({ envelope }: { envelope: Envelope | null }) {
     <div className="comparison-engine"><span className={`data-status ${envelope?.connected ? 'data-fresh' : 'data-warning'}`}>Движок {envelope?.connected ? 'на связи' : 'недоступен'}</span>
       <span>Режим: {comparisonMode(state ? `${state.execution_mode}/${state.mode}` : null)}</span><span>Потоки данных: {envelope?.connected && state?.feed_ready ? 'готовы' : 'не готовы'}</span>
       <span>Торговля: {state?.live && envelope?.connected ? comparisonMode(state.live.phase) : 'нет подтвержденного активного счета'}</span></div>
+    {state?.fault && <div className="notice error" role="alert">{envelope?.connected ? 'Ошибка движка' : 'Последняя известная ошибка движка'}: {state.fault}</div>}
+    {state?.simulation_error && <div className="notice error" role="alert">{envelope?.connected ? 'Симуляция остановлена' : 'Последняя известная ошибка симуляции'}: {state.simulation_error}</div>}
+    {state?.live?.fault && <div className="notice error" role="alert">{envelope?.connected ? 'Торговля остановлена' : 'Последняя известная ошибка торговли'}: {state.live.fault}</div>}
+    {envelope?.connected && ['warning', 'critical', 'full'].includes(envelope.execution?.journal?.stage ?? '') && <div className="notice warning" role="alert">{envelope.execution?.journal?.stage === 'full' ? 'Журнал достиг лимита.' : 'Журнал приближается к лимиту.'} Откройте управление и диагностику: продолжение работы требует проверки сохраненного состояния.</div>}
     <p className="comparison-disclaimer">Симуляция использует условные исполнения. Публичные операции кошелька не раскрывают внутреннюю стратегию mo-money и не подтверждают прибыль его бота.</p>
     {snapshot && <nav className="comparison-jumps" aria-label="Перейти к данным"><button onClick={() => document.getElementById('comparison-mm2')?.scrollIntoView({ block: 'start' })}>MM2 · симуляция</button><button onClick={() => document.getElementById('comparison-mo-money')?.scrollIntoView({ block: 'start' })}>mo-money</button></nav>}
     {error && <div className="notice warning" role="status">{error}</div>}

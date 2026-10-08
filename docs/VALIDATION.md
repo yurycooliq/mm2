@@ -39,6 +39,9 @@ position scope warnings. Requested-feed completeness is now distinguished from
 all wallet activity. Legacy samples without known boot identity cannot establish
 a continuous gain or connecting chart line; current samples from separate boots
 never join.
+The primary screen also exposes sampled engine/simulation/live faults and
+warning/critical/full journal capacity without expanding diagnostics. Rendered
+desktop/mobile fault and capacity fixtures passed with no control submissions.
 
 AWS STS was verified expired on October 8. Ordinary console sign-in now loads in
 the owner's browser; human authentication is pending. No candidate rollout,
