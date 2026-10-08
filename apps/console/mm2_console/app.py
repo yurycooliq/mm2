@@ -4,6 +4,7 @@ import threading
 import time
 
 from .auth import RateLimiter, Sessions
+from .audit_projection import observer_identity
 from .comparison import comparison
 from .engine import EngineClient, Reply, redact
 from .observability import execution_summary, health_identity, health_log, history_projection
@@ -52,11 +53,14 @@ class App:
         self._sample_lock = threading.Lock()
         self._snapshot = {"state": None, "observed_at_ms": None, "connected": False, "error": "waiting for first engine sample"}
         self._metrics = {"sampling_interval_ms": 1000, "sample_count": 0, "history_dropped": 0,
-                         "logs_dropped": 0, "history_compacted": 0, "overruns": 0, "last_sampling_ms": None, "storage_error": None}
+                         "logs_dropped": 0, "history_compacted": 0, "action_history_dropped": 0,
+                         "action_history_error": None, "overruns": 0, "last_sampling_ms": None, "storage_error": None}
         self._last_log_identity = None
         self._last_equity_minute = None
         self.stop = threading.Event()
         self._sampler = None
+        self.store.configure_action_observer(observer_identity(config.engine_url))
+        self._action_migrated = False
 
     def log(self, level, message):
         message = redact(str(message), self.config.secret_values)
@@ -102,6 +106,27 @@ class App:
                         self._metrics["history_dropped"] += 1
                         self._metrics["storage_error"] = "secondary minute valuation persistence unavailable"
             if state is not None:
+                # Capture the small allowlisted audit before raw history can be
+                # compacted. This is secondary and never a full account ledger.
+                try:
+                    if not self._action_migrated:
+                        self._action_migrated = self.store.backfill_action_samples(state, now)
+                except Exception:
+                    with self._lock:
+                        self._metrics["action_history_dropped"] += 1
+                        self._metrics["action_history_error"] = "secondary sampled action migration unavailable"
+                        self._metrics["storage_error"] = "secondary sampled action migration unavailable"
+                try:
+                    action_recorded = self.store.action_sample(now, state)
+                except Exception:
+                    action_recorded = False
+                with self._lock:
+                    if not action_recorded:
+                        self._metrics["action_history_dropped"] += 1
+                        self._metrics["action_history_error"] = "secondary sampled action persistence unavailable"
+                        self._metrics["storage_error"] = "secondary sampled action persistence unavailable"
+                    else:
+                        self._metrics["action_history_error"] = None
                 historical = history_projection(state)
                 if historical is not state:
                     with self._lock:

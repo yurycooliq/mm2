@@ -1,5 +1,41 @@
 # Validation evidence
 
+## Restarted simulation action history: October 8, 2026, 19:04 UTC
+
+Actual-container acceptance on `144143f` first passed the desktop/mobile
+comparison, but refreshing after engine restore lost the current audit list.
+The synthetic portfolio and durable command receipts were preserved. This was
+a reporting defect, not evidence that the capital journal was lost.
+
+The console now captures a bounded sanitized action projection before raw-state
+compaction, in its existing secondary SQLite store. Reads merge that retained
+projection with the current ring without writing, issuing commands or parsing
+the primary journal. Recovered paused snapshots with no active simulation can
+still select a source-qualified retained history. Limits, sampling gaps,
+API-tail omissions, boot uncertainty and generation changes remain visible;
+actions/financial completeness remain false. A published directory locator is
+not an authenticated account or globally unique financial ledger identity.
+
+Repeated independent review reproduced and fixed an audit-sequence rollback
+mixing old/new generations and a logical-time event being relabeled as a new
+observation on every read. Existing IDs keep the first observation clock before
+period filtering; evicted observations do not resurrect. Reset epochs separate
+sources. Legacy backfill is restricted to validated current boot/profile/locator/
+epoch because legacy samples do not prove their configured observer endpoint.
+Published u64 counters retain exact text values instead of overflowing SQLite
+signed integers. Missing or compacted old data cannot establish past actions.
+
+The frozen console suite passes 118 checks, including 12 action-history
+regressions; dashboard 30 checks and its production build pass. The earlier
+exact `144143f` push and PR CI both passed 250 Rust, 486 Python, 29 dashboard,
+19 reference and 6 parity checks, plus 14 real-container smoke checks and zero
+live orders ([push run](https://github.com/yurycooliq/mm2/actions/runs/37822689889),
+[PR run](https://github.com/yurycooliq/mm2/actions/runs/37822695840)). Those are
+dated earlier-candidate receipts. Final-head checks in [PR 5](https://github.com/yurycooliq/mm2/pull/5)
+and the separate final exact-image restart/browser receipts must establish this
+new history candidate. No AWS rollout or economic/funded result follows from
+these local checks.
+
 ## Simulation/comparison preparation: October 8, 2026, 18:10 UTC
 
 The owner console now has separate MM2 simulation and mo-money public-observation

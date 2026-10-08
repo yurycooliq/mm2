@@ -166,7 +166,9 @@ class ComparisonTests(unittest.TestCase):
         self.assertIsNone(result["actions"][0]["amount_usd"])
         self.assertIsNone(result["metrics"]["net_pnl_usd"]["value"])
         self.assertFalse(result["coverage"]["actions_complete"])
-        self.assertEqual(result["coverage"]["omitted_actions"], 2)
+        self.assertEqual(result["coverage"]["omitted_actions"], 0)
+        # Missing engine ring events are different from API-tail omissions.
+        self.assertEqual(result["coverage"]["source_audit_evicted"], 2)
 
     def test_stale_engine_retains_labeled_actions_but_not_current_balances(self):
         self.envelope["connected"] = False

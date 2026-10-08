@@ -28,6 +28,23 @@ or issues an engine command. A missing public view does not disconnect the
 engine. NAV samples are estimates at best bid; reset/context changes and gaps
 break continuity. The recent paper audit is bounded and is not a full ledger.
 
+The console sampler also stores a separate sanitized paper-action history before
+raw snapshot compaction: at most 4,096 observations over seven days, inside the
+existing 64 MiB SQLite cap. Comparison reads are side-effect free and show at most
+256 retained rows per selected interval; sampling gaps and retention omissions
+remain explicit. This secondary history survives normal console/engine restarts
+without reading or changing an engine journal. Old compacted samples cannot
+reconstruct missing actions.
+
+Event identity includes observer/profile/source, boot, reset epoch, market and
+audit sequence. Actual event and observation clocks remain distinct; logical
+simulation time is never relabeled as UTC. The engine's published ledger locator
+is a directory fingerprint, not account authentication or a global ledger ID.
+Missing/changed locators, prefix rollback/conflicts and cross-boot uncertainty
+are qualified separately. Observations across boots do not prove that their
+capital ledgers are continuous. Current model totals still come only from the
+current authenticated engine snapshot.
+
 ## Public refresher
 
 ```
@@ -114,6 +131,9 @@ activity vs unavailable activity, null costs and context/gap NAV discontinuity.
 Verify cumulative synthetic capital conservation, reported estimate provenance,
 actual selected point endpoints, daily fidelity, missing optional PnL and an
 insufficient point baseline independently of action-feed completeness.
+Check saved observed actions after console and engine restart, oversized raw
+snapshot compaction, sampled/retention gaps, source/boot/generation separation
+and secondary SQLite failure. Never recreate an unobserved historical event.
 Render desktop/mobile and exercise the shared period selector, action histories,
 missing/stale reference, owner reauthentication and preserved pending command ID.
 Finally validate real public capture and real engine/container/console wiring;

@@ -7,6 +7,7 @@ import re
 import sqlite3
 
 from .observability import execution_summary
+from .audit_projection import digest, project_audit
 from .telegram_reports import deposit_value, holdings, valuation_boot, valuation_context
 
 REFERENCE_ACCOUNT = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
@@ -351,51 +352,42 @@ def own_lane(envelope, store, now_ms, start_ms):
     result["metrics"]["nav_usd"] = metric(decimal(deposit_value(state, "paper", now_ms)) if connected else None,
         scope="current synthetic best-bid NAV estimate", reason="SAMPLED_NAV_NOT_REALIZED_PROFIT")
     result["metrics"]["net_pnl_usd"] = metric(scope="simulation period result", reason="FULL_BOT_LEDGER_REQUIRED")
-    simulation = obj(state.get("simulation"))
-    audit = simulation.get("recent_audit")
-    audit = audit[-256:] if isinstance(audit, list) else []
-    now_sim = uint(simulation.get("now_ms"))
-    wall_clock = now_sim is not None and observed is not None and abs(now_sim - observed) <= 60_000
-    if not wall_clock:
-        result["warnings"].append("SIMULATION_CLOCK_NOT_WALL_TIME")
-    market = _text(state.get("simulation_market_condition"))
-    epoch = uint(state.get("reset_epoch"))
-    quotes, conflicting = {}, set()
-    same_market = market is not None and obj(state.get("market")).get("condition_id") == market
-    if simulation.get("simulated") is True and same_market:
-        for name in ("venue_orders", "orders"):
-            orders = simulation.get(name)
-            for row in orders[:1024] if isinstance(orders, list) else []:
-                row = obj(row)
-                identity, quote = uint(row.get("id")), obj(row.get("quote"))
-                price = uint(quote.get("price_micros"))
-                if identity is None or quote.get("outcome") not in {"up", "down"} or price is None or not 0 < price < 1_000_000:
-                    continue
-                if identity in quotes and quotes[identity] != quote:
-                    conflicting.add(identity)
-                quotes[identity] = quote
-        for identity in conflicting:
-            quotes.pop(identity, None)
-    for row in audit:
-        row = obj(row)
-        seq = uint(row.get("sequence"))
-        if seq is None:
-            continue
-        at = uint(row.get("at_ms")) if wall_clock else None
-        if at is not None and (at > now_ms or (start_ms is not None and at < start_ms)):
-            continue
-        order_id = uint(row.get("order_id"))
-        quote = quotes.get(order_id, {})
-        result["actions"].append({"id": f"paper:{epoch}:{market}:{seq}"[:128], "at_ms": at,
-            "kind": _text(row.get("kind"), 32) or "unknown", "market": market, "side": "BUY" if quote else None,
-            "outcome": _text(quote.get("outcome"), 64), "quantity_shares": decimal(uint(row.get("quantity_micros")), 6),
-            "amount_usd": None, "source": "synthetic-recent-audit", "order_id": str(order_id) if order_id is not None else None,
-            "title": _text(obj(state.get("market")).get("title")) if same_market else None,
-            "price_usd": decimal(uint(quote.get("price_micros")), 6)})
-    result["coverage"] = {"actions_complete": False, "financial_complete": False, "reason": "RECENT_AUDIT_NOT_COMPLETE_LEDGER",
-        "observed_actions": len(result["actions"]), "omitted_actions": uint(simulation.get("audit_evicted"))}
-    result["actions"].reverse()
-    result["metrics"]["observed_events"] = metric(str(len(result["actions"])), unit="count", scope="retained recent simulation audit", reason="RECENT_AUDIT_NOT_COMPLETE_LEDGER")
+    try:
+        history = store.action_history(state, observed, now_ms, start_ms)
+    except (sqlite3.Error, ValueError, TypeError, OverflowError):
+        # Keep the current ring visible even if the secondary store is down.
+        # No history is invented, imported or persisted by an API request.
+        projected = project_audit(state, observed, store.action_observer) if observed is not None else None
+        actions = []
+        if projected is not None:
+            generation = digest([projected["base"], "initial"])
+            for action in projected["actions"]:
+                action, _ = store._action(action, generation)
+                at = action["at_ms"] if action["at_ms"] is not None else observed
+                if at is not None and at <= now_ms and (start_ms is None or at >= start_ms):
+                    action["observation"] = "current-snapshot"
+                    actions.append(action)
+        history = {"actions": list(reversed(actions)), "observed_actions": len(actions), "omitted_actions": 0,
+            "retention_omitted_observations": None, "scope_id": None,
+            "warnings": (projected["warnings"] if projected else []) + ["SECONDARY_ACTION_HISTORY_UNAVAILABLE"]}
+    result["actions"] = history["actions"]
+    result["warnings"].extend(history["warnings"])
+    telemetry = obj(envelope.get("telemetry"))
+    if telemetry.get("action_history_error") is not None:
+        result["warnings"].append("SECONDARY_ACTION_HISTORY_UNAVAILABLE")
+    if uint(telemetry.get("action_history_dropped")):
+        result["warnings"].append("ACTION_HISTORY_SAMPLE_GAPS")
+    if history["scope_id"] is not None:
+        result["source_refs"].append({"kind": "secondary_sampled_simulation_audit", "id": history["scope_id"],
+                                     "sha256": None, "at_ms": observed})
+    result["coverage"] = {"actions_complete": False, "financial_complete": False,
+        "reason": "SAMPLED_ACTION_HISTORY_NOT_COMPLETE_LEDGER", "observed_actions": history["observed_actions"],
+        "omitted_actions": history["omitted_actions"],
+        "retention_omitted_observations": history["retention_omitted_observations"],
+        "source_audit_evicted": uint(obj(state.get("simulation")).get("audit_evicted"))}
+    result["metrics"]["observed_events"] = metric(str(history["observed_actions"]), unit="count",
+        scope="retained sampled simulation observations within requested period", reason="SAMPLED_ACTION_HISTORY_NOT_COMPLETE_LEDGER")
+    result["warnings"] = sorted(set(result["warnings"]))
     positions, complete = holdings(state, "paper")
     result["positions"] = [{"market": row["market"], "outcome": row["outcome"],
                             "quantity_shares": decimal(row["quantity"], 6), "value_usd": None}

@@ -37,6 +37,20 @@ test('active simulation shadow flag and cumulative fills have clear meanings', (
   assert.equal(comparisonKind('venue_fill'), 'Условное исполнение');
 });
 
+test('persisted action history explains sampling, retention and source continuity without claiming a complete ledger', () => {
+  const cases = [
+    ['SAMPLED_ACTION_HISTORY_NOT_COMPLETE_LEDGER', /сохраненная выборка.*не полный журнал.*нельзя подтвердить/],
+    ['BOOT_CONTINUITY_UNPROVEN', /разных запусков.*одного счета и журнала.*не подтверждена/],
+    ['ACTION_HISTORY_LOCATOR_UNBOUND', /не подтверждена.*только.*текущего снимка/],
+    ['ACTION_HISTORY_GENERATION_CHANGED', /отката или несовпадения.*отделены.*не подтверждена/],
+    ['ACTION_HISTORY_SAMPLE_GAPS', /есть пропуски.*могла не попасть/],
+    ['ACTION_HISTORY_RETENTION_LIMIT', /4 096 наблюдениями и 7 днями.*исключена из этой выборки/],
+    ['SECONDARY_ACTION_HISTORY_UNAVAILABLE', /выборка действий недоступна.*снимок проверяется отдельно.*не заменяются нулями/],
+    ['ACTION_HISTORY_INVALID_SOURCE', /конфликтующие записи.*не прошли проверку.*не подтверждена/],
+  ];
+  for (const [reason, description] of cases) assert.match(comparisonReason(reason), description, reason);
+});
+
 function snapshot() {
   const metric = { value: null, unit: 'USD', scope: 'unknown', reason: 'INCOMPLETE_ACCOUNTING' };
   const lane = { status: 'UNAVAILABLE', metrics: Object.fromEntries(['cash_usd', 'nav_usd', 'net_pnl_usd', 'equity_change_usd', 'turnover_usd', 'observed_events', 'cost_bound_usd'].map(key => [key, { ...metric }])), freshness: {}, coverage: {}, period: {}, actions: [], positions: [], equity: [], source_refs: [], warnings: [] };
