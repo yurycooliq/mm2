@@ -31,10 +31,13 @@ does not establish the classification reproduction.
 
 Virtual before/after testing exposed a stale Cargo artifact in the local shared
 BuildKit target cache. A forced recompilation corrected the test builder; final
-local image acceptance must first clean only the cached mm2-engine package,
-then use the normal production Dockerfile and verify new test counts, release
-compilation, exact revision labels and actual runtime behavior. No engine
-journal or capital reset is part of that build-cache operation.
+local image acceptance must force recompilation of the mm2-engine package and
+verify new test counts, release compilation, exact revision labels and actual
+runtime behavior. Cargo clean refused the shared target without a valid cache
+directory marker; no files were deleted or guard bypassed. A one-use local copy
+of the production Dockerfile touches the engine source before its unchanged
+test/release command. That changes build freshness only. No engine journal or
+capital reset is part of that build-cache operation.
 
 Both push and PR CI for the earlier `81028a0` history candidate passed 803
 automated checks without skips (250 Rust, 498 Python, 30 dashboard, 19 reference,
