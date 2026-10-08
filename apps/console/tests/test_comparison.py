@@ -67,6 +67,90 @@ class ComparisonTests(unittest.TestCase):
         (target.parent / "current.json").write_bytes(canonical({"bundle_id": target.name}))
         return target
 
+    def reported(self):
+        points = [{"at_ms": NOW - 7_200_000, "economic_pnl_usd": "100", "realized_pnl_usd": "100",
+                   "unrealized_pnl_usd": "0", "wallet_income_usd": "0"},
+                  {"at_ms": NOW - 3_600_000, "economic_pnl_usd": "98.75", "realized_pnl_usd": "99",
+                   "unrealized_pnl_usd": "-0.25", "wallet_income_usd": "0"}]
+        return {"status": "AVAILABLE", "evidence_class": "venue-reported-wallet-estimate", "wallet": ACCOUNT,
+                "endpoint": "https://data-api.polymarket.com/v2/user-pnl", "interval": "1d", "fidelity": "1h",
+                "source_fidelity": "1d", "source_at_ms": NOW - 60_000, "response_sha256": "c" * 64,
+                "latest_at_ms": points[-1]["at_ms"], "latest": {key: value for key, value in points[-1].items() if key != "at_ms"},
+                "period": {"start_ms": points[0]["at_ms"], "end_ms": points[-1]["at_ms"]},
+                "change_economic_pnl_usd": None, "series": points, "warnings": ["PNL_CASHFLOWS_UNKNOWN"]}
+
+    def test_provider_wallet_result_is_separate_from_unknown_account_result_and_uses_actual_selected_points(self):
+        self.artifact(lambda view: view.update(reported_performance=self.reported()))
+        lane = load_reference(self.root / "views", NOW, NOW - 86_400_000, "24h")
+        result = lane["reported_performance"]
+        self.assertEqual(result["status"], "AVAILABLE")
+        self.assertEqual(result["change_economic_pnl_usd"], "-1.25")
+        self.assertEqual(result["period"], {"start_ms": NOW - 7_200_000, "end_ms": NOW - 3_600_000})
+        self.assertEqual(result["latest"]["economic_pnl_usd"], "98.75")
+        self.assertIsNone(lane["metrics"]["net_pnl_usd"]["value"])
+        self.assertFalse(lane["coverage"]["financial_complete"])
+        hour = load_reference(self.root / "views", NOW, NOW - 3_600_000, "1h")["reported_performance"]
+        self.assertEqual(len(hour["series"]), 1)
+        self.assertIsNone(hour["change_economic_pnl_usd"])
+        self.assertIn("PNL_PERIOD_BASELINE_INSUFFICIENT", hour["warnings"])
+
+    def test_optional_malformed_future_or_oversized_report_does_not_hide_valid_activity(self):
+        mutations = [lambda value: value.update(wallet="0x" + "f" * 40),
+                     lambda value: value.update(source_at_ms=NOW + 10_000),
+                     lambda value: value.update(series=value["series"] * 33),
+                     lambda value: value["series"][1].update(at_ms=NOW - 7_200_000)]
+        for index, mutation in enumerate(mutations):
+            value = self.reported(); mutation(value)
+            self.artifact(lambda view: view.update(reported_performance=value), published=f"2026-10-08T11:59:{index:02}Z")
+            lane = load_reference(self.root / "views", NOW, NOW - 86_400_000, "24h")
+            self.assertEqual(lane["status"], "AVAILABLE")
+            self.assertEqual(lane["reported_performance"]["status"], "INVALID")
+            self.assertEqual(len(lane["actions"]), 2)
+
+    def test_missing_zero_and_stale_provider_estimates_remain_explicit(self):
+        self.artifact()
+        lane = load_reference(self.root / "views", NOW, None)
+        self.assertEqual(lane["reported_performance"]["status"], "UNAVAILABLE")
+        value = self.reported()
+        for point in value["series"]:
+            point["economic_pnl_usd"] = "0"
+        value["latest"]["economic_pnl_usd"] = "0"
+        self.artifact(lambda view: view.update(reported_performance=value), published="2026-10-08T11:59:01Z")
+        result = load_reference(self.root / "views", NOW + 61_000, None)["reported_performance"]
+        self.assertEqual(result["status"], "STALE")
+        self.assertEqual(result["change_economic_pnl_usd"], "0")
+        value["series"][0]["economic_pnl_usd"] = None
+        self.artifact(lambda view: view.update(reported_performance=value), published="2026-10-08T11:59:02Z")
+        self.assertIsNone(load_reference(self.root / "views", NOW, None)["reported_performance"]["change_economic_pnl_usd"])
+
+    def test_cumulative_synthetic_ledger_result_is_exact_conserved_and_never_period_profit(self):
+        self.state["paper_portfolio"].update(initial_cash_pico="100000000000000", cash_pico="101000000000000",
+            spent_pico="9000000000000", fees_pico="1000000000000", returned_pico="10000000000000", realized_pnl_pico="1000000000000")
+        lane = comparison(self.envelope, self.store, self.root / "missing", NOW)["own"]
+        model = lane["model_result"]
+        self.assertEqual(model["status"], "AVAILABLE")
+        self.assertEqual(model["realized_pnl_usd"], "1")
+        self.assertEqual((model["spent_usd"], model["fees_usd"], model["returned_usd"]), ("9", "1", "10"))
+        self.assertIsNone(lane["metrics"]["net_pnl_usd"]["value"])
+        self.envelope["connected"] = False
+        self.assertEqual(comparison(self.envelope, self.store, self.root / "missing", NOW)["own"]["model_result"]["status"], "UNAVAILABLE")
+
+    def test_malformed_model_conservation_cannot_become_a_result(self):
+        self.state["paper_portfolio"].update(initial_cash_pico="100000000000000", cash_pico="200000000000000",
+            spent_pico="9000000000000", fees_pico="1000000000000", returned_pico="10000000000000", realized_pnl_pico="1000000000000")
+        result = comparison(self.envelope, self.store, self.root / "missing", NOW)["own"]["model_result"]
+        self.assertEqual(result["status"], "INVALID")
+        self.assertIsNone(result["realized_pnl_usd"])
+
+    def test_model_signed_ledger_result_requires_canonical_i128(self):
+        self.state["paper_portfolio"].update(initial_cash_pico="100000000000000", cash_pico="100000000000000",
+            spent_pico="0", fees_pico="0", returned_pico="0")
+        for signed in ("-0", str(2**127), str(-(2**127)-1), True, "1.5"):
+            self.state["paper_portfolio"]["realized_pnl_pico"] = signed
+            result = comparison(self.envelope, self.store, self.root / "missing", NOW)["own"]["model_result"]
+            self.assertEqual(result["status"], "INVALID", signed)
+            self.assertIsNone(result["realized_pnl_usd"])
+
     def test_unavailable_reference_and_missing_engine_do_not_become_zero_results(self):
         result = comparison({}, self.store, self.root / "missing", NOW)
         self.assertEqual(result["reference"]["status"], "UNAVAILABLE")

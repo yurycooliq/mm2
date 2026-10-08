@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { api } from './api';
-import { comparisonAge, comparisonAmount, comparisonDate, comparisonExport, comparisonKind, comparisonMode, comparisonPeriods, comparisonReason, comparisonTrendPath, validComparison } from './comparisonModel';
+import { comparisonAge, comparisonAmount, comparisonDate, comparisonExport, comparisonKind, comparisonMode, comparisonPeriods, comparisonPeriodText, comparisonReason, comparisonSourceFidelity, comparisonTrendPath, validComparison, validModelResult, validReportedPerformance } from './comparisonModel';
 import type { ComparisonLane, ComparisonMetric, ComparisonPeriod, ComparisonSnapshot } from './comparisonModel';
 import type { Envelope } from './types';
 
 const statusLabels = { AVAILABLE: 'Данные доступны', STALE: 'Данные устарели', UNAVAILABLE: 'Нет данных', INVALID: 'Данные не прошли проверку' };
+const reportedMetricGrid = { gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))' };
 
 function downloadComparison(snapshot: ComparisonSnapshot) {
   const file = comparisonExport(snapshot);
@@ -48,9 +49,65 @@ function Metric({ label, metric, note }: { label: string; metric: ComparisonMetr
   </div>;
 }
 
-function periodText(period: { start_ms: number | null; end_ms: number | null }): string {
-  if (period.start_ms === null && period.end_ms === null) return 'Период наблюдений неизвестен';
-  return `${period.start_ms === null ? 'Начало неизвестно' : comparisonDate(period.start_ms)} — ${period.end_ms === null ? 'Конец неизвестен' : comparisonDate(period.end_ms)}`;
+function ReportedAmount({ label, value, note, reason }: { label: string; value: string | null | undefined; note: string; reason: string }) {
+  const amount = comparisonAmount(value, 'USDC');
+  const known = amount !== 'Неизвестно';
+  return <div className={`comparison-metric${known ? '' : ' metric-unknown'}`}><dt>{label}</dt><dd>{amount}</dd><p>{known ? note : comparisonReason(reason)}</p></div>;
+}
+
+function ModelResult({ lane, transportStale }: { lane: ComparisonLane; transportStale: boolean }) {
+  const result = validModelResult(lane.model_result) ? lane.model_result : null;
+  const status = result?.status ?? (lane.model_result ? 'INVALID' : 'UNAVAILABLE');
+  const known = status === 'AVAILABLE';
+  const reason = known ? 'SYNTHETIC_CUMULATIVE_NOT_PERIOD_RESULT' : status === 'INVALID' ? 'MODEL_LEDGER_INVALID' : 'MODEL_LEDGER_UNAVAILABLE';
+  const metric = (value: string | null | undefined): ComparisonMetric => ({value:known ? value ?? null : null,unit:'USD',scope:'cumulative-synthetic-ledger',reason});
+  return <section className="comparison-actions model-result" aria-label="Накопленные результаты модели">
+    <div className="comparison-subheading"><h3>Накопленные результаты модели</h3><span>{transportStale ? 'Свежесть не подтверждена' : statusLabels[status]}</span></div>
+    <p className="small">Итоги журнала модели на дату снимка, за все накопленные закрытые позиции. Это условные деньги модели, а не заработанные средства и не результат выбранного периода.</p>
+    <dl className="comparison-metrics">
+      <Metric label="Накопленный результат закрытых позиций · модель" metric={metric(result?.realized_pnl_usd)} note="Накопленный реализованный результат модели; текущие открытые позиции сюда не входят" />
+      <Metric label="Начальный капитал модели" metric={metric(result?.initial_cash_usd)} note="Начальная сумма условных денег по журналу модели" />
+    </dl>
+    <p className="small">Дата снимка модели: {comparisonDate(known ? result?.at_ms ?? null : null)}.</p>
+    <details className="comparison-quality"><summary>Расходы и возвраты модели</summary>
+      <dl className="comparison-metrics">
+        <Metric label="Накопленные расходы модели" metric={metric(result?.spent_usd)} note="Включают комиссии модели; это расходы, не убыток" />
+        <Metric label="Комиссии внутри расходов" metric={metric(result?.fees_usd)} note="Уже входят в расходы; повторно не вычитаются" />
+        <Metric label="Накопленные возвраты модели" metric={metric(result?.returned_usd)} note="Возвраты из закрытых позиций по журналу; не весь остаток счета" />
+      </dl>
+      <p className="small">{comparisonReason(reason)}</p>
+    </details>
+  </section>;
+}
+
+function ReportedPerformance({ lane, transportStale }: { lane: ComparisonLane; transportStale: boolean }) {
+  const reported = validReportedPerformance(lane.reported_performance) ? lane.reported_performance : null;
+  const status = reported?.status ?? (lane.reported_performance ? 'INVALID' : 'UNAVAILABLE');
+  const known = status === 'AVAILABLE' || status === 'STALE';
+  const latest = known ? reported?.latest : null;
+  const unavailableReason = status === 'INVALID' ? 'PNL_SOURCE_INVALID' : 'PNL_SOURCE_UNAVAILABLE';
+  return <section className="comparison-actions reported-performance" aria-label="Оценки кошелька по данным Polymarket">
+    <div className="comparison-subheading"><h3>Оценки кошелька по данным Polymarket</h3><span>{transportStale ? 'Свежесть не подтверждена' : statusLabels[status]}</span></div>
+    <p className="small">Оценка публичного кошелька. Не подтверждает прибыль отдельного бота. Фактическое окно и точность источника указаны; полного учета денег/комиссий нет. Суммы выражены в USDC; перевод в доллары не подтвержден.</p>
+    <dl className="comparison-metrics" style={reportedMetricGrid}>
+      <ReportedAmount label="Накопленная оценка API" value={latest?.economic_pnl_usd} note="Последняя точка провайдера; начало накопления неизвестно. Это не результат выбранного периода." reason={known ? 'INCOMPLETE_ACCOUNTING' : unavailableReason} />
+      <ReportedAmount label="Изменение оценки API за доступный период" value={known ? reported?.change_economic_pnl_usd : null} note="Разница между первой и последней пригодной точкой API в фактическом окне; не подтвержденная чистая прибыль." reason={known ? 'PNL_PERIOD_BASELINE_INSUFFICIENT' : unavailableReason} />
+    </dl>
+    <div className="lane-time"><p><strong>Последняя точка провайдера</strong><br />{comparisonDate(known ? reported?.latest_at_ms ?? null : null)}</p>
+      <p><strong>Фактическое окно изменения оценки</strong><br />{comparisonPeriodText(known ? reported?.period : null)}</p></div>
+    <p className="small">Точность источника: {comparisonSourceFidelity(reported?.source_fidelity)} {reported?.interval === '1d' && reported?.fidelity === '1h' ? 'Запрошены окно API 1 день и сетка 1 час.' : ''}</p>
+    <details className="comparison-quality"><summary>Состав оценки и источник</summary>
+      <dl className="comparison-metrics" style={reportedMetricGrid}>
+        <ReportedAmount label="Реализованная часть по API" value={latest?.realized_pnl_usd} note="Оценка провайдера для кошелька, без подтвержденного полного журнала бота" reason={known ? 'INCOMPLETE_ACCOUNTING' : unavailableReason} />
+        <ReportedAmount label="Нереализованная часть по API" value={latest?.unrealized_pnl_usd} note="Оценка открытых позиций провайдером; цена выхода не гарантирована" reason={known ? 'INCOMPLETE_ACCOUNTING' : unavailableReason} />
+        <ReportedAmount label="Доходы кошелька по API" value={latest?.wallet_income_usd} note="Отдельная составляющая оценки провайдера; принадлежность дохода боту неизвестна" reason={known ? 'INCOMPLETE_ACCOUNTING' : unavailableReason} />
+      </dl>
+      <p className="small">Источник получен: {comparisonDate(reported?.source_at_ms ?? null)}. Точек в доступном окне: {reported ? comparisonAmount(String(reported.series.length), 'count') : 'Неизвестно'}.</p>
+      {reported?.warnings.length ? <ul>{reported.warnings.map((warning, index) => <li key={index}>{comparisonReason(warning)}</li>)}</ul> : <p className="small">{comparisonReason(known ? 'PNL_ESTIMATE_NOT_AUTHENTICATED_BOT_RESULT' : unavailableReason)}</p>}
+      {reported?.endpoint && <p className="small mono">Источник: {reported.endpoint}</p>}
+      {reported?.response_sha256 && <p className="small mono">SHA-256 ответа: {reported.response_sha256}</p>}
+    </details>
+  </section>;
 }
 
 function Trend({ lane }: { lane: ComparisonLane }) {
@@ -91,7 +148,7 @@ function Lane({ lane, transportStale }: { lane: ComparisonLane; transportStale: 
       <span className={`data-status ${!transportStale && lane.status === 'AVAILABLE' && lane.freshness.fresh ? 'data-fresh' : 'data-warning'}`}>{transportStale ? 'Свежесть не подтверждена' : statusLabels[lane.status]}</span></div>
     <p className="lane-mode">{own ? comparisonMode(lane.mode) : 'Наблюдения публичных операций'}</p>
     <div className="lane-time"><p><strong>Последний снимок</strong><br />{comparisonDate(lane.freshness.observed_at_ms)} · {comparisonAge(lane.freshness.age_ms)}</p>
-      <p><strong>{own ? 'Период снимков для оценки' : 'Фактический период наблюдений'}</strong><br />{periodText(lane.period)}</p></div>
+      <p><strong>{own ? 'Период снимков для оценки' : 'Фактический период наблюдений'}</strong><br />{comparisonPeriodText(lane.period)}</p></div>
     <dl className="comparison-metrics">
       <Metric label="Деньги на счете" metric={lane.metrics.cash_usd} note="Остаток по последнему снимку" />
       <Metric label="Оценка капитала с позициями" metric={lane.metrics.nav_usd} note="Оценка источника, не подтвержденная продажа" />
@@ -102,6 +159,7 @@ function Lane({ lane, transportStale }: { lane: ComparisonLane; transportStale: 
       <Metric label="Оборот в наблюдениях" metric={lane.metrics.turnover_usd} note="Объем событий с известной суммой" />
       <Metric label="Наблюдаемые события" metric={lane.metrics.observed_events} note="Число событий доступной выборки" />
     </dl>
+    {own ? <ModelResult lane={lane} transportStale={transportStale} /> : <ReportedPerformance lane={lane} transportStale={transportStale} />}
     {own && <Trend lane={lane} />}
     <details className="comparison-positions"><summary>Позиции по последнему снимку · {lane.positions.length} в выборке</summary>
       {lane.positions.length ? <ul>{lane.positions.slice(0, 10).map((position, index) => <li key={index}><span>{position.market ?? 'Рынок неизвестен'}{position.outcome ? ` · ${position.outcome}` : ''}</span><strong>{comparisonAmount(position.quantity_shares, 'shares')}</strong><span>Оценка: {comparisonAmount(position.value_usd)}</span></li>)}</ul>
@@ -136,7 +194,7 @@ export function Comparison({ envelope }: { envelope: Envelope | null }) {
     <p className="comparison-disclaimer">Симуляция использует условные исполнения. Публичные операции кошелька не раскрывают внутреннюю стратегию mo-money и не подтверждают прибыль его бота.</p>
     {snapshot && <nav className="comparison-jumps" aria-label="Перейти к данным"><button onClick={() => document.getElementById('comparison-mm2')?.scrollIntoView({ block: 'start' })}>MM2 · симуляция</button><button onClick={() => document.getElementById('comparison-mo-money')?.scrollIntoView({ block: 'start' })}>mo-money</button></nav>}
     {error && <div className="notice warning" role="status">{error}</div>}
-    {snapshot ? <><div className="comparison-export"><p className="comparison-period">Выбранный интервал: {periodText(snapshot.period)}. Экран сформирован {comparisonDate(snapshot.generated_at_ms)}.</p><button onClick={() => downloadComparison(snapshot)}>Скачать полный срез JSON</button></div>
+    {snapshot ? <><div className="comparison-export"><p className="comparison-period">Выбранный интервал: {comparisonPeriodText(snapshot.period)}. Экран сформирован {comparisonDate(snapshot.generated_at_ms)}.</p><button onClick={() => downloadComparison(snapshot)}>Скачать полный срез JSON</button></div>
       <p className="comparison-export-note">Файл содержит весь ответ сравнения: суммы, действия, даты, источники, неизвестные значения и ограничения выборки.{error ? ' Это последний полученный срез; его свежесть не подтверждена.' : ''}</p>
       <div className="comparison-grid"><Lane lane={snapshot.own} transportStale={!!error} /><Lane lane={snapshot.reference} transportStale={!!error} /></div>
       <section className="comparison-conclusion"><h2>Сопоставимый итог пока не подтвержден</h2><p>Для оценки стратегии нужны одинаковые рынки и периоды, начальный капитал, полные исполнения и затраты. Денежный оборот и отдельные удачные сделки не заменяют эти данные.</p>

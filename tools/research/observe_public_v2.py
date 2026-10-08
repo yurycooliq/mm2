@@ -10,6 +10,7 @@ USDC. Entry basis is report-only and fee-exclusive. Public fees/PnL are never
 promoted to authenticated ledger facts. Schema errors abort publication.
 """
 from collections import Counter
+from decimal import Decimal
 import hashlib
 import http.client
 import time
@@ -23,6 +24,9 @@ from .schema import (MICRO, PICO, ResearchError, address, canonical, condition,
                      digest, epoch_utc, parse_json, quality, units, utc, utc_now, validate_event, window)
 
 MAX_BYTES, MAX_REQUESTS, MAX_SECONDS, MAX_ROWS = 16_000_000, 120, 90, 10_000
+PNL_ENDPOINT = BASE + "/v2/user-pnl"
+PNL_KEYS = {"economic_pnl_usd": "economic_pnl", "realized_pnl_usd": "realized_pnl",
+            "unrealized_pnl_usd": "unrealized_pnl", "wallet_income_usd": "wallet_income"}
 ACTIVITY_MAPPING = {"proxy_wallet": "proxyWallet", "timestamp": "timestamp", "condition_id": "conditionId",
     "type": "type", "size": "size", "usdc_size": "usdcSize", "transaction_hash": "transactionHash",
     "price": "price", "token_id": "asset", "side": "side", "outcome_index": "outcomeIndex",
@@ -64,6 +68,7 @@ class PublicHTTPV2:
         self.deadline = time.monotonic() + max_seconds
         self.opener = opener or urllib.request.build_opener(NoRedirect()).open
         self.bytes_read, self.request_count, self.receipts = 0, 0, []
+        self.pnl_evidence = None
 
     def _body(self, response, limit):
         # read1 performs one underlying buffered read, so a trickling response
@@ -90,16 +95,20 @@ class PublicHTTPV2:
             pieces.append(chunk)
 
     def get(self, endpoint, parameters):
-        if endpoint not in {"activity", "positions"}:
+        if endpoint not in {"activity", "positions", "user-pnl"}:
             raise ResearchError("V2 public GET endpoint not allowed")
-        allowed = ({"user", "start", "end", "limit", "cursor", "sort_by", "sort_direction", "exclude_deposits_withdrawals"}
+        allowed = ({"user", "interval", "fidelity"} if endpoint == "user-pnl" else
+            {"user", "start", "end", "limit", "cursor", "sort_by", "sort_direction", "exclude_deposits_withdrawals"}
             if endpoint == "activity" else {"user", "status", "limit", "cursor", "sort_by", "sort_direction", "filter_type", "filter_amount", "include_archived"})
         if not isinstance(parameters, dict) or set(parameters) - allowed or len(canonical(parameters)) > 6144:
             raise ResearchError("V2 public query outside allowlist")
         address(parameters.get("user"))
+        if endpoint == "user-pnl" and parameters != {"user": parameters["user"], "interval": "1d", "fidelity": "1h"}:
+            raise ResearchError("V2 PnL query outside fixed documented window")
         api_path = "/v2/" + endpoint
         url = BASE + api_path + "?" + urllib.parse.urlencode(parameters)
-        for attempt in range(3):
+        attempts = 1 if endpoint == "user-pnl" else 3
+        for attempt in range(attempts):
             remaining, budget = self.deadline - time.monotonic(), self.max_bytes - self.bytes_read
             if self.request_count >= self.max_requests or remaining <= 0 or budget <= 0:
                 raise ResearchError("V2 public capture budget exhausted")
@@ -111,6 +120,19 @@ class PublicHTTPV2:
                     if getattr(response, "status", 200) != 200:
                         raise ResearchError("V2 public API non-success status")
                     data = self._body(response, limit)
+                    if endpoint == "user-pnl":
+                        receipt = {"endpoint": endpoint, "api_version": 2, "api_path": api_path,
+                            "source_url": PNL_ENDPOINT, "parameters": parameters, "bytes": len(data),
+                            "response_sha256": hashlib.sha256(data).hexdigest(), "observed_at_utc": utc_now()}
+                        self.receipts.append(receipt)
+                        self.pnl_evidence = {"raw_body_utf8": None, "receipt": receipt}
+                        if len(data) > 200_000:
+                            raise ResearchError("V2 PnL evidence record bound exceeded")
+                        try:
+                            self.pnl_evidence["raw_body_utf8"] = data.decode("utf-8")
+                        except UnicodeDecodeError:
+                            raise ResearchError("V2 PnL response not UTF8") from None
+                        return parse_json(data, api=True), receipt
                     value = envelope(parse_json(data, api=True))
                     receipt = {"endpoint": endpoint, "api_version": 2, "api_path": api_path, "source_url": BASE + api_path,
                         "parameters": parameters, "bytes": len(data), "response_sha256": hashlib.sha256(data).hexdigest(),
@@ -119,13 +141,106 @@ class PublicHTTPV2:
                     self.receipts.append(receipt)
                     return value, receipt
             except urllib.error.HTTPError as error:
-                if error.code not in {429, 500, 502, 503, 504} or attempt == 2:
+                if error.code not in {429, 500, 502, 503, 504} or attempt == attempts - 1:
                     raise ResearchError("V2 public API HTTP failure") from None
                 delay = min(2**attempt, max(0, self.deadline - time.monotonic()))
                 if delay:
                     time.sleep(delay)
             except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
                 raise ResearchError("V2 public transport unavailable") from None
+
+
+def empty_reported_pnl(account_id, status="UNAVAILABLE", reason="PNL_SOURCE_UNAVAILABLE"):
+    return {"status": status, "evidence_class": "venue-reported-wallet-estimate", "wallet": account_id,
+        "endpoint": PNL_ENDPOINT, "interval": "1d", "fidelity": "1h", "source_fidelity": None,
+        "source_at_ms": None, "response_sha256": None, "latest_at_ms": None,
+        "latest": {key: None for key in PNL_KEYS}, "period": {"start_ms": None, "end_ms": None},
+        "change_economic_pnl_usd": None, "series": [], "warnings": [reason]}
+
+
+def _pnl_amount(value):
+    if value is None:
+        return None
+    # OpenAPI says JSON numeric USDC; strings or binary floats are schema changes.
+    if type(value) is not int and not isinstance(value, Decimal):
+        raise ResearchError("V2 PnL numeric schema changed")
+    amount = int(units(value, PICO, "reported PnL USDC", signed=True))
+    sign, (whole, fraction) = ("-" if amount < 0 else ""), divmod(abs(amount), PICO)
+    return sign + str(whole) + (("." + str(fraction).zfill(12).rstrip("0")) if fraction else "")
+
+
+def project_reported_pnl(evidence, account_id):
+    """Verify original bounded response/receipt; never establish ledger completeness."""
+    result = empty_reported_pnl(account_id)
+    if not isinstance(evidence, dict):
+        return result
+    if evidence.get("status") != "AVAILABLE":
+        return empty_reported_pnl(account_id, "INVALID" if evidence.get("status") == "INVALID" else "UNAVAILABLE",
+                                  "PNL_SOURCE_INVALID" if evidence.get("status") == "INVALID" else "PNL_SOURCE_UNAVAILABLE")
+    try:
+        raw, receipt = evidence.get("raw_body_utf8"), evidence.get("receipt")
+        if not isinstance(raw, str) or len(raw.encode("utf-8")) > 200_000 or not isinstance(receipt, dict):
+            raise ResearchError("V2 PnL original evidence missing")
+        body = raw.encode("utf-8")
+        if (receipt.get("endpoint") != "user-pnl" or receipt.get("api_version") != 2
+                or receipt.get("api_path") != "/v2/user-pnl" or receipt.get("source_url") != PNL_ENDPOINT
+                or receipt.get("parameters") != {"user": account_id, "interval": "1d", "fidelity": "1h"}
+                or receipt.get("bytes") != len(body) or receipt.get("response_sha256") != hashlib.sha256(body).hexdigest()):
+            raise ResearchError("V2 PnL source receipt mismatch")
+        observed = utc(receipt["observed_at_utc"])
+        observed_ms = int(observed.timestamp() * 1000)
+        value = parse_json(body, api=True)
+        if not isinstance(value, dict) or set(value) != {"data"} or not isinstance(value["data"], dict):
+            raise ResearchError("V2 PnL envelope changed")
+        data = value["data"]
+        if (set(data) != {"proxy_wallet", "interval", "fidelity", "source_fidelity", "points"}
+                or data.get("proxy_wallet") != account_id or data.get("interval") != "1d"
+                or data.get("fidelity") != "1h" or data.get("source_fidelity") != "1d"
+                or not isinstance(data.get("points"), list) or not 2 <= len(data["points"]) <= 64):
+            raise ResearchError("V2 PnL identity/window changed")
+        required = {"timestamp", "source_block", "realized_market_pnl", "realized_lp_pnl", "realized_combo_pnl",
+                    "realized_pnl", "volume", "volume_usdc", "trade_count"}
+        numeric = {"cashflow_net", "deposits", "economic_pnl", "fees", "fees_paid", "fees_refunded", "maker_rebate",
+                   "position_pnl", "referral_income", "reward_income", "settled_pnl", "sponsored_income",
+                   "taker_rebate", "trade_pnl", "unrealized_pnl", "wallet_income", "withdrawals", "yield_income",
+                   "realized_market_pnl", "realized_lp_pnl", "realized_combo_pnl", "realized_pnl", "volume", "volume_usdc"}
+        previous = None
+        for point in data["points"]:
+            if not isinstance(point, dict) or not required <= point.keys() or point.keys() - (numeric | {"timestamp", "source_block", "trade_count"}):
+                raise ResearchError("V2 PnL point schema changed")
+            if any(type(point.get(key)) is not int or point[key] < 0 for key in ("timestamp", "source_block", "trade_count")):
+                raise ResearchError("V2 PnL source clock/count changed")
+            at = int(utc(epoch_utc(point["timestamp"])).timestamp() * 1000)
+            if not observed_ms - 86_400_000 <= at <= observed_ms + 5000:
+                raise ResearchError("V2 PnL point outside requested rolling window")
+            if previous is not None and (point["timestamp"] - previous["timestamp"] != 3600
+                    or point["source_block"] < previous["source_block"] or point["trade_count"] < previous["trade_count"]):
+                raise ResearchError("V2 PnL point clock/order discontinuity")
+            for key in numeric & point.keys():
+                _pnl_amount(point[key])
+            if any(point[key] is None for key in required - {"timestamp", "source_block", "trade_count"}):
+                raise ResearchError("V2 PnL required source value missing")
+            for target, terms in (("realized_pnl", ("realized_market_pnl", "realized_lp_pnl", "realized_combo_pnl")),
+                                  ("position_pnl", ("realized_pnl", "unrealized_pnl")),
+                                  ("economic_pnl", ("position_pnl", "wallet_income")),
+                                  ("settled_pnl", ("realized_pnl", "wallet_income"))):
+                if point.get(target) is not None and all(point.get(key) is not None for key in terms):
+                    if units(point[target], PICO, signed=True) != str(sum(int(units(point[key], PICO, signed=True)) for key in terms)):
+                        raise ResearchError("V2 PnL reported composition inconsistent")
+            result["series"].append({"at_ms": at, **{key: _pnl_amount(point.get(source)) for key, source in PNL_KEYS.items()}})
+            previous = point
+        if observed_ms - result["series"][-1]["at_ms"] > 3_600_000:
+            raise ResearchError("V2 PnL current baseline unavailable")
+        result.update(status="AVAILABLE", source_fidelity="1d", source_at_ms=observed_ms,
+                      response_sha256=receipt["response_sha256"], latest_at_ms=result["series"][-1]["at_ms"],
+                      latest={key: result["series"][-1][key] for key in PNL_KEYS},
+                      period={"start_ms": result["series"][0]["at_ms"], "end_ms": result["series"][-1]["at_ms"]},
+                      warnings=["PNL_ESTIMATE_NOT_AUTHENTICATED_BOT_RESULT", "PNL_DAILY_SOURCE_ON_HOURLY_GRID"])
+        if any(point.get(key) is None for point in data["points"] for key in ("deposits", "withdrawals", "cashflow_net")):
+            result["warnings"].append("PNL_CASHFLOWS_UNKNOWN")
+        return result
+    except (ResearchError, ValueError, TypeError, KeyError, OverflowError):
+        return empty_reported_pnl(account_id, "INVALID", "PNL_SOURCE_INVALID")
 
 
 def project_activity(raw, account_id):
@@ -231,10 +346,12 @@ def _walk(client, endpoint, parameters, projector, *, max_rows, interval=None):
     return {"rows": rows, "complete": complete, "reasons": reasons}
 
 
-def observe_account(client, account, start, end, *, page_size=500, max_rows=MAX_ROWS):
+def observe_account(client, account, start, end, *, page_size=500, max_rows=MAX_ROWS, include_reported_pnl=False):
     account_id = address(account.get("account_id"))
     if type(page_size) is not int or not 1 <= page_size <= 1000 or type(max_rows) is not int or not 1 <= max_rows <= MAX_ROWS:
         raise ResearchError("V2 public row/page quota invalid")
+    if type(include_reported_pnl) is not bool:
+        raise ResearchError("V2 optional PnL flag must be boolean")
     start_dt, end_dt = utc(start), utc(end)
     window(start, end)
     if start_dt.microsecond or end_dt.microsecond or (end_dt-start_dt).total_seconds() > 31*86400:
@@ -277,5 +394,21 @@ def observe_account(client, account, start, end, *, page_size=500, max_rows=MAX_
         "late_events_possible": True, "snapshot_atomic": False, "financial_complete": False,
         "purpose": account.get("purpose"), "mm2_order_attribution": False, "api_version": 2,
         "position_spine": "OPEN", "tips_requested": False}
-    return {"events": events, "snapshot": snapshot, "coverage": coverage, "quality": quality("PARTIAL", reasons),
-            "activity_rows": activity["rows"], "position_rows": positions["rows"]}
+    result = {"events": events, "snapshot": snapshot, "coverage": coverage, "quality": quality("PARTIAL", reasons),
+              "activity_rows": activity["rows"], "position_rows": positions["rows"]}
+    if include_reported_pnl:
+        evidence = {"status": "UNAVAILABLE", "reason": "PNL_SOURCE_UNAVAILABLE", "raw_body_utf8": None, "receipt": None}
+        try:
+            client.get("user-pnl", {"user": account_id, "interval": "1d", "fidelity": "1h"})
+            captured = getattr(client, "pnl_evidence", None)
+            if captured:
+                evidence.update(captured, status="AVAILABLE", reason=None)
+                projected = project_reported_pnl(evidence, account_id)
+                evidence["status"] = projected["status"]
+                evidence["reason"] = "PNL_SOURCE_INVALID" if projected["status"] == "INVALID" else None
+        except (ResearchError, OSError, ValueError, TypeError, KeyError):
+            captured = getattr(client, "pnl_evidence", None)
+            if captured:
+                evidence.update(captured, status="INVALID", reason="PNL_SOURCE_INVALID")
+        result["reported_pnl_evidence"] = evidence
+    return result

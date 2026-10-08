@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { comparisonAmount, comparisonAge, comparisonDate, comparisonExport, comparisonReason, comparisonMode, comparisonKind, comparisonTrendPath, validComparison } from '../.test-build/comparisonModel.js';
+import { comparisonAmount, comparisonAge, comparisonDate, comparisonExport, comparisonPeriodText, comparisonReason, comparisonMode, comparisonKind, comparisonSourceFidelity, comparisonTrendPath, validComparison, validModelResult, validReportedPerformance } from '../.test-build/comparisonModel.js';
 
 test('comparison amounts preserve exact large decimals, tiny losses, and explicit zero', () => {
   assert.equal(comparisonAmount('12345678901234567890.123456789012'), '$12 345 678 901 234 567 890,123456789012');
@@ -121,4 +121,61 @@ test('legacy, unknown, and malformed boot contexts keep observed points but neve
     {at_ms:0,value_usd:'100',context:valuationContext},
     {at_ms:60000,value_usd:'110',context:otherValuationContext},
   ]).match(/[ML]/g), ['M','M']);
+});
+
+function reportedPerformance() {
+  const latest = {economic_pnl_usd:'488700.192192',realized_pnl_usd:'444039.806094',unrealized_pnl_usd:'-509.673902',wallet_income_usd:'45170.06'};
+  const first = Date.UTC(2026,9,7,18), last = Date.UTC(2026,9,8,17);
+  return {status:'AVAILABLE',evidence_class:'venue-reported-wallet-estimate',wallet:null,endpoint:'https://data-api.polymarket.com/v2/pnl',interval:'1d',fidelity:'1h',source_fidelity:'1d',source_at_ms:last+60000,response_sha256:'a'.repeat(64),latest_at_ms:last,latest,
+    period:{start_ms:first,end_ms:last},change_economic_pnl_usd:'-3740.914710',series:[{at_ms:first,...latest,economic_pnl_usd:'492441.106902'},{at_ms:last,...latest}],warnings:['PNL_DAILY_SOURCE_ON_HOURLY_GRID']};
+}
+
+test('wallet estimates preserve exact signed USDC amounts without implying dollar conversion', () => {
+  assert.equal(comparisonAmount('488700.192192','USDC'), '488 700,192192 USDC');
+  assert.equal(comparisonAmount('-3740.914710','USDC'), '−3 740,91471 USDC');
+  assert.equal(comparisonAmount('-509.673902','USDC'), '−509,673902 USDC');
+  assert.equal(comparisonAmount('0','USDC'), '0 USDC');
+  assert.equal(comparisonAmount(null,'USDC'), 'Неизвестно');
+  assert.equal(comparisonAmount(488700.192192,'USDC'), 'Неизвестно');
+});
+
+test('reported estimate period shows actual 23-hour UTC endpoints and daily source fidelity', () => {
+  const reported = reportedPerformance();
+  assert.equal(validReportedPerformance(reported),true);
+  assert.equal(reported.period.end_ms-reported.period.start_ms,23*3600000);
+  assert.equal(comparisonPeriodText(reported.period),'07.10.2026, 18:00:00 UTC — 08.10.2026, 17:00:00 UTC');
+  assert.equal(comparisonPeriodText(null),'Период наблюдений неизвестен');
+  assert.match(comparisonSourceFidelity('1d'),/Дневные.*не повышает.*точность/);
+  assert.match(comparisonSourceFidelity(null),/неизвестна/);
+  assert.match(comparisonReason('PNL_PERIOD_BASELINE_INSUFFICIENT'),/Накопленная оценка не является результатом этого периода/);
+});
+
+test('missing or invalid optional wallet estimates do not invalidate the underlying comparison lane', () => {
+  assert.equal(validReportedPerformance(null),false);
+  const invalid = reportedPerformance(); invalid.latest.economic_pnl_usd = 488700.192192;
+  assert.equal(validReportedPerformance(invalid),false);
+  const unsupported = reportedPerformance(); unsupported.source_fidelity = '1h';
+  assert.equal(validReportedPerformance(unsupported),false);
+  const missingField = reportedPerformance(); delete missingField.latest.wallet_income_usd;
+  assert.equal(validReportedPerformance(missingField),false);
+  const malformedSource = reportedPerformance(); malformedSource.endpoint = {url:'unsafe-shape'};
+  assert.equal(validReportedPerformance(malformedSource),false);
+  const value = snapshot(); value.reference.reported_performance = invalid;
+  assert.equal(validComparison(value,'1h'),true);
+  const noBaseline = reportedPerformance(); noBaseline.change_economic_pnl_usd = null; noBaseline.series = [noBaseline.series[1]]; noBaseline.period.start_ms = noBaseline.period.end_ms;
+  assert.equal(validReportedPerformance(noBaseline),true);
+});
+
+test('cumulative model results retain exact loss and reject missing or malformed ledger evidence independently', () => {
+  const result={status:'AVAILABLE',kind:'cumulative-synthetic-ledger',at_ms:Date.UTC(2026,9,8,17),initial_cash_usd:'100',cash_usd:'95.12',spent_usd:'10',fees_usd:'0.01',returned_usd:'5.12',realized_pnl_usd:'-1.125000000001',reason:'SYNTHETIC_CUMULATIVE_NOT_PERIOD_RESULT'};
+  assert.equal(validModelResult(result),true);
+  assert.equal(comparisonAmount(result.realized_pnl_usd),'$−1,125000000001');
+  assert.match(comparisonReason(result.reason),/Накопленный итог.*Условные деньги.*выбранного периода не подтвержден/);
+  assert.equal(validModelResult(null),false);
+  const invalid={...result,realized_pnl_usd:-1.125};
+  assert.equal(validModelResult(invalid),false);
+  const missing={...result}; delete missing.returned_usd;
+  assert.equal(validModelResult(missing),false);
+  const value=snapshot();value.own.model_result=invalid;
+  assert.equal(validComparison(value,'1h'),true);
 });

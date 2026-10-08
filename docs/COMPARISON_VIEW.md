@@ -7,6 +7,21 @@ turnover is presented as authenticated live bot profit. Each lane shows its
 actual source period, clock, freshness and omissions. The original operator
 controls remain under “Управление и диагностика”.
 
+The model panel separately exposes cumulative closed-position realized result,
+initial cash, remaining cash, spending, included model fees and returned capital
+from the exact synthetic portfolio snapshot. It verifies capital conservation;
+stale, disconnected, missing or malformed snapshots show unknown values. These
+totals span the ledger lifetime and do not establish selected-period net profit
+or a mark-to-market value of remaining open positions.
+
+The public wallet panel shows Polymarket's cumulative reported economic,
+realized, unrealized and wallet-income estimates in USDC, with the response hash
+and source clock. Selected-period change uses only the actual first/last retained
+points and displays their UTC endpoints; fewer than two points give an unknown
+change. A requested 24h range with only 23h of points is not described as a full
+24h result. Daily source fidelity on an hourly grid remains visible. The API
+estimate does not establish bot attribution, full cash-flow accounting or ROI.
+
 `GET /api/comparison?period=1h` reads the cached engine state, bounded console
 SQLite NAV samples and a verified local public view. It never fetches the venue
 or issues an engine command. A missing public view does not disconnect the
@@ -20,13 +35,16 @@ python -B scripts/refresh_comparison.py --out /path/to/research-view --hours 24
 python -B scripts/refresh_comparison.py --out /path/to/research-view --loop --interval-seconds 300
 ```
 
-Only public GET activity/positions calls are made for the exact registered
-account. Public collection budget: 90 seconds, 120 HTTP requests, 16 MB received, 10,000
+Only public GET activity/positions and one optional `/v2/user-pnl` call are made
+for the exact registered account. Public collection budget: 90 seconds, 120 HTTP requests, 16 MB received, 10,000
 activity rows, at most 24 hours. Successful captures keep canonical immutable
 observer bundles, requests/coverage receipts and a view bundle. Only after
 verification does `current.json` switch atomically. Failed activity capture
 retains the prior pointer; its source clock ages naturally. Unknown fees,
-opening collateral and strategy attribution stay unknown.
+opening collateral and strategy attribution stay unknown. Optional PnL failure
+or invalid schema is reported separately and does not discard valid activity.
+Its bounded raw response and exact GET receipt are stored inside the verified
+observer evidence. No optional PnL request is retried.
 
 The root must be NEW dedicated secondary storage, initialized with an explicit
 cache marker. Never point this collector at an existing research archive or
@@ -37,9 +55,10 @@ retained. An immutable observer/view copy is kept once per UTC capture day with
 its exact rolling source window and gaps; this is not complete calendar-day
 coverage or evidence of a remote upload. Audit checkpoints are never deleted.
 
-At the observed 9.8 MB/capture, retaining every five-minute full window would
-consume about 2.8 GB/day. This cache instead grows about one checkpoint/day plus
-two hot captures; the conservative reserve gives roughly 37 days at that size,
+At the earlier observed 9.8 MB/capture, retaining every five-minute full window
+would consume about 2.8 GB/day. The actual v2 container capture measured about
+12.7 MB per observer/view pair. This cache grows about one checkpoint/day plus
+two hot captures; the conservative reserve gives roughly 29 days at that newer size,
 not a capacity guarantee. Quota exhaustion stops publication and retains the
 last verified view. Archive verified audit copies to a new destination before a
 reviewed cleanup; never clear engine journals or account uncertainty to recover.
@@ -52,6 +71,7 @@ migration reference: https://docs.polymarket.com/migrate/data-api-v1-to-v2 . v1
 retirement is October 24, 2026. Legacy research-controller adapters remain
 separate and need their own migration acceptance. API page completeness is never
 assumed to establish full financial completeness.
+PnL contract: https://docs.polymarket.com/api-reference/wallet/get-a-users-pnl-series .
 
 ## Local and AWS wiring
 
@@ -91,6 +111,9 @@ without dumping container environment or private logs.
 Test successful verified publication, failed refresh retaining the pointer,
 tampered/oversized artifacts, quotas, fresh vs stale source clocks, true empty
 activity vs unavailable activity, null costs and context/gap NAV discontinuity.
+Verify cumulative synthetic capital conservation, reported estimate provenance,
+actual selected point endpoints, daily fidelity, missing optional PnL and an
+insufficient point baseline independently of action-feed completeness.
 Render desktop/mobile and exercise the shared period selector, action histories,
 missing/stale reference, owner reauthentication and preserved pending command ID.
 Finally validate real public capture and real engine/container/console wiring;

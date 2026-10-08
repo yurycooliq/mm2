@@ -14,6 +14,8 @@ MAX_VIEW_BYTES = 524_288
 PERIODS = {"1h": 3_600_000, "6h": 21_600_000, "24h": 86_400_000, "all": None}
 METRICS = ("cash_usd", "available_usd", "reserved_usd", "nav_usd", "net_pnl_usd",
            "equity_change_usd", "turnover_usd", "observed_events", "cost_bound_usd", "position_value_usd")
+PNL_ENDPOINT = "https://data-api.polymarket.com/v2/user-pnl"
+PNL_KEYS = ("economic_pnl_usd", "realized_pnl_usd", "unrealized_pnl_usd", "wallet_income_usd")
 
 
 def obj(value):
@@ -92,6 +94,109 @@ def _code(value):
 
 def _amount(value):
     return value if isinstance(value, str) and re.fullmatch(r"-?(?:0|[1-9][0-9]{0,39})(?:\.[0-9]{1,12})?", value) else None
+
+
+def empty_reported_performance(status="UNAVAILABLE", reason="PNL_SOURCE_UNAVAILABLE"):
+    return {"status": status, "evidence_class": "venue-reported-wallet-estimate", "wallet": REFERENCE_ACCOUNT,
+            "endpoint": PNL_ENDPOINT, "interval": "1d", "fidelity": "1h", "source_fidelity": None,
+            "source_at_ms": None, "response_sha256": None, "latest_at_ms": None,
+            "latest": {key: None for key in PNL_KEYS}, "period": {"start_ms": None, "end_ms": None},
+            "change_economic_pnl_usd": None, "series": [], "warnings": [reason]}
+
+
+def _pnl_pico(value):
+    if value is None:
+        return None
+    if _amount(value) is None:
+        raise ValueError("invalid reported amount")
+    negative = value.startswith("-")
+    whole, _, fraction = value.lstrip("-").partition(".")
+    amount = (-1 if negative else 1) * (int(whole) * 10**12 + int(fraction.ljust(12, "0") or "0"))
+    if abs(amount) >= 10**40:
+        raise ValueError("reported amount outside exact bound")
+    return amount
+
+
+def model_result(state, connected, at_ms):
+    fields = {"initial_cash_usd": "initial_cash_pico", "cash_usd": "cash_pico", "spent_usd": "spent_pico",
+              "fees_usd": "fees_pico", "returned_usd": "returned_pico", "realized_pnl_usd": "realized_pnl_pico"}
+    result = {"status": "UNAVAILABLE", "kind": "cumulative-synthetic-ledger", "at_ms": at_ms,
+              **{key: None for key in fields}, "reason": "MODEL_LEDGER_UNAVAILABLE"}
+    if not connected:
+        return result
+    portfolio = obj(state.get("paper_portfolio"))
+    if not all(key in portfolio for key in fields.values()):
+        return result
+    try:
+        unsigned = {key: uint(portfolio[source]) for key, source in fields.items() if key != "realized_pnl_usd"}
+        signed = portfolio["realized_pnl_pico"]
+        if not isinstance(signed, str) or not re.fullmatch(r"(?:0|-?[1-9][0-9]{0,38})", signed):
+            raise ValueError("invalid synthetic signed result")
+        realized = int(signed)
+        if (any(value is None for value in unsigned.values()) or not -(2**127) <= realized < 2**127
+                or unsigned["initial_cash_usd"] + unsigned["returned_usd"] != unsigned["cash_usd"] + unsigned["spent_usd"]
+                or unsigned["fees_usd"] > unsigned["spent_usd"]):
+            raise ValueError("invalid synthetic conservation")
+        result.update({key: decimal(value) for key, value in unsigned.items()})
+        result.update(status="AVAILABLE", realized_pnl_usd=decimal(realized), reason="SYNTHETIC_CUMULATIVE_NOT_PERIOD_RESULT")
+    except (ValueError, TypeError):
+        result.update(status="INVALID", reason="MODEL_LEDGER_INVALID")
+    return result
+
+
+def load_reported_performance(value, now_ms, source_observed_ms, source_first, source_last, selected_first, selected_last):
+    """Optional provider estimates stay separate from authenticated/account results."""
+    if not isinstance(value, dict):
+        return empty_reported_performance()
+    if value.get("status") != "AVAILABLE":
+        return empty_reported_performance("INVALID" if value.get("status") == "INVALID" else "UNAVAILABLE",
+            "PNL_SOURCE_INVALID" if value.get("status") == "INVALID" else "PNL_SOURCE_UNAVAILABLE")
+    try:
+        source_at, latest_at = uint(value.get("source_at_ms")), uint(value.get("latest_at_ms"))
+        if (value.get("evidence_class") != "venue-reported-wallet-estimate" or value.get("wallet") != REFERENCE_ACCOUNT
+                or value.get("endpoint") != PNL_ENDPOINT or value.get("interval") != "1d" or value.get("fidelity") != "1h"
+                or value.get("source_fidelity") != "1d" or source_at is None or latest_at is None
+                or not latest_at <= source_at + 5000 <= source_observed_ms + 5000 or source_at > now_ms + 5000
+                or not isinstance(value.get("response_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", value["response_sha256"])):
+            raise ValueError("invalid reported provenance")
+        series = value.get("series")
+        if not isinstance(series, list) or not 2 <= len(series) <= 64:
+            raise ValueError("invalid reported series")
+        cleaned, previous = [], None
+        for row in series:
+            at = uint(row.get("at_ms")) if isinstance(row, dict) else None
+            if at is None or not source_at - 86_400_000 <= at <= source_at + 5000 or (previous is not None and at - previous != 3_600_000):
+                raise ValueError("invalid reported point clock")
+            if set(row) != {"at_ms", *PNL_KEYS}:
+                raise ValueError("invalid reported point fields")
+            cleaned.append({"at_ms": at, **{key: decimal(_pnl_pico(row.get(key))) for key in PNL_KEYS}})
+            previous = at
+        if cleaned[-1]["at_ms"] != latest_at or source_at - latest_at > 3_600_000:
+            raise ValueError("invalid reported latest baseline")
+        if value.get("latest") != {key: cleaned[-1][key] for key in PNL_KEYS} or value.get("period") != {"start_ms": cleaned[0]["at_ms"], "end_ms": latest_at}:
+            raise ValueError("inconsistent reported latest/window")
+        warnings = ["PNL_ESTIMATE_NOT_AUTHENTICATED_BOT_RESULT", "PNL_DAILY_SOURCE_ON_HOURLY_GRID"]
+        if "PNL_CASHFLOWS_UNKNOWN" in value.get("warnings", []):
+            warnings.append("PNL_CASHFLOWS_UNKNOWN")
+        if cleaned[0]["at_ms"] != source_first or latest_at != source_last:
+            warnings.append("PNL_WINDOW_DIFFERS_FROM_ACTIVITY")
+        selected = [row for row in cleaned if (selected_first is None or row["at_ms"] >= selected_first) and row["at_ms"] <= selected_last]
+        result = {"status": "AVAILABLE", "evidence_class": "venue-reported-wallet-estimate", "wallet": REFERENCE_ACCOUNT,
+            "endpoint": PNL_ENDPOINT, "interval": "1d", "fidelity": "1h", "source_fidelity": "1d",
+            "source_at_ms": source_at, "response_sha256": value["response_sha256"], "latest_at_ms": latest_at,
+            "latest": {key: cleaned[-1][key] for key in PNL_KEYS},
+            "period": {"start_ms": selected[0]["at_ms"] if selected else None, "end_ms": selected[-1]["at_ms"] if selected else None},
+            "change_economic_pnl_usd": None, "series": selected, "warnings": warnings}
+        if len(selected) >= 2 and selected[0]["economic_pnl_usd"] is not None and selected[-1]["economic_pnl_usd"] is not None:
+            result["change_economic_pnl_usd"] = decimal(_pnl_pico(selected[-1]["economic_pnl_usd"]) - _pnl_pico(selected[0]["economic_pnl_usd"]))
+        else:
+            result["warnings"].append("PNL_PERIOD_BASELINE_INSUFFICIENT")
+        if now_ms - latest_at > 3_600_000:
+            result["status"] = "STALE"
+            result["warnings"].append("PNL_SOURCE_STALE")
+        return result
+    except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
+        return empty_reported_performance("INVALID", "PNL_SOURCE_INVALID")
 
 
 def load_reference(root, now_ms, start_ms, period="all"):
@@ -213,6 +318,8 @@ def load_reference(root, now_ms, start_ms, period="all"):
             result["warnings"].append("REFERENCE_OUTSIDE_REQUESTED_PERIOD")
         if result["status"] == "STALE":
             result["warnings"].append("REFERENCE_SOURCE_STALE")
+        result["reported_performance"] = load_reported_performance(view.get("reported_performance"), now_ms, observed,
+            first, last, result["period"]["start_ms"] if selected else start_ms, result["period"]["end_ms"])
         result["actions"].reverse()
         return result
     except (OSError, ValueError, KeyError, TypeError, RecursionError, AttributeError):
@@ -234,6 +341,7 @@ def own_lane(envelope, store, now_ms, start_ms):
     result.update(status="AVAILABLE" if connected else "STALE", mode=summary["profile"] + "/" + (_text(state.get("mode"), 32) or "unknown"),
         freshness={"observed_at_ms": observed, "age_ms": max(0, now_ms - observed) if observed is not None else None, "fresh": connected})
     result["source_refs"] = [{"kind": "cached_engine_simulation", "id": "current-sample", "sha256": None, "at_ms": observed}]
+    result["model_result"] = model_result(state, connected, observed)
     result["warnings"] = ["SIMULATION_SYNTHETIC_EXECUTION", "RECENT_AUDIT_NOT_COMPLETE_LEDGER", "CURRENT_SNAPSHOT_NOT_PERIOD_RESULT"]
     for key in ("turnover_usd", "cost_bound_usd", "position_value_usd"):
         result["metrics"][key] = metric(scope="simulation evidence", reason="FULL_SIMULATION_PERIOD_LEDGER_REQUIRED")

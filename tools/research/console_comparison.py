@@ -10,6 +10,7 @@ import re
 from .accounting import account_bundle
 from .archive import publish_bundle, read_member, verify_bundle
 from .registry import DEFAULT_ACCOUNTS
+from .observe_public_v2 import empty_reported_pnl, project_reported_pnl
 from .schema import ResearchError, canonical, digest, integer, quality, utc
 
 MAX_VIEW_BYTES = 524_288
@@ -150,6 +151,12 @@ def build_reference(observer_bundle):
                 "financial_complete": complete, "reason": "PUBLIC_ACTIVITY_NOT_AUTHENTICATED_FILLS", "observed_actions": len(events),
                 "omitted_actions": len(events) - len(actions)}, "metrics": metrics, "actions": actions, "positions": positions,
             "periods": periods, "warnings": warnings}
+    reported = project_reported_pnl(read_member(observer_bundle, "source-reported-pnl.json"), account) if "source-reported-pnl.json" in names else empty_reported_pnl(account)
+    if reported["source_at_ms"] is not None and reported["source_at_ms"] > epoch(manifest["created_at_utc"]):
+        reported = empty_reported_pnl(account, "INVALID", "PNL_SOURCE_INVALID")
+    if reported["status"] == "AVAILABLE" and reported["period"] != {"start_ms": first_ms, "end_ms": last_ms}:
+        reported["warnings"].append("PNL_WINDOW_DIFFERS_FROM_ACTIVITY")
+    view["reported_performance"] = reported
     if len(canonical(view)) + 1 > MAX_VIEW_BYTES:
         raise ResearchError("comparison view byte quota exceeded")
     return view, manifest

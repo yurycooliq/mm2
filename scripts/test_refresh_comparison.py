@@ -57,6 +57,21 @@ class RefreshComparisonTests(unittest.TestCase):
             self.capture(Client(receipts=False))
         self.assertEqual((self.root / "current.json").read_bytes(), previous)
 
+    def test_optional_reported_pnl_failure_preserves_valid_activity_publication(self):
+        evidence = observed()
+        evidence["reported_pnl_evidence"] = {"status": "UNAVAILABLE", "reason": "REPORTED_PNL_SOURCE_UNAVAILABLE",
+            "raw_body_utf8": None, "receipt": None}
+        with patch("scripts.refresh_comparison.observe_account", return_value=evidence) as observer:
+            result = refresh(self.root, hours=1, now=self.clock, client=Client())
+        self.assertTrue(observer.call_args.kwargs["include_reported_pnl"])
+        self.assertEqual(result["status"], "PUBLISHED")
+        self.assertEqual(result["reported_pnl_status"], "UNAVAILABLE")
+        source = self.root / "hot-observers" / result["observer_bundle_id"]
+        self.assertEqual(load_json(source / "source-reported-pnl.json"), evidence["reported_pnl_evidence"])
+        view = load_json(self.root / result["bundle_id"] / "view.json")
+        self.assertIsNone(view["metrics"]["net_pnl_usd"]["value"])
+        self.assertFalse(view["coverage"]["financial_complete"])
+
     def test_invalid_view_publication_cannot_switch_existing_pointer(self):
         self.capture()
         previous = (self.root / "current.json").read_bytes()

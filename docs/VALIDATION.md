@@ -1,18 +1,25 @@
 # Validation evidence
 
-## Simulation/comparison preparation: October 8, 2026, 17:30 UTC
+## Simulation/comparison preparation: October 8, 2026, 18:10 UTC
 
 The owner console now has separate MM2 simulation and mo-money public-observation
 lanes, exact decimal values, source clocks, selected-period aggregates, recent
 actions, positions, sampled NAV continuity and a complete sanitized JSON export.
 Incomplete public accounting and bounded synthetic audit remain explicit;
 neither turnover nor sampled NAV is claimed as authenticated bot profit.
+Separate optional panels now show cumulative synthetic closed-position results
+and the venue's cumulative public wallet estimates. Actual selected point
+endpoints and daily source fidelity remain explicit; net selected-period PnL
+and full public financial completeness remain unknown.
 
-An actual read-only v2 capture covered October 7 17:23:36 through October 8
-17:23:36 UTC: 4,424 normalized events, 10 public GET requests, 3,840,424 received
+An actual read-only v2 capture covered October 7 18:05:05 through October 8
+18:05:05 UTC: 4,353 normalized events, 11 public GET requests, 3,808,703 received
 bytes. Activity pagination completed, while financial completeness and MM2
 attribution remain false. Observer ID:
-`3922cb6d28d0dfc8d0e53613106487745994768b3f963c6be7870be7665b7621`.
+`aa614e28bb095effded2d2f9f6674edec272a7742a5d07a20c1e3ee7c8110c1e`.
+The optional public PnL source was available and its exact response/receipt was
+retained. This capture records a working-tree source revision; final images and
+the final-head CI must establish the committed candidate independently.
 The new dedicated comparison cache retains two verified hot copies plus
 immutable daily rolling-window checkpoints, with explicit gaps and finite
 quotas. Existing research archives and engine state were not pruned.
@@ -23,11 +30,11 @@ preserving durable writes and control/fault priority. Disconnection enqueue
 failures retain overflow/closed classifications and the first fatal cause.
 These reproductions do not establish the cause of historical AWS restarts.
 
-Local Windows validation plus targeted final-review regressions: 471 Python
-checks, 446 passed and 25 platform/dependency skips (console 100, data 21,
-latency 34, operations 147, research 169). The six new
+Local Windows validation plus targeted final-review regressions: 485 Python
+checks, 460 passed and 25 platform/dependency skips (console 106, data 21,
+latency 34, operations 148, research 176). The six new
 engine regression checks passed with 90 engine tests, formatting and targeted
-Clippy. Dashboard 25 checks, production build, rendered fixture desktop/mobile
+Clippy. Dashboard 29 checks, production build, rendered fixture desktop/mobile
 interaction and exact JSON-download parity passed. Full locked Rust/workspace,
 Python Linux, parity/reference, new exact-image container acceptance and final
 independent image/host acceptance remain required for this candidate; use final-head PR checks

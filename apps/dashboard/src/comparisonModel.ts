@@ -1,5 +1,21 @@
 export type ComparisonPeriod = '1h' | '6h' | '24h' | 'all';
 export interface ComparisonMetric { value: string | null; unit: 'USD' | 'count'; scope: string; reason: string | null }
+export interface ComparisonModelResult {
+  status: 'AVAILABLE' | 'UNAVAILABLE' | 'INVALID'; kind: 'cumulative-synthetic-ledger'; at_ms: number | null;
+  initial_cash_usd: string | null; cash_usd: string | null; spent_usd: string | null; fees_usd: string | null;
+  returned_usd: string | null; realized_pnl_usd: string | null;
+  reason: 'SYNTHETIC_CUMULATIVE_NOT_PERIOD_RESULT' | 'MODEL_LEDGER_UNAVAILABLE' | 'MODEL_LEDGER_INVALID';
+}
+export interface ComparisonReportedPerformance {
+  // Provider field names are retained; these reported amounts are USDC, with no verified USD conversion.
+  status: 'AVAILABLE' | 'STALE' | 'UNAVAILABLE' | 'INVALID'; evidence_class: 'venue-reported-wallet-estimate';
+  wallet: string | null; endpoint: string | null; interval: '1d' | null; fidelity: '1h' | null;
+  source_fidelity: '1d' | null; source_at_ms: number | null; response_sha256: string | null; latest_at_ms: number | null;
+  latest: { economic_pnl_usd: string | null; realized_pnl_usd: string | null; unrealized_pnl_usd: string | null; wallet_income_usd: string | null };
+  period: { start_ms: number | null; end_ms: number | null }; change_economic_pnl_usd: string | null;
+  series: { at_ms: number; economic_pnl_usd: string | null; realized_pnl_usd: string | null; unrealized_pnl_usd: string | null; wallet_income_usd: string | null }[];
+  warnings: string[];
+}
 export interface ComparisonAction {
   id: string; at_ms: number | null; kind: string; market: string | null; side: string | null;
   outcome: string | null; quantity_shares: string | null; amount_usd: string | null; source: string;
@@ -18,6 +34,8 @@ export interface ComparisonLane {
     position_value_usd?: ComparisonMetric;
   };
   activity_summary?: { buy_count: string; sell_count: string; trade_count: string; merge_count: string; redeem_count: string };
+  reported_performance?: ComparisonReportedPerformance;
+  model_result?: ComparisonModelResult;
   actions: ComparisonAction[];
   positions: { market: string | null; outcome: string | null; quantity_shares: string | null; value_usd: string | null }[];
   equity: { at_ms: number; value_usd: string | null; context: string }[];
@@ -34,7 +52,7 @@ export const comparisonPeriods: { value: ComparisonPeriod; label: string }[] = [
 ];
 
 // Display exact decimal text without a floating-point round trip or invented zeros.
-export function comparisonAmount(value: unknown, unit: 'USD' | 'count' | 'shares' = 'USD'): string {
+export function comparisonAmount(value: unknown, unit: 'USD' | 'USDC' | 'count' | 'shares' = 'USD'): string {
   if (typeof value !== 'string' || !/^-?\d{1,40}(?:\.\d{1,12})?$/.test(value)) return 'Неизвестно';
   if (unit === 'count' && !/^\d{1,40}$/.test(value)) return 'Неизвестно';
   const negative = value.startsWith('-'), [whole, fraction = ''] = (negative ? value.slice(1) : value).split('.');
@@ -42,13 +60,52 @@ export function comparisonAmount(value: unknown, unit: 'USD' | 'count' | 'shares
   const decimals = fraction.replace(/0+$/, '');
   const nonzero = /[1-9]/.test(whole + fraction);
   const text = `${negative && nonzero ? '−' : ''}${grouped}${decimals ? `,${decimals}` : ''}`;
-  return unit === 'USD' ? `$${text}` : unit === 'shares' ? `${text} долей` : text;
+  return unit === 'USD' ? `$${text}` : unit === 'USDC' ? `${text} USDC` : unit === 'shares' ? `${text} долей` : text;
 }
 
 export function comparisonDate(ms: number | null): string {
   return ms !== null && Number.isSafeInteger(ms) && ms >= 0
     ? new Date(ms).toLocaleString('ru-RU', { timeZone: 'UTC', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) + ' UTC'
     : 'Время неизвестно';
+}
+
+export function comparisonPeriodText(period: { start_ms: number | null; end_ms: number | null } | null | undefined): string {
+  if (!period || (period.start_ms === null && period.end_ms === null)) return 'Период наблюдений неизвестен';
+  return `${period.start_ms === null ? 'Начало неизвестно' : comparisonDate(period.start_ms)} — ${period.end_ms === null ? 'Конец неизвестен' : comparisonDate(period.end_ms)}`;
+}
+
+export function comparisonSourceFidelity(value: string | null | undefined): string {
+  return value === '1d' ? 'Дневные исходные наблюдения; отображение на часовой сетке API не повышает их точность.' : 'Точность исходных наблюдений неизвестна.';
+}
+
+export function validReportedPerformance(value: unknown): value is ComparisonReportedPerformance {
+  if (!value || typeof value !== 'object') return false;
+  const reported = value as ComparisonReportedPerformance;
+  const amount = (value: unknown) => value === null || (typeof value === 'string' && comparisonAmount(value, 'USDC') !== 'Неизвестно');
+  const timestamp = (value: unknown) => value === null || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && Number.isFinite(new Date(value).getTime()));
+  const text = (value: unknown) => value === null || (typeof value === 'string' && value.length <= 256);
+  const fields = ['economic_pnl_usd', 'realized_pnl_usd', 'unrealized_pnl_usd', 'wallet_income_usd'] as const;
+  return ['AVAILABLE', 'STALE', 'UNAVAILABLE', 'INVALID'].includes(reported.status)
+    && reported.evidence_class === 'venue-reported-wallet-estimate'
+    && text(reported.wallet) && text(reported.endpoint)
+    && (reported.response_sha256 === null || (typeof reported.response_sha256 === 'string' && /^[0-9a-f]{64}$/.test(reported.response_sha256)))
+    && [null, '1d'].includes(reported.interval) && [null, '1h'].includes(reported.fidelity) && [null, '1d'].includes(reported.source_fidelity)
+    && timestamp(reported.source_at_ms) && timestamp(reported.latest_at_ms)
+    && !!reported.latest && fields.every(field => amount(reported.latest[field]))
+    && !!reported.period && timestamp(reported.period.start_ms) && timestamp(reported.period.end_ms)
+    && amount(reported.change_economic_pnl_usd)
+    && Array.isArray(reported.series) && reported.series.every(point => point && point.at_ms !== null && timestamp(point.at_ms) && fields.every(field => amount(point[field])))
+    && Array.isArray(reported.warnings) && reported.warnings.every(warning => typeof warning === 'string');
+}
+
+export function validModelResult(value: unknown): value is ComparisonModelResult {
+  if (!value || typeof value !== 'object') return false;
+  const result = value as ComparisonModelResult;
+  const fields = ['initial_cash_usd', 'cash_usd', 'spent_usd', 'fees_usd', 'returned_usd', 'realized_pnl_usd'] as const;
+  return ['AVAILABLE', 'UNAVAILABLE', 'INVALID'].includes(result.status) && result.kind === 'cumulative-synthetic-ledger'
+    && (result.at_ms === null || (Number.isSafeInteger(result.at_ms) && result.at_ms >= 0 && Number.isFinite(new Date(result.at_ms).getTime())))
+    && fields.every(field => result[field] === null || (typeof result[field] === 'string' && comparisonAmount(result[field]) !== 'Неизвестно'))
+    && ['SYNTHETIC_CUMULATIVE_NOT_PERIOD_RESULT', 'MODEL_LEDGER_UNAVAILABLE', 'MODEL_LEDGER_INVALID'].includes(result.reason);
 }
 
 export function comparisonAge(ms: number | null): string {
@@ -161,6 +218,17 @@ const reasons: Record<string, string> = {
   SECONDARY_EQUITY_UNAVAILABLE: 'История вторичных оценок капитала недоступна. Текущие снимки проверяются отдельно.',
   V2_DEFAULT_FEED_EXCLUDES_OPT_IN_TIPS: 'Запрошенная публичная лента не включает TIP (чаевые). Возможные чаевые и их расходы здесь не учтены.',
   V2_OPEN_POSITIONS_NOT_COMPLETE_WALLET_LIFECYCLE: 'Снимок показывает открытые позиции. Закрытые позиции и завершенные расчеты не входят в этот снимок; полный учет кошелька не подтвержден.',
+  PNL_ESTIMATE_NOT_AUTHENTICATED_BOT_RESULT: 'API оценивает результат публичного кошелька. Прибыль отдельного бота не подтверждена.',
+  PNL_DAILY_SOURCE_ON_HOURLY_GRID: 'Дневные исходные наблюдения отображаются на часовой сетке. Это не доказывает точность оценки за каждый час.',
+  PNL_WINDOW_DIFFERS_FROM_ACTIVITY: 'Фактическое окно оценок API может отличаться от периода публичных действий.',
+  PNL_PERIOD_BASELINE_INSUFFICIENT: 'В выбранном окне недостаточно пригодных точек для изменения оценки. Накопленная оценка не является результатом этого периода.',
+  PNL_CASHFLOWS_UNKNOWN: 'Полные движения денег, комиссии и затраты кошелька неизвестны.',
+  PNL_SOURCE_UNAVAILABLE: 'Источник оценок результата кошелька недоступен. Остальные наблюдения проверяются отдельно.',
+  PNL_SOURCE_INVALID: 'Данные оценок результата кошелька не прошли проверку.',
+  PNL_SOURCE_STALE: 'Оценки результата кошелька устарели. Дата последней точки указана отдельно.',
+  SYNTHETIC_CUMULATIVE_NOT_PERIOD_RESULT: 'Накопленный итог по журналу модели на дату снимка. Условные деньги; результат выбранного периода не подтвержден.',
+  MODEL_LEDGER_UNAVAILABLE: 'Пригодные накопленные итоги журнала модели недоступны. Значения не заменяются нулем.',
+  MODEL_LEDGER_INVALID: 'Итоги журнала модели не прошли проверку согласованности. Результат неизвестен.',
   PUBLIC_WALLET_NOT_BOT_ATTRIBUTED: 'Наблюдаемый кошелек может включать ручные операции и другие стратегии. Результат самого бота не подтвержден.',
   PUBLIC_WALLET_ATTRIBUTION_UNVERIFIED: 'Публичный кошелек не подтверждает, что все операции принадлежат одному боту.',
   AUTHENTICATED_BOT_LEDGER_UNAVAILABLE: 'Нет полного журнала подтвержденных операций нашего бота.',

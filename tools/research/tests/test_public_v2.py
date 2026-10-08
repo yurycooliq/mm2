@@ -2,14 +2,16 @@
 from copy import deepcopy
 from decimal import Decimal
 import io
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 from tools.research.observe_public_v2 import (MAX_BYTES, MAX_REQUESTS, MAX_SECONDS, PublicHTTPV2,
-    envelope, observe_account, project_activity, project_position)
+    envelope, observe_account, project_activity, project_position, project_reported_pnl, PNL_ENDPOINT)
 from tools.research.schema import ResearchError, digest, epoch_utc
 from tools.research.archive import publish_bundle
 from tools.research.console_comparison import build_reference
@@ -36,6 +38,23 @@ def position(token="123"):
 
 def page(rows, cursor=None, limit=2, offset=0):
     return {"data": rows, "pagination": {"has_more": cursor is not None, "next_cursor": cursor, "limit": limit, "offset": offset}}
+
+
+def pnl_evidence(mutate=None, raw_override=None):
+    data = {"proxy_wallet": ACCOUNT, "interval": "1d", "fidelity": "1h", "source_fidelity": "1d", "points": []}
+    for index, at in enumerate((3600, 7200)):
+        data["points"].append({"timestamp": at, "source_block": 100 + index, "trade_count": 1 + index,
+            "realized_market_pnl": 100 - index, "realized_lp_pnl": 0, "realized_combo_pnl": 0,
+            "realized_pnl": 100 - index, "volume": index, "volume_usdc": index,
+            "unrealized_pnl": 0, "position_pnl": 100 - index, "wallet_income": 0,
+            "economic_pnl": 100 - index, "deposits": None, "withdrawals": None, "cashflow_net": None})
+    if mutate:
+        mutate(data)
+    raw = raw_override or json.dumps({"data": data}, separators=(",", ":"))
+    return {"status": "AVAILABLE", "reason": None, "raw_body_utf8": raw,
+            "receipt": {"endpoint": "user-pnl", "api_version": 2, "api_path": "/v2/user-pnl", "source_url": PNL_ENDPOINT,
+                "parameters": {"user": ACCOUNT, "interval": "1d", "fidelity": "1h"}, "bytes": len(raw.encode()),
+                "response_sha256": hashlib.sha256(raw.encode()).hexdigest(), "observed_at_utc": epoch_utc(10000)}}
 
 
 class FixtureAPI:
@@ -165,8 +184,100 @@ class V2ObserverTests(unittest.TestCase):
         self.assertFalse(view["coverage"]["financial_complete"])
         self.assertIsNone(view["metrics"]["net_pnl_usd"]["value"])
 
+    def test_optional_unavailable_pnl_never_discards_complete_activity_or_promotes_profit(self):
+        api = FixtureAPI([page([activity(10)])])
+        result = self.capture(api, include_reported_pnl=True)
+        self.assertEqual(len(result["events"]), 1)
+        self.assertTrue(result["coverage"]["activity_complete"])
+        self.assertEqual(result["reported_pnl_evidence"]["status"], "UNAVAILABLE")
+        self.assertFalse(result["coverage"]["financial_complete"])
+
+    def test_valid_optional_exact_response_survives_verified_observer_adapter(self):
+        class API(FixtureAPI):
+            def get(self, endpoint, parameters):
+                if endpoint != "user-pnl":
+                    return super().get(endpoint, parameters)
+                self.requests.append((endpoint, deepcopy(parameters)))
+                self.pnl_evidence = pnl_evidence()
+                return {}, self.pnl_evidence["receipt"]
+        api = API([page([activity(10)])])
+        result = self.capture(api, include_reported_pnl=True)
+        self.assertEqual(result["reported_pnl_evidence"]["status"], "AVAILABLE")
+        self.assertEqual(sum(endpoint == "user-pnl" for endpoint, _ in api.requests), 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            observer = publish_bundle(Path(temporary), {"events.jsonl": result["events"], "closing.json": result["snapshot"],
+                "coverage.json": result["coverage"], "source-reported-pnl.json": result["reported_pnl_evidence"]},
+                scope={"kind": "one-public-account", "lane": "public-benchmark", "account_id": ACCOUNT, "chain_id": 137},
+                utc_range={"start": epoch_utc(1), "end": epoch_utc(20)}, quality=result["quality"], created_at_utc=epoch_utc(10000))
+            view, _ = build_reference(observer)
+        reported = view["reported_performance"]
+        self.assertEqual(reported["latest"]["economic_pnl_usd"], "99")
+        self.assertEqual(reported["latest"]["unrealized_pnl_usd"], "0")
+        self.assertEqual(reported["source_fidelity"], "1d")
+        self.assertIn("PNL_WINDOW_DIFFERS_FROM_ACTIVITY", reported["warnings"])
+        self.assertFalse(view["coverage"]["financial_complete"])
+        self.assertIsNone(view["metrics"]["net_pnl_usd"]["value"])
+
+
+class PnlProjectionTests(unittest.TestCase):
+    def test_zero_and_nullable_reported_amounts_remain_distinct(self):
+        def unknown(data):
+            for row in data["points"]:
+                row.update(realized_market_pnl=0, realized_pnl=0, position_pnl=None, economic_pnl=None, unrealized_pnl=None)
+        result = project_reported_pnl(pnl_evidence(unknown), ACCOUNT)
+        self.assertEqual(result["status"], "AVAILABLE")
+        self.assertEqual(result["latest"]["realized_pnl_usd"], "0")
+        self.assertIsNone(result["latest"]["economic_pnl_usd"])
+
+    def test_duplicate_json_wrong_wallet_future_clock_precision_and_unknown_fields_fail_optional_only(self):
+        mutations = [lambda data: data.update(proxy_wallet="0x"+"f"*40),
+            lambda data: data["points"][-1].update(timestamp=10001),
+            lambda data: data["points"][-1].update(timestamp=3600),
+            lambda data: data["points"][-1].update(economic_pnl=99.0000000000001),
+            lambda data: data["points"][-1].update(secret="ignored-instead-of-exposed"),
+            lambda data: data.update(source_fidelity="unknown")]
+        for mutation in mutations:
+            self.assertEqual(project_reported_pnl(pnl_evidence(mutation), ACCOUNT)["status"], "INVALID")
+        for raw in ('{"data":{},"data":{}}', '{"data":NaN}'):
+            self.assertEqual(project_reported_pnl(pnl_evidence(raw_override=raw), ACCOUNT)["status"], "INVALID")
+        evidence = pnl_evidence(); evidence["receipt"]["response_sha256"] = "f" * 64
+        self.assertEqual(project_reported_pnl(evidence, ACCOUNT)["status"], "INVALID")
+
+    def test_original_body_hash_and_current_baseline_are_required(self):
+        evidence = pnl_evidence(); evidence["receipt"]["observed_at_utc"] = epoch_utc(20000)
+        self.assertEqual(project_reported_pnl(evidence, ACCOUNT)["status"], "INVALID")
+        evidence = pnl_evidence(); evidence["raw_body_utf8"] += " "
+        self.assertEqual(project_reported_pnl(evidence, ACCOUNT)["status"], "INVALID")
+
 
 class V2HTTPTests(unittest.TestCase):
+    def test_optional_pnl_http_failure_has_one_attempt_no_retry_or_receipt(self):
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            raise HTTPError(request.full_url, 429, "rate limit", {}, None)
+        http = PublicHTTPV2(opener=opener)
+        with patch("tools.research.observe_public_v2.time.sleep") as sleep:
+            with self.assertRaises(ResearchError):
+                http.get("user-pnl", {"user": ACCOUNT, "interval": "1d", "fidelity": "1h"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(http.request_count, 1)
+        self.assertEqual(http.receipts, [])
+        self.assertIsNone(http.pnl_evidence)
+        sleep.assert_not_called()
+
+    def test_optional_pnl_get_is_fixed_public_shared_budget_and_never_retried(self):
+        body = pnl_evidence()["raw_body_utf8"].encode()
+        calls = []
+        def opener(request, timeout):
+            calls.append(request); return io.BytesIO(body)
+        http = PublicHTTPV2(max_requests=1, opener=opener)
+        http.get("user-pnl", {"user": ACCOUNT, "interval": "1d", "fidelity": "1h"})
+        self.assertEqual(http.pnl_evidence["raw_body_utf8"].encode(), body)
+        self.assertEqual(http.bytes_read, len(body))
+        self.assertIsNone(calls[0].get_header("Authorization"))
+        with self.assertRaises(ResearchError): http.get("activity", {"user": ACCOUNT})
+        self.assertEqual(len(calls), 1)
     def test_only_public_v2_get_and_finite_envelope_receipt(self):
         calls = []
         body = b'{"data":[],"pagination":{"has_more":false,"limit":2,"offset":0,"next_cursor":null}}'

@@ -41,7 +41,8 @@ def refresh(root, *, hours=24, registry_path=None, source_revision="unknown", no
     if account is None:
         raise ResearchError("registered mo-money identity required")
     client = client or PublicHTTPV2(max_bytes=16_000_000, max_requests=120, max_seconds=90)
-    observed = observe_account(client, account, interval["start"], interval["end"], max_rows=10_000)
+    observed = observe_account(client, account, interval["start"], interval["end"], max_rows=10_000,
+                               include_reported_pnl=True)
     # A failed activity source must not replace a working view with a fresh zero.
     if not any(item["endpoint"] == "activity" for item in client.receipts):
         raise ResearchError("comparison activity unavailable; previous view retained")
@@ -51,6 +52,8 @@ def refresh(root, *, hours=24, registry_path=None, source_revision="unknown", no
              "coverage.json": observed["coverage"], "source-activity.jsonl": observed["activity_rows"],
              "source-positions.jsonl": observed["position_rows"], "requests.jsonl": client.receipts,
              "registry.json": {"schema_version": VERSION, "accounts": [account]}}
+    if "reported_pnl_evidence" in observed:
+        files["source-reported-pnl.json"] = observed["reported_pnl_evidence"]
     observer = publish_bundle(root / "hot-observers", files,
         scope={"account_id": account["account_id"], "lane": "public-benchmark", "kind": "one-public-account", "chain_id": 137},
         utc_range=interval, quality=observed["quality"], source_revision=source_revision,
@@ -61,6 +64,7 @@ def refresh(root, *, hours=24, registry_path=None, source_revision="unknown", no
     return {"schema_version": 1, "status": "PUBLISHED", "bundle_id": view.name, "observer_bundle_id": observer.name,
             "period": interval, "observed_events": len(observed["events"]), "coverage": observed["coverage"],
             "requests": client.request_count, "bytes": client.bytes_read, "cache": cache, "read_only_public_capture": True,
+            "reported_pnl_status": observed.get("reported_pnl_evidence", {}).get("status", "UNAVAILABLE"),
             "engine_commands": 0, "live_orders": 0, "messages_sent": 0}
 
 
