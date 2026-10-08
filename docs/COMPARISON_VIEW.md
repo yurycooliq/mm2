@@ -74,9 +74,10 @@ MM2_CONSOLE_IMAGE=sha256:<verified-image-id> docker compose -f infra/aws/compose
 ```
 
 This command is an operator deployment step, not evidence that AWS deployment
-has occurred. Both manual stop/restart and host reboot recovery need host
-acceptance. Existing production supervisor remains responsible for its original
-three services only. Observe collector output and `/api/comparison` source age
+has occurred. Docker restarts the isolated public collector after process failure
+or host reboot unless the operator stopped it. Both manual stop/restart and host
+reboot recovery still need host acceptance. Existing production supervisor remains
+responsible for its original three services only. Observe collector output and `/api/comparison` source age
 without dumping container environment or private logs.
 
 ## Acceptance

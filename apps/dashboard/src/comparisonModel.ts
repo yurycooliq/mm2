@@ -100,6 +100,26 @@ export function comparisonExport(snapshot: ComparisonSnapshot): { filename: stri
   return { filename: `mm2-comparison-${snapshot.requested_period}-${snapshot.generated_at_ms}.json`, text: JSON.stringify(snapshot, null, 2) + '\n' };
 }
 
+export function comparisonTrendPath(points: ComparisonLane['equity']): string | null {
+  // Floating-point coordinates draw the chart; financial amounts remain exact text.
+  const values = points.map(point => point.value_usd !== null && /^\d{1,12}(?:\.\d{1,12})?$/.test(point.value_usd) ? Number(point.value_usd) : null);
+  const known = values.filter((value): value is number => value !== null && Number.isFinite(value));
+  if (known.length < 2) return null;
+  const min = Math.min(...known), span = Math.max(...known) - min || 1;
+  const start = points[0].at_ms, duration = points[points.length - 1].at_ms - start || 1;
+  let path = '', previousContext: string | null = null, previousAt = 0, connected = false;
+  points.forEach((point, index) => {
+    const value = values[index];
+    if (value === null) { connected = false; return; }
+    const x = 12 + (point.at_ms - start) / duration * 676, y = 91 - (value - min) / span * 74;
+    const elapsed = point.at_ms - previousAt;
+    const continuous = connected && previousContext === point.context && elapsed >= 0 && elapsed <= 120_000;
+    path += `${continuous ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)} `;
+    previousContext = point.context; previousAt = point.at_ms; connected = true;
+  });
+  return path;
+}
+
 const reasons: Record<string, string> = {
   SIMULATION_SYNTHETIC_EXECUTION: 'Заявки и исполнения моделируются. Очередь, комиссия и исполнение на бирже могут отличаться.',
   RECENT_AUDIT_NOT_COMPLETE_LEDGER: 'Показан ограниченный хвост журнала. По нему нельзя посчитать все действия за период.',
@@ -128,6 +148,8 @@ const reasons: Record<string, string> = {
   MATCHED_COMPLETE_ACCOUNTING_REQUIRED: 'Для сопоставимого результата нужны одинаковый период и рынки, полный учет капитала, исполнений и затрат.',
   SIMULATION_NOT_SELECTED: 'В текущем режиме симуляция не выбрана.',
   SECONDARY_EQUITY_UNAVAILABLE: 'История вторичных оценок капитала недоступна. Текущие снимки проверяются отдельно.',
+  V2_DEFAULT_FEED_EXCLUDES_OPT_IN_TIPS: 'Запрошенная публичная лента не включает TIP (чаевые). Возможные чаевые и их расходы здесь не учтены.',
+  V2_OPEN_POSITIONS_NOT_COMPLETE_WALLET_LIFECYCLE: 'Снимок показывает открытые позиции. Закрытые позиции и завершенные расчеты не входят в этот снимок; полный учет кошелька не подтвержден.',
   PUBLIC_WALLET_NOT_BOT_ATTRIBUTED: 'Наблюдаемый кошелек может включать ручные операции и другие стратегии. Результат самого бота не подтвержден.',
   PUBLIC_WALLET_ATTRIBUTION_UNVERIFIED: 'Публичный кошелек не подтверждает, что все операции принадлежат одному боту.',
   AUTHENTICATED_BOT_LEDGER_UNAVAILABLE: 'Нет полного журнала подтвержденных операций нашего бота.',

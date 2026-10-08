@@ -3,12 +3,16 @@ from copy import deepcopy
 from decimal import Decimal
 import io
 import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from tools.research.observe_public_v2 import (MAX_BYTES, MAX_REQUESTS, MAX_SECONDS, PublicHTTPV2,
     envelope, observe_account, project_activity, project_position)
 from tools.research.schema import ResearchError, digest, epoch_utc
+from tools.research.archive import publish_bundle
+from tools.research.console_comparison import build_reference
 
 ACCOUNT = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
 CONDITION = "0x" + "a" * 64
@@ -141,6 +145,25 @@ class V2ObserverTests(unittest.TestCase):
         self.assertFalse(result["snapshot"]["financial_complete"])
         query = next(query for endpoint, query in api.requests if endpoint == "positions")
         self.assertEqual((query["status"], query["filter_amount"], query["include_archived"]), ("OPEN", "0", "true"))
+
+    def test_comparison_preserves_verified_v2_feed_and_position_scope_limits(self):
+        result = self.capture(FixtureAPI([page([activity(10)])], [page([position()])]))
+        self.assertTrue(result["coverage"]["activity_complete"])
+        self.assertTrue(result["coverage"]["positions_page_complete"])
+        with tempfile.TemporaryDirectory() as temporary:
+            observer = publish_bundle(Path(temporary), {
+                "events.jsonl": result["events"], "closing.json": result["snapshot"],
+                "coverage.json": result["coverage"], "source-activity.jsonl": result["activity_rows"],
+            }, scope={"kind": "one-public-account", "lane": "public-benchmark", "account_id": ACCOUNT, "chain_id": 137},
+                utc_range={"start": epoch_utc(1), "end": epoch_utc(20)},
+                quality=result["quality"], created_at_utc=epoch_utc(20))
+            view, _ = build_reference(observer)
+        self.assertTrue(view["coverage"]["actions_complete"])
+        for reason in ("V2_DEFAULT_FEED_EXCLUDES_OPT_IN_TIPS", "V2_OPEN_POSITIONS_NOT_COMPLETE_WALLET_LIFECYCLE",
+                       "PROFILE_ATTRIBUTION_REVERIFY_REQUIRED"):
+            self.assertIn(reason, view["warnings"])
+        self.assertFalse(view["coverage"]["financial_complete"])
+        self.assertIsNone(view["metrics"]["net_pnl_usd"]["value"])
 
 
 class V2HTTPTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from './api';
-import { comparisonAge, comparisonAmount, comparisonDate, comparisonExport, comparisonKind, comparisonMode, comparisonPeriods, comparisonReason, validComparison } from './comparisonModel';
+import { comparisonAge, comparisonAmount, comparisonDate, comparisonExport, comparisonKind, comparisonMode, comparisonPeriods, comparisonReason, comparisonTrendPath, validComparison } from './comparisonModel';
 import type { ComparisonLane, ComparisonMetric, ComparisonPeriod, ComparisonSnapshot } from './comparisonModel';
 import type { Envelope } from './types';
 
@@ -54,20 +54,9 @@ function periodText(period: { start_ms: number | null; end_ms: number | null }):
 }
 
 function Trend({ lane }: { lane: ComparisonLane }) {
-  // Floating-point geometry is only a drawing aid. Exact financial values stay decimal text.
-  const values = lane.equity.map(point => point.value_usd !== null && /^\d{1,12}(?:\.\d{1,12})?$/.test(point.value_usd) ? Number(point.value_usd) : null);
-  const known = values.filter((value): value is number => value !== null && Number.isFinite(value));
-  if (known.length < 2) return <p className="trend-empty">История оценки капитала появится после нескольких пригодных снимков. Пропуски не заменяются нулем.</p>;
-  const min = Math.min(...known), span = Math.max(...known) - min || 1;
-  const start = lane.equity[0].at_ms, duration = lane.equity[lane.equity.length - 1].at_ms - start || 1;
-  let path = '', previousContext: string | null = null, connected = false;
-  lane.equity.forEach((point, index) => {
-    const value = values[index];
-    if (value === null) { connected = false; return; }
-    const x = 12 + (point.at_ms - start) / duration * 676, y = 91 - (value - min) / span * 74;
-    path += `${connected && previousContext === point.context ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)} `;
-    previousContext = point.context; connected = true;
-  });
+  const path = comparisonTrendPath(lane.equity);
+  if (path === null) return <p className="trend-empty">История оценки капитала появится после нескольких пригодных снимков. Пропуски не заменяются нулем.</p>;
+  const start = lane.equity[0].at_ms;
   return <div className="comparison-trend"><h3>Оценка капитала по снимкам</h3>
     <svg viewBox="0 0 700 108" role="img" aria-label="История оценочного капитала симуляции. Пробелы означают отсутствие пригодных данных."><path d={path} /></svg>
     <p className="small">{comparisonDate(start)} — {comparisonDate(lane.equity[lane.equity.length - 1].at_ms)}. Оценка по ценам источника; комиссии и продажа по этой цене не гарантированы.</p>
@@ -88,7 +77,10 @@ function ActionList({ lane }: { lane: ComparisonLane }) {
     </li>)}</ol> : <p className="comparison-empty">Нет пригодных действий в выбранном периоде. Это не подтверждает отсутствие операций.</p>}
     <p className="small">{lane.lane === 'simulation' ? 'Условные исполнения симуляции.' : 'Сумма события — движение денег, не прибыль.'} {lane.actions.length > shown.length ? `Еще ${lane.actions.length - shown.length} событий в доступной выборке. ` : ''}
       {lane.coverage.omitted_actions !== null && lane.coverage.omitted_actions > 0 ? `Не показано источником: ${lane.coverage.omitted_actions}. ` : ''}
-      {lane.coverage.actions_complete ? 'Источник подтверждает полноту действий для указанного периода.' : 'Полнота действий не подтверждена.'}</p>
+      {lane.coverage.actions_complete ? lane.lane === 'simulation'
+        ? 'Источник подтверждает полноту действий для указанного периода.'
+        : 'Запрошенная публичная лента прочитана полностью. Действия вне ленты и недоступные данные кошелька сюда не входят.'
+        : lane.lane === 'simulation' ? 'Полнота действий не подтверждена.' : 'Полнота запрошенной публичной ленты не подтверждена.'}</p>
   </div>;
 }
 

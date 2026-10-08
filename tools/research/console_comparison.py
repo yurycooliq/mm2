@@ -133,8 +133,11 @@ def build_reference(observer_bundle):
         warnings.append("ACTIONS_TRUNCATED")
     if len(raw_positions) > len(positions):
         warnings.append("POSITIONS_TRUNCATED")
-    if "PROFILE_ATTRIBUTION_REVERIFY_REQUIRED" in manifest.get("quality", {}).get("reasons", []):
-        warnings.append("PROFILE_ATTRIBUTION_REVERIFY_REQUIRED")
+    source_reasons = manifest.get("quality", {}).get("reasons", [])
+    for reason in ("PROFILE_ATTRIBUTION_REVERIFY_REQUIRED", "V2_DEFAULT_FEED_EXCLUDES_OPT_IN_TIPS",
+                   "V2_OPEN_POSITIONS_NOT_COMPLETE_WALLET_LIFECYCLE"):
+        if reason in source_reasons:
+            warnings.append(reason)
     first_ms, last_ms = epoch(manifest["utc_range"]["start"]), epoch(manifest["utc_range"]["end"])
     periods = {}
     for key, duration in (("1h", 3_600_000), ("6h", 21_600_000), ("24h", 86_400_000), ("all", None)):

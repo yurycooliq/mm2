@@ -31,6 +31,7 @@ class ComparisonTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.store = Store(self.root / "secondary.sqlite3")
         self.state = {"execution_mode": "simulation", "mode": "paused", "published_at_ms": NOW,
+            "boot_id": "00000000-0000-4000-8000-000000000001",
             "reset_epoch": 0, "simulation_market_condition": "market-A", "feed_ready": False,
             "simulation": {"simulated": True, "now_ms": NOW, "audit_sequence": 4, "audit_evicted": 2,
                 "account": {"initial_cash_micros": 100_000_000, "spent_pico": "2000000000000",
@@ -108,6 +109,22 @@ class ComparisonTests(unittest.TestCase):
         self.assertIsNone(own["metrics"]["equity_change_usd"]["value"])
         self.assertIsNone(own["metrics"]["net_pnl_usd"]["value"])
 
+    def test_equity_different_boots_with_same_profile_epoch_do_not_join(self):
+        self.store.equity_sample(NOW - 60_000, None, 10**14, valuation_context(self.state))
+        self.state["boot_id"] = "00000000-0000-4000-8000-000000000002"
+        self.store.equity_sample(NOW, None, 2 * 10**14, valuation_context(self.state))
+        own = comparison(self.envelope, self.store, self.root / "missing", NOW)["own"]
+        self.assertNotEqual(own["equity"][0]["context"], own["equity"][1]["context"])
+        self.assertIsNone(own["metrics"]["equity_change_usd"]["value"])
+
+    def test_equity_unknown_boot_and_legacy_samples_cannot_establish_continuity(self):
+        self.state.pop("boot_id")
+        for context in (valuation_context(self.state), '{"profile":"simulation","reset_epoch":0}'):
+            self.store.equity_sample(NOW - 60_000, None, 10**14, context)
+            self.store.equity_sample(NOW, None, 2 * 10**14, context)
+            own = comparison(self.envelope, self.store, self.root / "missing", NOW)["own"]
+            self.assertIsNone(own["metrics"]["equity_change_usd"]["value"])
+
     def test_reference_source_window_and_requested_window_remain_distinct(self):
         self.artifact()
         result = comparison(self.envelope, self.store, self.root / "views", NOW, "1h")["reference"]
@@ -159,6 +176,17 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(result["status"], "AVAILABLE")
             self.assertFalse(result["coverage"]["financial_complete"])
             self.assertIsNone(result["metrics"]["net_pnl_usd"]["value"])
+
+    def test_complete_selected_feed_does_not_inherit_whole_window_tail_warning(self):
+        def selected(view):
+            view["warnings"].append("ACTIONS_TRUNCATED")
+            view["periods"] = {"1h": {"period": {"start_ms": NOW - 3_600_000, "end_ms": NOW - 60_000},
+                "observed_actions": 1, "observed_events": "1", "actions_complete": True}}
+        self.artifact(selected)
+        result = load_reference(self.root / "views", NOW, NOW - 3_600_000, "1h")
+        self.assertEqual(result["coverage"]["omitted_actions"], 0)
+        self.assertTrue(result["coverage"]["actions_complete"])
+        self.assertNotIn("ACTIONS_TRUNCATED", result["warnings"])
 
     def observer_bundle(self, repetitions=2):
         fixtures = Path(archive.__file__).resolve().parent / "tests" / "fixtures"

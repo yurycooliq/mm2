@@ -7,6 +7,7 @@ Errors retain the last pointer; quota stops collection without deleting audit
 copies or primary data. Run separately from engine and console request handlers.
 """
 import argparse
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import signal
@@ -68,7 +69,7 @@ def main(argv=None):
     parser.add_argument("--out", required=True, help="dedicated bounded secondary archive/view root")
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--registry")
-    parser.add_argument("--source-revision", default="unknown")
+    parser.add_argument("--source-revision", default=os.environ.get("MM2_SOURCE_REVISION", "unknown"))
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=300)
     args = parser.parse_args(argv)

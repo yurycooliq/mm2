@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { comparisonAmount, comparisonAge, comparisonDate, comparisonExport, comparisonReason, comparisonMode, comparisonKind, validComparison } from '../.test-build/comparisonModel.js';
+import { comparisonAmount, comparisonAge, comparisonDate, comparisonExport, comparisonReason, comparisonMode, comparisonKind, comparisonTrendPath, validComparison } from '../.test-build/comparisonModel.js';
 
 test('comparison amounts preserve exact large decimals, tiny losses, and explicit zero', () => {
   assert.equal(comparisonAmount('12345678901234567890.123456789012'), '$12 345 678 901 234 567 890,123456789012');
@@ -24,6 +24,8 @@ test('dates explicitly use UTC and quality explains incomplete public evidence',
   assert.equal(comparisonDate(Date.UTC(2026, 9, 8, 13, 14, 15)), '08.10.2026, 13:14:15 UTC');
   assert.match(comparisonReason('PUBLIC_WALLET_NOT_BOT_ATTRIBUTED'), /ручные операции/);
   assert.match(comparisonReason('REFERENCE_OUTSIDE_REQUESTED_PERIOD'), /не перекрывает/);
+  assert.match(comparisonReason('V2_DEFAULT_FEED_EXCLUDES_OPT_IN_TIPS'), /чаевые.*не учтены/);
+  assert.match(comparisonReason('V2_OPEN_POSITIONS_NOT_COMPLETE_WALLET_LIFECYCLE'), /Закрытые позиции.*не входят/);
   assert.equal(comparisonReason('FUTURE_NEW_REASON'), 'FUTURE_NEW_REASON');
 });
 
@@ -62,4 +64,30 @@ test('export preserves full evidence, exact decimals, nulls, selected period, an
   assert.equal(exported.filename, 'mm2-comparison-1h-100.json');
   assert.deepEqual(JSON.parse(exported.text),value);
   assert.equal(JSON.parse(exported.text).reference.metrics.net_pnl_usd.value,null);
+});
+
+test('sparse equity samples do not draw a gain across a gap longer than 120 seconds', () => {
+  const points = [
+    {at_ms:0,value_usd:'100',context:'same'},
+    {at_ms:60000,value_usd:'101',context:'same'},
+    {at_ms:180001,value_usd:'110',context:'same'},
+    {at_ms:240001,value_usd:'111',context:'same'},
+  ];
+  assert.deepEqual(comparisonTrendPath(points).match(/[ML]/g), ['M','L','M','L']);
+  assert.deepEqual(comparisonTrendPath([
+    {at_ms:0,value_usd:'100',context:'same'},
+    {at_ms:120000,value_usd:'101',context:'same'},
+  ]).match(/[ML]/g), ['M','L']);
+});
+
+test('equity nulls and context changes break lines without substituting a zero', () => {
+  const points = [
+    {at_ms:0,value_usd:'100',context:'first'},
+    {at_ms:60000,value_usd:null,context:'first'},
+    {at_ms:120000,value_usd:'105',context:'first'},
+    {at_ms:180000,value_usd:'106',context:'second'},
+    {at_ms:240000,value_usd:'107',context:'second'},
+  ];
+  assert.deepEqual(comparisonTrendPath(points).match(/[ML]/g), ['M','M','M','L']);
+  assert.equal(comparisonTrendPath(points.slice(0,2)),null);
 });

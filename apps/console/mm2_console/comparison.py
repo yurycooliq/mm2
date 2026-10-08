@@ -7,7 +7,7 @@ import re
 import sqlite3
 
 from .observability import execution_summary
-from .telegram_reports import deposit_value, holdings, valuation_context
+from .telegram_reports import deposit_value, holdings, valuation_boot, valuation_context
 
 REFERENCE_ACCOUNT = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
 MAX_VIEW_BYTES = 524_288
@@ -201,6 +201,8 @@ def load_reference(root, now_ms, start_ms, period="all"):
                 raise ValueError("inconsistent action coverage")
             result["coverage"]["omitted_actions"] = observed_count - shown
             result["coverage"]["actions_complete"] = selected.get("actions_complete") is True and observed_count == shown
+            if observed_count == shown:
+                result["warnings"] = [code for code in result["warnings"] if code != "ACTIONS_TRUNCATED"]
         for row in view["positions"]:
             row = obj(row)
             result["positions"].append({"market": _text(row.get("market")), "outcome": _text(row.get("outcome"), 64),
@@ -301,7 +303,8 @@ def own_lane(envelope, store, now_ms, start_ms):
     result["equity"] = [{"at_ms": row["observed_at_ms"], "value_usd": decimal(uint(row.get("paper_pico"))),
                          "context": row["context"]} for row in points]
     context = valuation_context(state)
-    if (len(points) >= 2 and all(row["context"] == context and uint(row.get("paper_pico")) is not None for row in points)
+    if (valuation_boot(state) is not None and len(points) >= 2
+            and all(row["context"] == context and uint(row.get("paper_pico")) is not None for row in points)
             and all(b["observed_at_ms"] - a["observed_at_ms"] <= 120_000 for a, b in zip(points, points[1:]))):
         result["metrics"]["equity_change_usd"] = metric(decimal(int(points[-1]["paper_pico"]) - int(points[0]["paper_pico"])),
             scope="change between retained same-context sampled NAV estimates", reason="SAMPLED_NAV_NOT_REALIZED_PROFIT")
