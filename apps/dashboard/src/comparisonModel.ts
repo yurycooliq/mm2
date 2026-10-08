@@ -100,6 +100,17 @@ export function comparisonExport(snapshot: ComparisonSnapshot): { filename: stri
   return { filename: `mm2-comparison-${snapshot.requested_period}-${snapshot.generated_at_ms}.json`, text: JSON.stringify(snapshot, null, 2) + '\n' };
 }
 
+function hasKnownValuationBoot(context: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(context);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const boot = (parsed as Record<string, unknown>).boot_id;
+    return typeof boot === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(boot);
+  } catch {
+    return false;
+  }
+}
+
 export function comparisonTrendPath(points: ComparisonLane['equity']): string | null {
   // Floating-point coordinates draw the chart; financial amounts remain exact text.
   const values = points.map(point => point.value_usd !== null && /^\d{1,12}(?:\.\d{1,12})?$/.test(point.value_usd) ? Number(point.value_usd) : null);
@@ -113,7 +124,7 @@ export function comparisonTrendPath(points: ComparisonLane['equity']): string | 
     if (value === null) { connected = false; return; }
     const x = 12 + (point.at_ms - start) / duration * 676, y = 91 - (value - min) / span * 74;
     const elapsed = point.at_ms - previousAt;
-    const continuous = connected && previousContext === point.context && elapsed >= 0 && elapsed <= 120_000;
+    const continuous = connected && previousContext === point.context && hasKnownValuationBoot(point.context) && elapsed >= 0 && elapsed <= 120_000;
     path += `${continuous ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)} `;
     previousContext = point.context; previousAt = point.at_ms; connected = true;
   });

@@ -27,7 +27,7 @@ Local Windows validation plus targeted final-review regressions: 471 Python
 checks, 446 passed and 25 platform/dependency skips (console 100, data 21,
 latency 34, operations 147, research 169). The six new
 engine regression checks passed with 90 engine tests, formatting and targeted
-Clippy. Dashboard 24 checks, production build, rendered fixture desktop/mobile
+Clippy. Dashboard 25 checks, production build, rendered fixture desktop/mobile
 interaction and exact JSON-download parity passed. Full locked Rust/workspace,
 Python Linux, parity/reference, new exact-image container acceptance and final
 independent image/host acceptance remain required for this candidate; use final-head PR checks
@@ -37,7 +37,8 @@ Repeated integration review found and fixed chart connections across gaps over
 120 seconds, boot-identity omission from NAV continuity, and dropped v2 TIP/open
 position scope warnings. Requested-feed completeness is now distinguished from
 all wallet activity. Legacy samples without known boot identity cannot establish
-a continuous gain; current samples from separate boots never join.
+a continuous gain or connecting chart line; current samples from separate boots
+never join.
 
 AWS STS was verified expired on October 8. Ordinary console sign-in now loads in
 the owner's browser; human authentication is pending. No candidate rollout,

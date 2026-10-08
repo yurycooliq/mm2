@@ -66,28 +66,59 @@ test('export preserves full evidence, exact decimals, nulls, selected period, an
   assert.equal(JSON.parse(exported.text).reference.metrics.net_pnl_usd.value,null);
 });
 
+const valuationContext = JSON.stringify({profile:'simulation',reset_epoch:'0',boot_id:'01234567-89ab-cdef-0123-456789abcdef'});
+const otherValuationContext = JSON.stringify({profile:'simulation',reset_epoch:'0',boot_id:'11234567-89ab-cdef-0123-456789abcdef'});
+
 test('sparse equity samples do not draw a gain across a gap longer than 120 seconds', () => {
   const points = [
-    {at_ms:0,value_usd:'100',context:'same'},
-    {at_ms:60000,value_usd:'101',context:'same'},
-    {at_ms:180001,value_usd:'110',context:'same'},
-    {at_ms:240001,value_usd:'111',context:'same'},
+    {at_ms:0,value_usd:'100',context:valuationContext},
+    {at_ms:60000,value_usd:'101',context:valuationContext},
+    {at_ms:180001,value_usd:'110',context:valuationContext},
+    {at_ms:240001,value_usd:'111',context:valuationContext},
   ];
   assert.deepEqual(comparisonTrendPath(points).match(/[ML]/g), ['M','L','M','L']);
   assert.deepEqual(comparisonTrendPath([
-    {at_ms:0,value_usd:'100',context:'same'},
-    {at_ms:120000,value_usd:'101',context:'same'},
+    {at_ms:0,value_usd:'100',context:valuationContext},
+    {at_ms:120000,value_usd:'101',context:valuationContext},
   ]).match(/[ML]/g), ['M','L']);
 });
 
 test('equity nulls and context changes break lines without substituting a zero', () => {
   const points = [
-    {at_ms:0,value_usd:'100',context:'first'},
-    {at_ms:60000,value_usd:null,context:'first'},
-    {at_ms:120000,value_usd:'105',context:'first'},
-    {at_ms:180000,value_usd:'106',context:'second'},
-    {at_ms:240000,value_usd:'107',context:'second'},
+    {at_ms:0,value_usd:'100',context:valuationContext},
+    {at_ms:60000,value_usd:null,context:valuationContext},
+    {at_ms:120000,value_usd:'105',context:valuationContext},
+    {at_ms:180000,value_usd:'106',context:otherValuationContext},
+    {at_ms:240000,value_usd:'107',context:otherValuationContext},
   ];
   assert.deepEqual(comparisonTrendPath(points).match(/[ML]/g), ['M','M','M','L']);
   assert.equal(comparisonTrendPath(points.slice(0,2)),null);
+});
+
+test('legacy, unknown, and malformed boot contexts keep observed points but never connect them', () => {
+  const contexts = [
+    JSON.stringify({profile:'simulation',reset_epoch:'0'}),
+    JSON.stringify({profile:'simulation',reset_epoch:'0',boot_id:null}),
+    JSON.stringify({profile:'simulation',reset_epoch:'0',boot_id:'unknown'}),
+    JSON.stringify({boot_id:'01234567-89AB-CDEF-0123-456789ABCDEF'}),
+    JSON.stringify({boot_id:'01234567-89ab-cdef-0123-456789abcdef-extra'}),
+    JSON.stringify({boot_id:123}),
+    'invalid context', 'null', '[]',
+  ];
+  for (const context of contexts) {
+    const path = comparisonTrendPath([
+      {at_ms:0,value_usd:'100',context},
+      {at_ms:60000,value_usd:'110',context},
+    ]);
+    assert.deepEqual(path.match(/[ML]/g), ['M','M'], context);
+    assert.equal(path.trim().split(' ').length, 2, 'both observed points remain');
+  }
+  assert.deepEqual(comparisonTrendPath([
+    {at_ms:0,value_usd:'100',context:valuationContext},
+    {at_ms:60000,value_usd:'110',context:valuationContext},
+  ]).match(/[ML]/g), ['M','L']);
+  assert.deepEqual(comparisonTrendPath([
+    {at_ms:0,value_usd:'100',context:valuationContext},
+    {at_ms:60000,value_usd:'110',context:otherValuationContext},
+  ]).match(/[ML]/g), ['M','M']);
 });
