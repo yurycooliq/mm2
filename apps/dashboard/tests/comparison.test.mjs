@@ -41,7 +41,7 @@ test('persisted action history explains sampling, retention and source continuit
   const cases = [
     ['SAMPLED_ACTION_HISTORY_NOT_COMPLETE_LEDGER', /сохраненная выборка.*не полный журнал.*нельзя подтвердить/],
     ['BOOT_CONTINUITY_UNPROVEN', /разных запусков.*одного счета и журнала.*не подтверждена/],
-    ['ACTION_HISTORY_LOCATOR_UNBOUND', /не подтверждена.*только.*текущего снимка/],
+    ['ACTION_HISTORY_LOCATOR_UNBOUND', /Нет проверенного указателя журнала.*текущего запуска.*счетом не подтверждена/],
     ['ACTION_HISTORY_GENERATION_CHANGED', /отката или несовпадения.*отделены.*не подтверждена/],
     ['ACTION_HISTORY_SAMPLE_GAPS', /есть пропуски.*могла не попасть/],
     ['ACTION_HISTORY_RETENTION_LIMIT', /4 096 наблюдениями и 7 днями.*исключена из этой выборки/],
