@@ -153,7 +153,7 @@ function Lane({ lane, transportStale }: { lane: ComparisonLane; transportStale: 
       <Metric label="Деньги на счете" metric={lane.metrics.cash_usd} note="Остаток по последнему снимку" />
       <Metric label="Оценка капитала с позициями" metric={lane.metrics.nav_usd} note="Оценка источника, не подтвержденная продажа" />
       {!own && <Metric label="Стоимость позиций с известной оценкой" metric={lane.metrics.position_value_usd} note="Сумма только позиций с известной оценкой. Остальная стоимость и деньги кошелька неизвестны." />}
-      {own && <><Metric label="Доступно в текущем рынке" metric={lane.metrics.available_usd} note="После текущих резервов" /><Metric label="Зарезервировано" metric={lane.metrics.reserved_usd} note="Под активные заявки по снимку" /></>}
+      {own && <><Metric label="Доступно в текущем рынке" metric={lane.metrics.available_usd} note="С учетом бюджета рынка, лимитов портфеля и резервов" /><Metric label="Зарезервировано" metric={lane.metrics.reserved_usd} note="Под активные заявки по снимку" /></>}
       <Metric label={own ? 'Чистый результат симуляции' : 'Чистый результат кошелька'} metric={lane.metrics.net_pnl_usd} />
       <Metric label="Изменение оценки между снимками" metric={lane.metrics.equity_change_usd} note="Первый и последний пригодный снимок; не чистая прибыль" />
       <Metric label="Оборот в наблюдениях" metric={lane.metrics.turnover_usd} note="Объем событий с известной суммой" />
