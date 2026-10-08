@@ -152,9 +152,10 @@ def build_report(bundle, *, cutoff_utc, display_timezone="Europe/Lisbon", contro
             raise ResearchError("access snapshot postdates cutoff")
         statuses = {"AUTHENTICATED", "EXPIRED", "UNCONFIGURED", "DENIED", "UNREACHABLE",
                     "CLI_UNAVAILABLE", "AUTH_ERROR", "INVALID_IDENTITY_RESPONSE"}
-        if (access.get("status") not in statuses
-                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", str(access.get("profile", "")))
-                or not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]", str(access.get("region", "")))):
+        if (not all(isinstance(access.get(key), str) for key in ("status", "profile", "region"))
+                or access["status"] not in statuses
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", access["profile"])
+                or not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]", access["region"])):
             raise ResearchError("invalid access snapshot")
         report["research_access"] = {key: access[key] for key in ("status", "profile", "region")}
         report["research_access"].update({"observed_at_utc": access["captured_at_utc"],

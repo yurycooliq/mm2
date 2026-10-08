@@ -37,7 +37,8 @@ class ControlReportTests(unittest.TestCase):
         access = {"captured_at_utc": "2026-10-07T00:00:30Z", "profile": "mm2", "region": "eu-west-1", "status": "AUTHENTICATED"}
         bundle = self.bundle()
         for change in ({"captured_at_utc": "2026-10-07T00:02:00Z"}, {"status": "HEALTHY"},
-                       {"profile": "untrusted\ntext"}, {"region": "untrusted"}):
+                       {"profile": "untrusted\ntext"}, {"region": "untrusted"},
+                       {"status": []}, {"profile": True}, {"profile": None}, {"region": []}):
             with self.subTest(change=change), self.assertRaises(ResearchError):
                 build_report(bundle, cutoff_utc="2026-10-07T00:01:00Z", access={**access, **change})
 
