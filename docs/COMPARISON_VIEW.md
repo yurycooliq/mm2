@@ -21,7 +21,7 @@ python -B scripts/refresh_comparison.py --out /path/to/research-view --loop --in
 ```
 
 Only public GET activity/positions calls are made for the exact registered
-account. Per capture: 90 seconds, 120 HTTP requests, 16 MB received, 10,000
+account. Public collection budget: 90 seconds, 120 HTTP requests, 16 MB received, 10,000
 activity rows, at most 24 hours. Successful captures keep canonical immutable
 observer bundles, requests/coverage receipts and a view bundle. Only after
 verification does `current.json` switch atomically. Failed activity capture
@@ -60,6 +60,12 @@ engine/owner/Telegram credentials or engine network. The console mounts its
 view volume read-only. It updates every five minutes independently of the engine.
 The collector uses the verified console image; its inherited HTTP healthcheck is
 disabled because it is not a web server. The engine still starts paused.
+The collector reserves 0.5 CPU and 192 MiB. A real cold 24h capture at these
+limits published and verified in 21.6 seconds with about 122 MiB peak process RSS;
+0.1 CPU failed to finish publication before the 90-second test deadline. These
+are measured desktop-container results, not selected-host latency guarantees.
+Artifact normalization, verification and publication follow the public HTTP
+budget; it is not a hard wall-time bound for the complete process.
 
 AWS uses a separate `mm2-comparison` project (`infra/aws/compose.comparison.yaml`),
 so collector failure cannot trigger engine supervisor recovery. The console reads

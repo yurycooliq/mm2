@@ -85,7 +85,7 @@ services:
     volumes: [research-view:/data]
     tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
     pids_limit: 16
-    cpus: 0.1
+    cpus: 0.5
     mem_limit: 192m
     stop_grace_period: 20s
     restart: unless-stopped

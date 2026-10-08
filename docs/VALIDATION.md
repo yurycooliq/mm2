@@ -42,6 +42,16 @@ never join.
 The primary screen also exposes sampled engine/simulation/live faults and
 warning/critical/full journal capacity without expanding diagnostics. Rendered
 desktop/mobile fault and capacity fixtures passed with no control submissions.
+Actual isolated collector acceptance on `d5e48f2`: UID 10002, read-only root,
+no execution credentials/network, 0.5 CPU/192 MiB, 4,370 events and 393 OPEN
+positions, ten public GETs and 3,807,128 received bytes. Cold publication took
+20.791 seconds; independent verification finished at 21.586 seconds. Peak
+process RSS was 125,060 KiB and OOM was false. Observer/view/current identities,
+source revision and v2 scope warnings were verified; financial completeness
+remained false. At 0.1 CPU the preceding cold test did not finish publication
+by 90 seconds; its partial public evidence was preserved. Only new labeled
+test containers/network/volumes were removed. This does not establish AWS
+performance, long retention or continuous engine capacity.
 
 AWS STS was verified expired on October 8. Ordinary console sign-in now loads in
 the owner's browser; human authentication is pending. No candidate rollout,
