@@ -1,5 +1,38 @@
 # Validation evidence
 
+## Binance reference burst isolation: October 9, 2026
+
+The selected AWS simulation exited at 10:43:07 UTC with a fatal Binance
+`feed_queue_overflow`. The source sent every BTCUSDT trade through the same
+bounded queue as CLOB execution input. Binance supplies a latest reference
+price, so this diagnostic traffic could exhaust capacity needed by execution.
+
+The Binance reader now validates every trade and keeps one pending reference
+per socket, attempting delivery every 50 ms with missed ticks skipped. Full
+queues retain that slot; newer valid references replace it. Exchange/receive
+clocks remain original, regressions remain errors, and socket termination
+discards pending references before Disconnect. Recoverable Binance Disconnect
+admission waits only until the existing send deadline and remains interruptible
+by shutdown. CLOB whole-frame admission, ordering and fatal overflow behavior
+are unchanged. Per-boot counters expose coalescing, delivery, capacity pressure
+and discarded pending references.
+
+All **259 Rust workspace tests passed**, including **60 engine library tests**
+and six new regressions. The new checks cover 50,000 references against a full
+queue, an actual 4,096-message loopback WebSocket burst, original timestamps,
+regressions, closed consumers, socket cleanup, ordered Disconnect admission,
+its finite deadline and shutdown priority. Workspace formatting and
+all-targets Clippy with `-D warnings` passed. The local production build forces
+engine recompilation using source mtimes only, as required by the earlier
+shared-cache incident below.
+
+Final-head Rust/release, Python, parity, frontend and container jobs in
+[PR 5](https://github.com/yurycooliq/mm2/pull/5), exact-image smoke checks and
+separate stopped-ledger recovery receipts establish release acceptance. These
+tests do not establish a continuous 24-hour run or economic profitability.
+The failed forward session remains a failed, partial technical acceptance;
+restarting with a preserved ledger begins a separate observation period.
+
 ## Established WebSocket recovery: October 8, 2026
 
 After its earlier successful 16-minute public-feed simulation, the retained

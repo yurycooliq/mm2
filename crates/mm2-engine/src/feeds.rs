@@ -28,6 +28,8 @@ const MAX_REST_BYTES: usize = 262_144;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 const MAX_MEMBERS: usize = 4096;
 const MAX_DEPTH: usize = 10_000;
+// Binance is a latest spot-price diagnostic, not an execution tape or TWAP.
+const REFERENCE_INTERVAL: Duration = Duration::from_millis(50);
 const UINT256_MAX: &str =
     "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 const UNCLEAN_WEBSOCKET_CLOSE: &str = "public WebSocket closed without closing handshake";
@@ -192,6 +194,12 @@ struct SourceDiagnostics {
     bootstrap_cutoff_exchange_ms: [AtomicU64; 2],
     phase: AtomicU8,
     last_failure: AtomicU64,
+    reference_received: AtomicU64,
+    reference_coalesced: AtomicU64,
+    reference_delivered: AtomicU64,
+    reference_queue_full: AtomicU64,
+    reference_discarded: AtomicU64,
+    reference_pending: AtomicU64,
 }
 
 #[derive(Clone, Serialize)]
@@ -214,6 +222,13 @@ pub struct SourceDiagnosticsSnapshot {
     last_failure: Option<&'static str>,
     last_failure_fatal: bool,
     last_failure_at_mono_ms: Option<u64>,
+    reference_received: u64,
+    reference_coalesced: u64,
+    reference_delivered: u64,
+    reference_queue_full: u64,
+    reference_discarded: u64,
+    reference_pending: u64,
+    reference_publish_interval_ms: Option<u64>,
 }
 
 fn increment(counter: &AtomicU64) {
@@ -260,6 +275,14 @@ impl FeedDiagnostics {
                 last_failure: failure_name(failure_class),
                 last_failure_fatal: failure & 256 != 0,
                 last_failure_at_mono_ms: (failure_class != 0).then_some(failure >> 9),
+                reference_received: value.reference_received.load(Ordering::Relaxed),
+                reference_coalesced: value.reference_coalesced.load(Ordering::Relaxed),
+                reference_delivered: value.reference_delivered.load(Ordering::Relaxed),
+                reference_queue_full: value.reference_queue_full.load(Ordering::Relaxed),
+                reference_discarded: value.reference_discarded.load(Ordering::Relaxed),
+                reference_pending: value.reference_pending.load(Ordering::Relaxed),
+                reference_publish_interval_ms: (source == FeedSource::Binance)
+                    .then_some(REFERENCE_INTERVAL.as_millis() as u64),
             }
         };
         FeedDiagnosticsSnapshot {
@@ -1040,6 +1063,107 @@ pub fn enqueue_frame(
     Ok(())
 }
 
+/// One pending diagnostic price per socket. Never coalesce CLOB books/trades,
+/// stamp a queued price with a new receive clock, or suppress invalid input.
+struct ReferenceBuffer<'a> {
+    pending: Option<FeedEvent>,
+    last_clock: Option<(u64, u64)>,
+    diagnostics: Option<&'a SourceDiagnostics>,
+}
+
+impl<'a> ReferenceBuffer<'a> {
+    fn new(diagnostics: Option<&'a SourceDiagnostics>) -> Self {
+        Self {
+            pending: None,
+            last_clock: None,
+            diagnostics,
+        }
+    }
+
+    fn observe(&mut self, event: FeedEvent) -> Result<(), String> {
+        let FeedEvent::Reference {
+            exchange_ms,
+            observed_mono_ms,
+            price_micro,
+        } = &event
+        else {
+            return Err("unexpected Binance reference event".into());
+        };
+        if *price_micro == 0
+            || self.last_clock.is_some_and(|(exchange, observed)| {
+                *exchange_ms < exchange || *observed_mono_ms < observed
+            })
+        {
+            return Err("invalid or regressed Binance reference input".into());
+        }
+        self.last_clock = Some((*exchange_ms, *observed_mono_ms));
+        let replaced = self.pending.replace(event).is_some();
+        if let Some(diagnostics) = self.diagnostics {
+            increment(&diagnostics.reference_received);
+            if replaced {
+                increment(&diagnostics.reference_coalesced);
+            }
+            diagnostics.reference_pending.store(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, tx: &mpsc::Sender<FeedEvent>) -> Result<(), String> {
+        if self.pending.is_none() {
+            return Ok(());
+        }
+        let permit = match tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Some(diagnostics) = self.diagnostics {
+                    increment(&diagnostics.reference_queue_full);
+                }
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err("feed consumer closed".into()),
+        };
+        permit.send(self.pending.take().expect("pending reference reserved"));
+        if let Some(diagnostics) = self.diagnostics {
+            increment(&diagnostics.reference_delivered);
+            diagnostics.reference_pending.store(0, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReferenceBuffer<'_> {
+    fn drop(&mut self) {
+        // A previous socket's pending price cannot appear after its Disconnect.
+        if self.pending.is_some()
+            && let Some(diagnostics) = self.diagnostics
+        {
+            increment(&diagnostics.reference_discarded);
+            diagnostics.reference_pending.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+async fn enqueue_reference_disconnect(
+    tx: &mpsc::Sender<FeedEvent>,
+    event: FeedEvent,
+    deadline: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<bool, String> {
+    // A diagnostic Disconnect must follow already delivered reference prices.
+    // Backpressure is bounded and shutdown remains interruptible.
+    tokio::select! {
+        biased;
+        _ = wait_shutdown(shutdown) => Ok(false),
+        result = tokio::time::timeout(deadline, tx.reserve()) => {
+            match result {
+                Ok(Ok(permit)) => { permit.send(event); Ok(true) }
+                Ok(Err(_)) => Err("feed consumer closed".into()),
+                Err(_) => Err("feed queue overflow".into()),
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Settings {
     connect: Duration,
@@ -1215,6 +1339,9 @@ async fn session(
     tokio::pin!(idle);
     let mut ping = tokio::time::interval(settings.ping);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut reference_tick = tokio::time::interval(REFERENCE_INTERVAL);
+    reference_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut reference = ReferenceBuffer::new(diagnostics);
     loop {
         tokio::select! {
             biased;
@@ -1227,6 +1354,9 @@ async fn session(
             _ = ping.tick() => {
                 let message = if source == FeedSource::Clob { Message::Text("PING".into()) } else { Message::Ping(Vec::new().into()) };
                 if !matches!(tokio::time::timeout(settings.send, socket.send(message)).await, Ok(Ok(()))) { return SessionResult::Transport("public heartbeat send failed"); }
+            },
+            _ = reference_tick.tick(), if source == FeedSource::Binance => {
+                if let Err(error) = reference.flush(tx) { return SessionResult::Fatal(error); }
             },
             received = socket.next() => {
                 let message = match received {
@@ -1248,7 +1378,11 @@ async fn session(
                             ready_since.get_or_insert_with(Instant::now);
                         }
                         if recovery_state.ready() && let Some(diagnostics) = diagnostics { diagnostics.phase.store(4, Ordering::Relaxed); }
-                        if let Err(error) = enqueue_frame(tx, events, fault) { return SessionResult::Fatal(error); }
+                        if source == FeedSource::Binance {
+                            for event in events {
+                                if let Err(error) = reference.observe(event) { return SessionResult::Fatal(error); }
+                            }
+                        } else if let Err(error) = enqueue_frame(tx, events, fault) { return SessionResult::Fatal(error); }
                     },
                     Message::Ping(payload) => {
                         if !matches!(tokio::time::timeout(settings.send, socket.send(Message::Pong(payload))).await, Ok(Ok(()))) { return SessionResult::Transport("public pong send failed"); }
@@ -1364,14 +1498,24 @@ async fn run_feed(
             // first fatal cause in the independent fault channel.
             latch_fault(&fault, reason.clone());
         }
-        if let Err(queue_error) = enqueue_frame(
-            &tx,
-            vec![FeedEvent::Disconnect {
-                source,
-                reason: reason.clone(),
-            }],
-            &fault,
-        ) {
+        let disconnect = FeedEvent::Disconnect {
+            source,
+            reason: reason.clone(),
+        };
+        let queued = if source == FeedSource::Binance && !fatal {
+            enqueue_reference_disconnect(&tx, disconnect, endpoint.settings.send, &mut shutdown)
+                .await
+        } else {
+            enqueue_frame(&tx, vec![disconnect], &fault).map(|()| true)
+        };
+        if matches!(queued, Ok(false)) {
+            if let Some(diagnostics) = &endpoint.diagnostics {
+                diagnostics.source(source).phase.store(7, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        if let Err(queue_error) = queued {
+            latch_fault(&fault, queue_error.clone());
             // Even a recoverable transport loss becomes fatal if its disconnect
             // cannot reach the actor. Preserve source/code/fatal diagnostics for
             // that secondary queue failure rather than exporting a retry phase.
@@ -1513,6 +1657,269 @@ mod transport_tests {
             bootstrap: Duration::from_secs(1),
             stable: Duration::from_millis(50),
         }
+    }
+
+    fn reference(exchange_ms: u64, observed_mono_ms: u64) -> FeedEvent {
+        FeedEvent::Reference {
+            exchange_ms,
+            observed_mono_ms,
+            price_micro: 80_000_000_000,
+        }
+    }
+
+    #[test]
+    fn reference_burst_keeps_one_latest_price_without_displacing_execution_events() {
+        let diagnostics = FeedDiagnostics::default();
+        let mut pending = ReferenceBuffer::new(Some(diagnostics.source(FeedSource::Binance)));
+        let (tx, mut rx) = mpsc::channel(1);
+        enqueue_frame(
+            &tx,
+            vec![FeedEvent::Disconnect {
+                source: FeedSource::Clob,
+                reason: "fixture".into(),
+            }],
+            &watch::channel(None).0,
+        )
+        .unwrap();
+        for time in 1..=50_000 {
+            pending.observe(reference(time, time + 3)).unwrap();
+            pending.flush(&tx).unwrap();
+        }
+        let sampled = diagnostics.snapshot().binance;
+        assert_eq!(sampled.reference_received, 50_000);
+        assert_eq!(sampled.reference_coalesced, 49_999);
+        assert_eq!(sampled.reference_pending, 1);
+        assert_eq!(sampled.reference_delivered, 0);
+        assert_eq!(sampled.reference_queue_full, 50_000);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            FeedEvent::Disconnect {
+                source: FeedSource::Clob,
+                ..
+            }
+        ));
+        pending.flush(&tx).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            FeedEvent::Reference {
+                exchange_ms: 50_000,
+                observed_mono_ms: 50_003,
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+        let sampled = diagnostics.snapshot().binance;
+        assert_eq!(sampled.reference_delivered, 1);
+        assert_eq!(sampled.reference_pending, 0);
+        assert_eq!(sampled.reference_discarded, 0);
+    }
+
+    #[test]
+    fn reference_coalescing_cannot_hide_regressed_clocks_or_invalid_event_types() {
+        let mut pending = ReferenceBuffer::new(None);
+        pending.observe(reference(10, 20)).unwrap();
+        assert!(pending.observe(reference(9, 21)).is_err());
+        assert!(pending.observe(reference(11, 19)).is_err());
+        assert!(
+            pending
+                .observe(FeedEvent::Disconnect {
+                    source: FeedSource::Binance,
+                    reason: "fixture".into()
+                })
+                .is_err()
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        pending.flush(&tx).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            FeedEvent::Reference {
+                exchange_ms: 10,
+                observed_mono_ms: 20,
+                ..
+            }
+        ));
+        // Same-exchange-time trades retain their actual receive ordering.
+        pending.observe(reference(10, 21)).unwrap();
+    }
+
+    #[test]
+    fn reference_socket_end_discards_pending_price_and_closed_consumer_is_fatal() {
+        let diagnostics = FeedDiagnostics::default();
+        {
+            let mut pending = ReferenceBuffer::new(Some(diagnostics.source(FeedSource::Binance)));
+            pending.observe(reference(1, 2)).unwrap();
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+            assert_eq!(pending.flush(&tx).unwrap_err(), "feed consumer closed");
+        }
+        let sampled = diagnostics.snapshot().binance;
+        assert_eq!(sampled.reference_discarded, 1);
+        assert_eq!(sampled.reference_pending, 0);
+        assert_eq!(sampled.reference_delivered, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reference_disconnect_waits_for_capacity_and_preserves_order() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(reference(10, 20)).await.unwrap();
+        let (_stop, mut shutdown) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            enqueue_reference_disconnect(
+                &tx,
+                FeedEvent::Disconnect {
+                    source: FeedSource::Binance,
+                    reason: "fixture".into(),
+                },
+                Duration::from_secs(1),
+                &mut shutdown,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            FeedEvent::Reference {
+                exchange_ms: 10,
+                ..
+            }
+        ));
+        assert!(task.await.unwrap().unwrap());
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            FeedEvent::Disconnect {
+                source: FeedSource::Binance,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reference_disconnect_has_a_finite_deadline_and_shutdown_priority() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(reference(10, 20)).await.unwrap();
+        let (stop, mut shutdown) = watch::channel(false);
+        let event = || FeedEvent::Disconnect {
+            source: FeedSource::Binance,
+            reason: "fixture".into(),
+        };
+        assert_eq!(
+            enqueue_reference_disconnect(&tx, event(), Duration::from_secs(1), &mut shutdown)
+                .await
+                .unwrap_err(),
+            "feed queue overflow"
+        );
+        stop.send_replace(true);
+        assert!(
+            !enqueue_reference_disconnect(&tx, event(), Duration::from_secs(1), &mut shutdown)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_binance_burst_survives_full_execution_queue_and_delivers_latest_price() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            for time in 1..=4096 {
+                let trade = json!({"e":"trade","s":"BTCUSDT","T":time,"E":time,"t":time,"m":false,"q":"0.01","p":"80000"});
+                socket
+                    .send(Message::Text(trade.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Ping(value) => {
+                        if socket.send(Message::Pong(value)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(FeedEvent::Disconnect {
+            source: FeedSource::Clob,
+            reason: "held execution event".into(),
+        })
+        .await
+        .unwrap();
+        let (fault, observed_fault) = watch::channel(None);
+        let (stop, shutdown) = watch::channel(false);
+        let diagnostics = Arc::new(FeedDiagnostics::default());
+        let observed = diagnostics.clone();
+        let client = tokio::spawn(run_feed(
+            Endpoint {
+                source: FeedSource::Binance,
+                url,
+                settings: Settings {
+                    receive: Duration::from_secs(10),
+                    ..fast_settings()
+                },
+                tick_refresh: TickRefresh::Skip,
+                diagnostics: Some(diagnostics),
+            },
+            market(),
+            Instant::now(),
+            tx,
+            fault,
+            shutdown,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let sample = observed.snapshot().binance;
+                if sample.reference_received == 4096 && sample.reference_queue_full > 0 {
+                    break;
+                }
+                assert!(!client.is_finished());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observed_fault.borrow().is_none());
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            FeedEvent::Disconnect {
+                source: FeedSource::Clob,
+                ..
+            }
+        ));
+        let latest = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            latest,
+            FeedEvent::Reference {
+                exchange_ms: 4096,
+                price_micro: 80_000_000_000,
+                ..
+            }
+        ));
+        let sample = observed.snapshot().binance;
+        assert_eq!(sample.reference_received, 4096);
+        assert_eq!(sample.reference_coalesced, 4095);
+        assert_eq!(sample.reference_delivered, 1);
+        assert_eq!(sample.reference_pending, 0);
+        assert_eq!(sample.transport_disconnects, 0);
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(observed_fault.borrow().is_none());
     }
 
     #[test]

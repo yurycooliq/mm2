@@ -32,6 +32,24 @@ python -B tools/latency/clob-latency-probe.py --help
 
 Use identical token subscriptions and Binance symbols concurrently on candidate hosts. Record event hashes, dropped counts, reconnects and clock offset/error bounds. The comparator refuses numeric cross-host arrival differences without those bounds. Neither a cold HTTP request nor a public WebSocket proves authenticated post/cancel latency or account-specific capacity. Keep TLS verification enabled.
 
+The engine's Binance BTCUSDT trade stream supplies a latest spot-price diagnostic,
+not an execution tape or the governing TWAP60. It validates each message and keeps
+one pending reference per socket, publishing at a 50 ms interval without catch-up
+bursts. A full actor queue retains that slot until another attempt; newer prices
+replace the pending price. Original exchange and monotonic receive timestamps
+remain intact, so queue delay cannot make an old price fresh. CLOB books, trades
+and tick updates retain their ordered, whole-frame admission and overflow faults.
+
+`feed_diagnostics.binance` exposes per-boot `reference_received`,
+`reference_coalesced`, `reference_delivered`, `reference_queue_full`,
+`reference_discarded`, `reference_pending` and `reference_publish_interval_ms`.
+Queue-full counts measure publication attempts, not missing trades. These
+independently sampled counters are diagnostics, not financial reconciliation.
+Ending a socket discards its pending reference; a recoverable Binance Disconnect
+waits for queue capacity only until the existing send deadline, preserving the
+order of already delivered prices. Closed consumers, invalid input and expired
+Disconnect admission remain fatal.
+
 After building the engine image, run `python -B scripts/smoke_public.py --seconds 35` for a bounded, credential-free public readiness check. It creates and removes only its labelled disposable container and state volume. On October 1, 2026 the current local Docker host passed API readiness but public IP eligibility metadata transport failed; shadow readiness was never reached. This result does not identify the transport failure's cause or measure latency on a future server.
 
 The core benchmark and `scripts/scenarios.py` provide offline timing and synthetic sensitivity. Scenario delays are assumptions, not measurements. The latter always reports scoring/live eligibility false and never computes a financial return.
