@@ -262,6 +262,53 @@ async fn watch_window(
     }
 }
 
+async fn refresh_fees(
+    client: reqwest::Client,
+    market: Market,
+    handle: Handle,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut timer = tokio::time::interval(Duration::from_millis(mm2_live::fees::FEE_REFRESH_MS));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_shutdown(&mut shutdown) => return Ok(()),
+            _ = timer.tick() => {}
+        }
+        let fetch = async {
+            let version = discovery::get(&client, "https://clob.polymarket.com/version").await?;
+            if version.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
+                return Err("public fee proof requires pinned CLOB V2".into());
+            }
+            let raw = discovery::get(
+                &client,
+                &format!(
+                    "https://clob.polymarket.com/clob-markets/{}",
+                    market.condition_id
+                ),
+            )
+            .await?;
+            mm2_live::fees::parse_policy(
+                &raw,
+                &market.condition_id,
+                &market.up_token,
+                &market.down_token,
+                runtime::wall_ms(),
+            )
+        };
+        let result = tokio::select! {
+            biased;
+            _ = wait_shutdown(&mut shutdown) => return Ok(()),
+            result = fetch => result
+        };
+        if result.is_err() {
+            tracing::warn!("public fee evidence unavailable; new quotes blocked");
+        }
+        handle.fee_policy(result.ok());
+    }
+}
+
 async fn run_public(
     start: Instant,
     handle: &Handle,
@@ -339,15 +386,25 @@ async fn run_public(
         let initial_epoch = reset_epoch(&state.borrow_and_update())?;
         // The actor has acknowledged the new identity before any new-market frame is emitted.
         let (feed_shutdown, feed_shutdown_rx) = watch::channel(false);
+        handle.fee_policy(None);
+        let fee_task = refresh_fees(
+            client.clone(),
+            market.clone(),
+            handle.clone(),
+            feed_shutdown_rx.clone(),
+        );
+        let feed_task = feeds::run_public_with_diagnostics(
+            market.clone(),
+            start,
+            tx.clone(),
+            fault_tx.clone(),
+            feed_shutdown_rx,
+            Some(handle.feed_diagnostics.clone()),
+        );
         let mut owned = OwnedFeeds {
-            task: Some(tokio::spawn(feeds::run_public_with_diagnostics(
-                market.clone(),
-                start,
-                tx.clone(),
-                fault_tx.clone(),
-                feed_shutdown_rx,
-                Some(handle.feed_diagnostics.clone()),
-            ))),
+            task: Some(tokio::spawn(async move {
+                tokio::select! { result = feed_task => result, result = fee_task => result }
+            })),
             shutdown: feed_shutdown,
         };
         let _ = handle.source_status(

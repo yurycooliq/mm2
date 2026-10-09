@@ -1,5 +1,38 @@
 # Validation evidence
 
+## Automated maker fee evidence and live reconciliation: October 9, 2026
+
+Public quote readiness now requires strict current-market fee metadata, refreshed off
+the execution path every 30 seconds with a 90-second maximum age. Missing fields,
+wrong identities, unsupported protocol or nonzero maker schedules block new work.
+Accepted paper policies are durable replay inputs; legacy amounts remain unchanged.
+The authenticated adapter freezes its fee policy before submission and compares it
+with canonical finalized V2 `OrderFilled.fee` evidence. Unknown coverage stays null;
+pending new fills block quoting, and actual fee/role discrepancies retain the proof
+before faulting. Collections and receipt-query fanout remain bounded. See
+[the complete contract and limitations](FEE_RECONCILIATION.md).
+
+Local formatting, all-targets Clippy with `-D warnings` and **278 Rust workspace
+tests** passed, including **74 engine library tests**. Seven new regressions cover
+explicit missing/invalid fee fields, exact identity/expiry, canonical finality/reorgs,
+actual fee matching/idempotency/mismatch, malformed fill receipts, legacy financial
+replay and the public actor's fee gate. Existing integration fixtures now supply
+explicit synthetic fee evidence and continue testing Reset/source-generation fences,
+paper/live isolation and tick cancellation/draining.
+
+Local Python suites collected **499 tests**, with **25 platform/optional dependency
+skips** and no failures (console 118, data 21, latency 34, ops 148, research 178).
+All **55 Node tests** and the dashboard type check/production build passed. Final
+commit CI, exact-image integration and selected-host recovery/run receipts are stored
+with the deployment report; these local results alone do not establish those gates.
+
+No authenticated funded execution was performed. Fee comparison tests use synthetic
+receipt fixtures; the eligible account's real behavior remains an external gate.
+Zero verified maker exchange fees do not establish zero gas, rebates, infrastructure
+cost, executable open-position valuation, net profit, real PnL, ROI or a completed
+economic holdout. Older binaries cannot replay new fee operations; rollback must
+preserve the newer journal and use an isolated pre-deployment copy for investigation.
+
 ## CLOB backpressure and durable trade batching: October 9, 2026
 
 The R2 public simulation on `b6a9646` stopped at 11:51:44 UTC with fatal

@@ -15,6 +15,8 @@ pub struct MultiMarketPaper {
     portfolio: mm2_portfolio::Portfolio,
     current_market: Option<String>,
     public_trades: VecDeque<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fee_policy: Option<mm2_live::fees::FeePolicy>,
 }
 impl Deref for MultiMarketPaper {
     type Target = PaperSession;
@@ -41,6 +43,14 @@ impl MultiMarketPaper {
         self.portfolio.halt_reason()
     }
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(policy) = &self.fee_policy {
+            policy.validate()?;
+            if self.current_market.as_deref() != Some(policy.condition_id.as_str())
+                || !policy.maker_zero()
+            {
+                return Err("durable paper fee policy disagrees with market".into());
+            }
+        }
         self.session.validate()?;
         self.portfolio.validate()?;
         if let Some(id) = &self.current_market {
@@ -142,6 +152,7 @@ impl MultiMarketPaper {
             end_ms: end_ms.unwrap_or(86_400_000),
         })?;
         self.current_market = Some(id.into());
+        self.fee_policy = None;
         self.public_trades.clear();
         Ok(())
     }
@@ -150,6 +161,9 @@ impl MultiMarketPaper {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    FeeRules {
+        policy: mm2_live::fees::FeePolicy,
+    },
     Market {
         condition_id: String,
         #[serde(default)]
@@ -247,11 +261,22 @@ pub fn new(limits: &Limits) -> Result<MultiMarketPaper, String> {
         portfolio,
         current_market: None,
         public_trades: VecDeque::new(),
+        fee_policy: None,
     })
 }
 
 pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<(), String> {
     let result = match operation {
+        Operation::FeeRules { policy } => {
+            policy.validate()?;
+            if session.current_market.as_deref() != Some(&policy.condition_id)
+                || !policy.maker_zero()
+            {
+                return Err("simulation fee identity or maker schedule mismatch".into());
+            }
+            session.fee_policy = Some(policy.clone());
+            Ok(())
+        }
         Operation::Market {
             condition_id,
             start_ms,
@@ -498,6 +523,51 @@ mod tests {
     }
     fn id(c: char) -> String {
         format!("0x{}", c.to_string().repeat(64))
+    }
+    #[test]
+    fn fee_evidence_replays_without_rewriting_legacy_finances() {
+        let mut session = new(&limits()).unwrap();
+        apply(
+            &mut session,
+            &Operation::Market {
+                condition_id: id('a'),
+                start_ms: Some(0),
+                end_ms: Some(300_000),
+            },
+        )
+        .unwrap();
+        let old = serde_json::to_value(&session).unwrap();
+        assert!(old.get("fee_policy").is_none());
+        let finance = serde_json::to_value(session.portfolio_snapshot()).unwrap();
+        let policy = mm2_live::fees::parse_policy(
+            &serde_json::json!({"c":id('a'),
+            "t":[{"t":"1","o":"Up"},{"t":"2","o":"Down"}],"fd":{"r":0.07,"e":1,"to":true}}),
+            &id('a'),
+            "1",
+            "2",
+            1000,
+        )
+        .unwrap();
+        let operation = Operation::FeeRules { policy };
+        apply(&mut session, &operation).unwrap();
+        assert_eq!(
+            finance,
+            serde_json::to_value(session.portfolio_snapshot()).unwrap()
+        );
+        let mut replay: MultiMarketPaper = serde_json::from_value(old).unwrap();
+        let persisted = values(&[operation]).unwrap().remove(0);
+        apply(&mut replay, &serde_json::from_value(persisted).unwrap()).unwrap();
+        assert!(same_state_without_clock(&session, &replay).unwrap());
+        apply(
+            &mut session,
+            &Operation::Market {
+                condition_id: id('b'),
+                start_ms: Some(300_000),
+                end_ms: Some(600_000),
+            },
+        )
+        .unwrap();
+        assert!(session.fee_policy.is_none());
     }
     fn executed_window() -> Vec<Operation> {
         vec![

@@ -45,6 +45,7 @@ LEDGER_FIELDS = {
     "daily_loss_micros", "loss_day", "foreign_order_ids", "fault", "owned_positions",
     "closeout_markets", "chain_pending", "chain_receipts", "chain_expiries",
     "returned_collateral_micros", "realized_cost_pico", "session_gas_cost_wei",
+    "fee_policies", "execution_fees",
 }
 OP_FIELDS = {
     "market": {"condition_id", "start_ms", "end_ms"},
@@ -53,6 +54,7 @@ OP_FIELDS = {
     "trade": {"now_ms", "outcome", "worst_price_micros", "quantity_micros"},
     "observed_trade": {"now_ms", "outcome", "price_micros", "quantity_micros", "fingerprint"},
     "venue_rules": {"now_ms", "tick_micros", "min_order_micros"},
+    "fee_rules": {"policy"},
     "demo_resolution": {"condition_id", "winning_outcome", "at_ms"},
     "limits": {"now_ms", "limits"},
 }
@@ -130,7 +132,7 @@ def _safe_scalar(key, value):
         return identity(value)
     if key in {"token_id", "cost_pico"}:
         return uint_string(value)
-    if key in {"redeemable", "mergeable", "neg_risk"}:
+    if key in {"redeemable", "mergeable", "neg_risk", "taker_only"}:
         if type(value) is not bool:
             raise ExportError("invalid boolean")
         return value
@@ -160,7 +162,23 @@ def _operation(value):
     for key, item in value.items():
         if key == "kind":
             continue
-        if key == "limits":
+        if key == "policy":
+            policy_fields = {"condition_id", "up_token", "down_token", "rate", "exponent", "taker_only", "observed_at_ms", "response_sha256"}
+            policy = fields(item, policy_fields, policy_fields)
+            rate = policy["rate"]
+            from decimal import Decimal, InvalidOperation
+            try:
+                if not isinstance(rate, str) or len(rate) > 32 or not Decimal(rate).is_finite() or not 0 <= Decimal(rate) <= 1:
+                    raise ExportError("invalid fee rate")
+            except InvalidOperation as exc:
+                raise ExportError("invalid fee rate") from exc
+            result[key] = {"condition_id": identity(policy["condition_id"]),
+                "up_token": uint_string(policy["up_token"]), "down_token": uint_string(policy["down_token"]),
+                "rate": rate, "exponent": integer(policy["exponent"], 8),
+                "taker_only": _safe_scalar("taker_only", policy["taker_only"]),
+                "observed_at_ms": integer(policy["observed_at_ms"]),
+                "response_sha256": digest(policy["response_sha256"])}
+        elif key == "limits":
             result[key] = _limits(item)
         elif key == "quotes":
             if not isinstance(item, list) or len(item) > 16:
@@ -205,7 +223,7 @@ def _engine_events(entry):
         raise ExportError("operation projection exceeds bound")
     for op in operations:
         safe = _operation(op)
-        result.append(("paper_replay_input", safe, safe.get("now_ms", safe.get("at_ms"))))
+        result.append(("paper_replay_input", safe, safe.get("now_ms", safe.get("at_ms", safe.get("policy", {}).get("observed_at_ms")))))
     return result
 
 
@@ -242,6 +260,26 @@ def _live_projection(record):
     position_fields = {"condition_id", "token_id", "outcome", "quantity_micros", "cost_pico", "redeemable", "mergeable"}
     for position in positions.values():
         safe["positions"].append({k: _safe_scalar(k, v) for k, v in fields(position, position_fields, position_fields).items()})
+    if "fee_policies" in ledger:
+        policies = ledger["fee_policies"]
+        if not isinstance(policies, dict) or len(policies) > 256:
+            raise ExportError("fee policy projection exceeds bound")
+        safe["fee_policies"] = [{"order_id": identity(key),
+            "policy": _operation({"kind": "fee_rules", "policy": policy})["policy"]}
+            for key, policy in policies.items()]
+    if "execution_fees" in ledger:
+        proofs = ledger["execution_fees"]
+        if not isinstance(proofs, dict) or len(proofs) > 1024:
+            raise ExportError("fee proof projection exceeds bound")
+        proof_fields = {"order_id", "transaction_hash", "log_index", "block_number", "block_hash",
+            "finalized_block_number", "quantity_micros", "actual_fee_micros", "taker"}
+        safe["execution_fees"] = []
+        for proof in proofs.values():
+            fields(proof, proof_fields, proof_fields)
+            safe_proof = {key: identity(value) if key in {"order_id", "transaction_hash", "block_hash"}
+                else _safe_scalar("taker_only" if key == "taker" else key, value)
+                for key, value in proof.items()}
+            safe["execution_fees"].append(safe_proof)
     # Private subtrees, free-form fault strings and signed wire material are never traversed/copied.
     return {"reason": reason, "state": safe, "reserved_upper_bound_pico": str(reserve),
             "classifications": {"state": "derived", "reserved_upper_bound_pico": "bound",

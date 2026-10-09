@@ -59,8 +59,16 @@ pub struct Handle {
     paper: Option<Box<Handle>>,
     paper_fault: Option<watch::Sender<Option<String>>>,
     pub(crate) feed_diagnostics: Arc<crate::feeds::FeedDiagnostics>,
+    fee_policy: watch::Sender<Option<mm2_live::fees::FeePolicy>>,
 }
 impl Handle {
+    pub fn fee_policy(&self, policy: Option<mm2_live::fees::FeePolicy>) {
+        let policy = policy.filter(|p| p.validate().is_ok() && p.maker_zero());
+        self.fee_policy.send_replace(policy.clone());
+        if let Some(paper) = &self.paper {
+            paper.fee_policy(policy);
+        }
+    }
     pub fn source_status(
         &self,
         phase: &'static str,
@@ -92,6 +100,7 @@ impl Handle {
             })?
     }
     pub async fn select_market(&self, market: Market) -> Result<(), String> {
+        self.fee_policy(None);
         if let Some(paper) = &self.paper {
             let (reply, _) = oneshot::channel();
             if paper
@@ -146,6 +155,7 @@ pub struct Actor {
     reset_epoch: u64,
     observation_barrier: Option<u64>,
     source_status: Value,
+    fee_policy: watch::Receiver<Option<mm2_live::fees::FeePolicy>>,
     awaiting_source_refresh: bool,
     simulation: Option<simulation::MultiMarketPaper>,
     simulation_origin_ms: u64,
@@ -188,6 +198,7 @@ struct Publication {
     version: u64,
     reset_epoch: u64,
     source_status: Value,
+    fee_check: Value,
     awaiting_source_refresh: bool,
     fatal: Option<String>,
     committing: bool,
@@ -301,6 +312,7 @@ pub fn prepare(
     journal.release_replay_buffer();
     let (tx, commands) = mpsc::channel(config.command_capacity);
     let (state, state_rx) = watch::channel(Arc::new(json!({"api_ready":false})));
+    let (fee_tx, fee_rx) = watch::channel(None);
     let feed_diagnostics = Arc::new(crate::feeds::FeedDiagnostics::default());
     let mut actor = Actor {
         core,
@@ -332,6 +344,7 @@ pub fn prepare(
         reset_epoch: 0,
         observation_barrier: None,
         source_status: json!({"phase":"starting","at_ms":wall_ms()}),
+        fee_policy: fee_rx,
         awaiting_source_refresh: false,
         simulation,
         simulation_origin_ms,
@@ -369,6 +382,7 @@ pub fn prepare(
             paper: None,
             paper_fault: None,
             feed_diagnostics,
+            fee_policy: fee_tx,
         },
         actor,
     ))
@@ -392,6 +406,35 @@ fn apply_command(core: &mut Core, limits: &mut Limits, command: &Command) -> Res
 }
 
 impl Actor {
+    fn fee_ready(&self, now: u64) -> bool {
+        self.source != "public"
+            || self.core.snapshot().market.as_ref().is_some_and(|market| {
+                self.fee_policy.borrow().as_ref().is_some_and(|policy| {
+                    policy.permits(
+                        &market.condition_id,
+                        &market.up_token,
+                        &market.down_token,
+                        now,
+                    )
+                })
+            })
+    }
+    fn fee_check(&self, now: u64) -> Value {
+        let ready = self.fee_ready(now);
+        let mut result = self.fee_policy.borrow().as_ref().map_or_else(||json!({
+            "policy":null,"net_pnl":null,"roi":null,"actual_live_fee":null,
+            "gas_usd":null,"rebates":null,"infrastructure_usd":null,"open_position_value":null
+        }),|p|p.status(now));
+        result["ready"] = json!(ready);
+        result["status"] = json!(if self.source != "public" {
+            "SYNTHETIC_DEMO"
+        } else if ready {
+            "VERIFIED_MAKER_ZERO"
+        } else {
+            "BLOCKED_MISSING_STALE_OR_UNSUPPORTED"
+        });
+        result
+    }
     fn mirror_paper(&mut self, command: Command) {
         if let Some(paper) = &self.paper
             && paper.tx.try_send(Operation::Mirror(command)).is_err()
@@ -511,6 +554,10 @@ impl Actor {
                     self.desired_quotes = self.live_quotes.clone();
                 }
             }
+        }
+        if !self.fee_ready(now) {
+            self.desired_quotes.clear();
+            self.live_quotes.clear();
         }
         self.last_decision.intents = self
             .desired_quotes
@@ -642,6 +689,7 @@ impl Actor {
             version: self.version,
             reset_epoch: self.reset_epoch,
             source_status: self.source_status.clone(),
+            fee_check: self.fee_check(wall_ms()),
             awaiting_source_refresh: self.awaiting_source_refresh,
             fatal: self.fatal.clone(),
             committing: self.committing,
@@ -807,6 +855,28 @@ impl Actor {
                     return;
                 }
                 operations.push(operation);
+            }
+        }
+        if active && !settling && self.source == "public" {
+            let policy = self.fee_policy.borrow().clone();
+            if let Some(policy) = policy.filter(|_| self.fee_ready(wall_ms())) {
+                if candidate.fee_policy.as_ref() != Some(&policy) {
+                    let operation = SimulationOperation::FeeRules { policy };
+                    if let Err(error) = simulation::apply(&mut candidate, &operation) {
+                        self.latch(format!("simulation fee evidence invariant: {error}"));
+                        return;
+                    }
+                    operations.push(operation);
+                }
+            } else {
+                // Unknown rules cancel possible fills before any new post.
+                let operation = SimulationOperation::CancelAll { now_ms: now };
+                if let Err(error) = simulation::apply(&mut candidate, &operation) {
+                    self.latch(format!("simulation fee cancel invariant: {error}"));
+                    return;
+                }
+                operations.push(operation);
+                active = false;
             }
         }
         if active && !settling {
@@ -1449,6 +1519,7 @@ impl Publication {
             "decision_ns_p50":percentile(50),"decision_ns_p99":if ordered.len()>=1000 {percentile(99)} else {None},
             "measurement":"core and strategy evaluation; excludes transport, parsing, queue wait, execution durability and snapshot publication"});
         let diagnostics = json!({
+            "fee_check":self.fee_check,
             "feed_diagnostics":self.feed_diagnostics,
             "feed_diagnostics_policy":"bounded atomic counters sampled independently; local boot scope, not a durable event stream",
             "fault_class":self.fatal.as_deref().map(runtime_failure_class),
@@ -1609,6 +1680,39 @@ mod tests {
         actor.bind_simulation_market(&condition).await.unwrap();
         actor.condition = Some(condition);
         actor
+    }
+    #[tokio::test]
+    async fn public_fee_gate_requires_current_market_and_fresh_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut actor = batch_actor(&batch_config(directory.path())).await;
+        let (fees, rx) = watch::channel(None);
+        actor.fee_policy = rx;
+        let now = wall_ms();
+        assert!(!actor.fee_ready(now));
+        let market = actor.core.snapshot().market.unwrap();
+        let policy = mm2_live::fees::parse_policy(
+            &json!({"c":market.condition_id,
+            "t":[{"t":"1","o":"Up"},{"t":"2","o":"Down"}],"fd":{"r":0.07,"e":1,"to":true}}),
+            &market.condition_id,
+            "1",
+            "2",
+            now,
+        )
+        .unwrap();
+        fees.send_replace(Some(policy.clone()));
+        assert!(actor.fee_ready(now));
+        assert!(!actor.fee_ready(now + mm2_live::fees::FEE_TTL_MS));
+        let mut foreign = policy;
+        foreign.condition_id = format!("0x{}", "b".repeat(64));
+        fees.send_replace(Some(foreign));
+        assert!(!actor.fee_ready(now));
+        actor.evaluate();
+        assert!(actor.desired_quotes.is_empty());
+        fees.send_replace(None);
+        assert_eq!(
+            actor.fee_check(now)["status"],
+            "BLOCKED_MISSING_STALE_OR_UNSUPPORTED"
+        );
     }
 
     fn trades(actor: &Actor, count: usize) -> Vec<FeedEvent> {

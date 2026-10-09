@@ -325,6 +325,7 @@ fn snapshot(
     } = health;
     let now = now_ms();
     let healthy = reconciled
+        && !ledger.fees_pending()
         && connected
         && account.is_some_and(|t| now.saturating_sub(t) < 5000)
         && heartbeat.is_some_and(|t| {
@@ -351,6 +352,7 @@ fn snapshot(
     let reserved = ledger.reserved_pico();
     let available = available_collateral(ledger);
     LiveSnapshot {
+        execution_fee_reconciliation: ledger.fee_summary(),
         simulated: false,
         phase: ledger.phase,
         can_resume: resume,
@@ -492,6 +494,7 @@ impl Actor {
     }
     fn healthy(&self) -> bool {
         self.account_reconciled
+            && !self.ledger.fees_pending()
             && self.connected
             && self
                 .last_account
@@ -787,13 +790,16 @@ impl Actor {
                     let keys: Vec<_> = next
                         .orders
                         .values()
-                        .filter(|o| o.phase == OrderPhase::Closed)
+                        .filter(|o| {
+                            o.phase == OrderPhase::Closed && o.cumulative_filled_micros == 0
+                        })
                         .take(128)
                         .map(|o| o.order_id.clone())
                         .collect();
                     for key in keys {
                         next.orders.remove(&key);
                         next.signed_intents.remove(&key);
+                        next.fee_policies.remove(&key);
                     }
                 }
                 if next.orders.len() >= 256 || next.orders.contains_key(&prepared.order_id) {
@@ -826,6 +832,9 @@ impl Actor {
                 }
                 next.signed_intents
                     .insert(id.clone(), prepared.signed_wire.clone());
+                if let Some(policy) = &prepared.fee_policy {
+                    next.fee_policies.insert(id.clone(), policy.clone());
+                }
                 next.orders.insert(
                     id.clone(),
                     LiveOrder {
@@ -919,6 +928,12 @@ impl Actor {
                             if next.orders.contains_key(&observation.order_id)
                                 && let Err(error) = next.observe(&observation)
                             {
+                                self.fault(error).await;
+                                return;
+                            }
+                        }
+                        for proof in account.execution_fees {
+                            if let Err(error) = next.observe_fee(proof) {
                                 self.fault(error).await;
                                 return;
                             }

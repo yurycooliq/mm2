@@ -39,6 +39,7 @@ impl Venue for OfflineVenue {
             order_id: format!("0x{id:064x}"),
             quote,
             signed_wire: serde_json::json!({"offline":true}),
+            fee_policy: None,
         })
     }
     async fn post(&self, order: PreparedOrder) -> Result<PostResult, String> {
@@ -86,6 +87,7 @@ impl Venue for OfflineVenue {
                 mergeable: false,
             }],
             foreign_order_ids: vec![],
+            execution_fees: vec![],
         })
     }
     async fn heartbeat(&self) -> Result<(), String> {
@@ -266,6 +268,17 @@ async fn begin_feeds(service: &mut Service) {
         tick_micro: 10_000,
     };
     service.handle.select_market(market).await.unwrap();
+    service.handle.fee_policy(Some(
+        mm2_live::fees::parse_policy(
+            &serde_json::json!({"c":condition(),
+        "t":[{"t":"1","o":"Up"},{"t":"2","o":"Down"}],"fd":{"r":0.07,"e":1,"to":true}}),
+            &condition(),
+            "1",
+            "2",
+            now,
+        )
+        .unwrap(),
+    ));
     let feeds = service.feeds.clone();
     let paper_feeds = service.paper_feeds.clone();
     let start = service.start;

@@ -7,6 +7,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .user_agent("mm2-public-metadata/1.0")
         .timeout(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -15,7 +16,7 @@ pub fn client() -> Result<reqwest::Client, String> {
         .map_err(|_| "cannot build public metadata client".into())
 }
 
-async fn get(client: &reqwest::Client, url: &str) -> Result<Value, String> {
+pub(crate) async fn get(client: &reqwest::Client, url: &str) -> Result<Value, String> {
     let mut response = client
         .get(url)
         .send()
