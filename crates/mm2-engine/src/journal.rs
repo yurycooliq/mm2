@@ -264,6 +264,11 @@ fn command_hash(command: &Command) -> Result<String, String> {
 }
 
 impl Journal {
+    #[cfg(test)]
+    pub(crate) fn inject_sync_failure(&mut self) {
+        self.fail_sync_once = true;
+    }
+
     /// Compatibility entry point: the old byte setting is now the active segment size.
     /// The retained budget is explicit in metrics and remains finite (at most 1 GiB).
     pub fn open(directory: &Path, max_bytes: u64, limits: Limits) -> Result<Self, String> {

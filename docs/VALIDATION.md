@@ -1,5 +1,41 @@
 # Validation evidence
 
+## CLOB backpressure and durable trade batching: October 9, 2026
+
+The R2 public simulation on `b6a9646` stopped at 11:51:44 UTC with fatal
+`feed_queue_overflow source=clob`. Code review reproduced immediate failure on
+transient Full and valid native frames exceeding the queue's capacity. It also
+found per-trade full-state comparison/sync overhead and a relay that could hide
+shutdown while blocked. Exact frame size and disk latency at the AWS failure
+remain unknown. See [the detailed queue review](QUEUE_BACKPRESSURE_REVIEW.md).
+
+Fully validated CLOB frames now enter existing bounded queues in ordered chunks
+of at most 16, with one finite admission deadline, explicit pending/discarded
+suffix accounting and an independent fatal timeout signal. Reference coalescing
+is confined to Binance. Emulator actors drain up to 16 already queued inputs,
+validate ordered trade operations and sync one transaction before publishing
+candidate finances; small segments reduce the batch size. Funded/shadow actors
+retain one-event scheduling. The relay observes shutdown/fault during admission.
+
+The local workspace check passed **271 Rust tests**, including **72 engine
+library tests**, plus formatting and all-targets Clippy with `-D warnings`.
+Twelve new regressions cover 4096 ordered events through capacity 16, a real
+1024-event CLOB WebSocket frame, original clocks, permanent stalls, cancelled
+admission, relay fault/shutdown, isolated paper overflow, exact financial replay,
+duplicates, stale/future clocks, quota rejection, failed sync/poisoning and 1 KiB
+segments. The production-image build repeats the suite for its actual inputs.
+
+Local Python suites collected **498 tests** with **25 platform/optional dependency
+skips** and no failures (console 118, data 21, latency 34, ops 148, research 177).
+All **55 Node tests** passed (strategy parity 6, reference 19, dashboard 30), and
+dashboard type checking/production build passed. Dependency-complete Linux CI
+and exact-image integration are recorded with the final release evidence.
+
+This change preserves queue capacities, capital, owner receipts, strategy,
+journal/portfolio quotas and funded authorization. Source-boundary diagnostics
+are per-boot counters, not durable financial reconciliation. No new forward run,
+24-hour host acceptance, real PnL or economic holdout is established here.
+
 ## Binance reference burst isolation: October 9, 2026
 
 The selected AWS simulation exited at 10:43:07 UTC with a fatal Binance

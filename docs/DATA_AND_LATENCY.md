@@ -38,7 +38,33 @@ one pending reference per socket, publishing at a 50 ms interval without catch-u
 bursts. A full actor queue retains that slot until another attempt; newer prices
 replace the pending price. Original exchange and monotonic receive timestamps
 remain intact, so queue delay cannot make an old price fresh. CLOB books, trades
-and tick updates retain their ordered, whole-frame admission and overflow faults.
+and tick updates are never coalesced. The complete native frame is validated
+before admission, then streamed in FIFO chunks of at most 16 through the existing
+bounded queue. A valid frame may be larger than that queue. Admission waits for
+capacity until one absolute send deadline (5 seconds in the public profile),
+with shutdown priority. A permanent stall faults with `feed_backpressure_timeout`;
+a closed consumer remains a distinct fatal error. A timed-out frame can have an
+admitted prefix: its pending suffix is counted as discarded and the independent
+fault channel stops execution. Validation is atomic; queue admission is not.
+
+Each source exposes per-boot `ingress_frames`, `ingress_events`,
+`ingress_enqueued`, `ingress_waits`, `ingress_wait_ns`, `ingress_timeouts`,
+`ingress_pending_events`, `ingress_discarded_events`, `ingress_max_frame_events`
+and `ingress_queue_high_watermark`. `ingress_frames` includes recovery/Disconnect
+admission batches, rather than being a count of native socket frames alone.
+With no admission in progress, admitted plus discarded events account for the
+events offered to this boundary. Samples during admission are not atomic across
+counters, and admitted events are not proof of downstream processing or fills.
+
+The primary relay also has finite admission and observes fault/shutdown while
+blocked. Emulator intake groups up to 16 already queued inputs into one turn
+without waiting to fill a batch. New trade operations retain order in one journal
+transaction; one candidate copy and one sync precede its publication. Small
+journal segments reduce this limit. `metrics.execution_feed_batches`,
+`execution_trade_commits` and `execution_feed_batch_limit` expose this work.
+Stale/future-clock checks, receipt identity, finite capital and journal quotas
+still apply. See [queue review](QUEUE_BACKPRESSURE_REVIEW.md) for other queue
+policies and evidence limits.
 
 `feed_diagnostics.binance` exposes per-boot `reference_received`,
 `reference_coalesced`, `reference_delivered`, `reference_queue_full`,

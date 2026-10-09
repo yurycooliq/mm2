@@ -158,11 +158,16 @@ async fn run_demo(
             }
             now = runtime::wall_ms();
         }
-        feeds::enqueue_frame(
+        if !feeds::enqueue_frame(
             tx,
             demo_frame(&market, now, runtime::mono_ms(start)),
             fault_tx,
-        )?;
+            shutdown,
+        )
+        .await?
+        {
+            return Ok(());
+        }
     }
 }
 

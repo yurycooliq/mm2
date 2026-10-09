@@ -122,27 +122,13 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|_| "cannot bind HTTP listener")?;
     let mut actor_task = tokio::spawn(actor.run());
-    let mut relay_shutdown = shutdown_rx.clone();
-    let mut relay_task = tokio::spawn(async move {
-        let mut input = source_feed_rx;
-        loop {
-            tokio::select! {
-                biased;
-                _=relay_shutdown.changed()=>break,
-                event=input.recv()=>match event {
-                    Some(event)=>{
-                        // Only the primary execution lane can backpressure the source.
-                        if let Some((sender,fault))=&paper_feed
-                            && sender.try_send(event.clone()).is_err() {
-                                fault.send_replace(Some("parallel simulation lost a feed event; rebuild its source state".into()));
-                        }
-                        if feed_tx.send(event).await.is_err() { break; }
-                    },
-                    None=>break,
-                }
-            }
-        }
-    });
+    let mut relay_task = tokio::spawn(mm2_engine::feeds::relay(
+        source_feed_rx,
+        feed_tx,
+        paper_feed,
+        shutdown_rx.clone(),
+        fault_tx.clone(),
+    ));
     let source_handle = handle.clone();
     let source_fault = fault_tx.clone();
     let source_shutdown = shutdown_rx.clone();
@@ -175,11 +161,13 @@ async fn run() -> Result<(), String> {
     let mut actor_done = false;
     let mut source_done = false;
     let mut server_done = false;
+    let mut relay_done = false;
     let result: Result<(), String> = tokio::select! {
         _ = signal() => Ok(()),
         _ = &mut actor_task => { actor_done=true; Err("core actor stopped unexpectedly".into()) },
         result = &mut source_task => { source_done=true; match result { Ok(Ok(())) => Err("source owner stopped unexpectedly".into()),Ok(Err(reason)) => Err(reason.chars().take(256).collect()),Err(_) => Err("source owner task failed".into()) } },
         _ = &mut server_task => { server_done=true; Err("HTTP server stopped unexpectedly".into()) },
+        _ = &mut relay_task => { relay_done=true; Err("feed relay stopped unexpectedly".into()) },
     };
     shutdown_tx.send_replace(true);
     // The outer deadline also bounds a stalled disk worker; process exit releases its OS fence.
@@ -193,7 +181,9 @@ async fn run() -> Result<(), String> {
         if !server_done {
             let _ = (&mut server_task).await;
         }
-        let _ = (&mut relay_task).await;
+        if !relay_done {
+            let _ = (&mut relay_task).await;
+        }
         if let Some(paper) = &mut paper_task {
             let _ = paper.await;
         }

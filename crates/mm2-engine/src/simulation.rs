@@ -28,6 +28,9 @@ impl DerefMut for MultiMarketPaper {
     }
 }
 impl MultiMarketPaper {
+    pub(crate) fn has_public_trade(&self, fingerprint: &str) -> bool {
+        self.public_trades.iter().any(|prior| prior == fingerprint)
+    }
     pub fn portfolio_snapshot(&self) -> mm2_portfolio::Snapshot {
         self.portfolio.snapshot()
     }
