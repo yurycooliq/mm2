@@ -17,6 +17,12 @@ pub struct MultiMarketPaper {
     public_trades: VecDeque<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fee_policy: Option<mm2_live::fees::FeePolicy>,
+    #[serde(default)]
+    public_resolution_count: u64,
+    #[serde(default)]
+    last_public_resolution_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_public_resolution: Option<crate::paper_resolution::Evidence>,
 }
 impl Deref for MultiMarketPaper {
     type Target = PaperSession;
@@ -30,6 +36,31 @@ impl DerefMut for MultiMarketPaper {
     }
 }
 impl MultiMarketPaper {
+    pub(crate) fn resolution_targets(&self) -> Vec<crate::paper_resolution::Target> {
+        let mut targets: Vec<_> = self
+            .portfolio
+            .snapshot()
+            .positions
+            .into_iter()
+            .filter(|p| {
+                self.current_market.as_deref() != Some(&p.market.id)
+                    && p.resolution.is_none()
+                    && (p.up.quantity_micros > 0 || p.down.quantity_micros > 0)
+            })
+            .map(|p| crate::paper_resolution::Target {
+                condition_id: p.market.id,
+                start_ms: p.market.start_ms,
+                end_ms: p.market.end_ms,
+            })
+            .collect();
+        targets.sort_by_key(|p| p.end_ms);
+        targets
+    }
+    pub(crate) fn resolution_status(&self) -> serde_json::Value {
+        serde_json::json!({"accounting":"synthetic_redemption_from_finalized_public_ctf_outcome",
+            "completed":self.public_resolution_count,"last_evidence":self.last_public_resolution,
+            "real_redemption_receipt":null})
+    }
     pub(crate) fn has_public_trade(&self, fingerprint: &str) -> bool {
         self.public_trades.iter().any(|prior| prior == fingerprint)
     }
@@ -131,7 +162,8 @@ impl MultiMarketPaper {
                             .market(previous)
                             .ok_or("missing retained paper market")?
                             .market
-                            .end_ms,
+                            .end_ms
+                            .max(self.last_public_resolution_at_ms),
                         provenance: mm2_portfolio::Provenance::Synthetic,
                     },
                     true,
@@ -212,6 +244,11 @@ pub enum Operation {
         winning_outcome: String,
         at_ms: u64,
     },
+    /// Public final outcome, synthetic redemption and cash.
+    PublicResolution {
+        evidence: crate::paper_resolution::Evidence,
+        at_ms: u64,
+    },
     Limits {
         now_ms: u64,
         limits: Limits,
@@ -262,6 +299,9 @@ pub fn new(limits: &Limits) -> Result<MultiMarketPaper, String> {
         current_market: None,
         public_trades: VecDeque::new(),
         fee_policy: None,
+        public_resolution_count: 0,
+        last_public_resolution_at_ms: 0,
+        last_public_resolution: None,
     })
 }
 
@@ -409,6 +449,49 @@ pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<()
                     true,
                 )
                 .map(|_| ())
+        }
+        Operation::PublicResolution { evidence, at_ms } => {
+            let winner = evidence.winner()?;
+            let target = &evidence.target;
+            if session.current_market.as_deref() == Some(&target.condition_id) {
+                return Err("cannot resolve the current paper execution market".into());
+            }
+            let market = session
+                .portfolio
+                .market(&target.condition_id)
+                .ok_or("unknown public resolution market")?;
+            if market.market.start_ms != target.start_ms
+                || market.market.end_ms != target.end_ms
+                || *at_ms < evidence.observed_at_ms
+            {
+                return Err("public resolution identity or observation clock mismatch".into());
+            }
+            let receipt_id = format!("paper-public-resolution:{}", target.condition_id);
+            if let Some(previous) = &market.resolution {
+                return if previous.id == receipt_id && previous.winning_outcome == winner {
+                    Ok(())
+                } else {
+                    Err("public resolution conflicts with the retained receipt".into())
+                };
+            }
+            let applied = session.portfolio.redeem(
+                mm2_portfolio::ResolutionReceipt {
+                    id: receipt_id,
+                    market_id: target.condition_id.clone(),
+                    winning_outcome: winner,
+                    fee_pico: 0,
+                    at_ms: *at_ms,
+                    finality_confirmed: true,
+                    provenance: mm2_portfolio::Provenance::Synthetic,
+                },
+                true,
+            )?;
+            if applied {
+                session.public_resolution_count += 1;
+                session.last_public_resolution_at_ms = *at_ms;
+                session.last_public_resolution = Some(evidence.clone());
+            }
+            Ok(())
         }
         Operation::Limits { now_ms, limits } => {
             let mut risk = risk(limits)?;
@@ -649,6 +732,192 @@ mod tests {
             serde_json::to_value(session).unwrap(),
             serde_json::to_value(recovered).unwrap()
         );
+    }
+    #[test]
+    fn public_final_outcomes_close_more_than_64_windows_and_replay_one_finite_pool() {
+        let mut config = limits();
+        config.initial_collateral_usd = "1000".into();
+        let mut session = new(&config).unwrap();
+        let mut tape = Vec::new();
+        for index in 0..72u64 {
+            let condition = format!("0x{:064x}", index + 1);
+            let mut operations = executed_window();
+            for operation in &mut operations {
+                match operation {
+                    Operation::Market {
+                        condition_id,
+                        start_ms,
+                        end_ms,
+                    } => {
+                        *condition_id = condition.clone();
+                        *start_ms = Some(index * 300_000);
+                        *end_ms = Some((index + 1) * 300_000);
+                    }
+                    Operation::Book { now_ms, .. }
+                    | Operation::Quotes { now_ms, .. }
+                    | Operation::Advance { now_ms }
+                    | Operation::ObservedTrade { now_ms, .. }
+                    | Operation::CancelAll { now_ms } => *now_ms += index * 20_000,
+                    _ => {}
+                }
+            }
+            if index > 0 {
+                let target = crate::paper_resolution::Target {
+                    condition_id: format!("0x{index:064x}"),
+                    start_ms: (index - 1) * 300_000,
+                    end_ms: index * 300_000,
+                };
+                operations.push(Operation::PublicResolution {
+                    evidence: crate::paper_resolution::tests::evidence(
+                        target,
+                        true,
+                        index * 300_000,
+                    ),
+                    at_ms: index * 300_000,
+                });
+            }
+            for operation in &operations {
+                apply(&mut session, operation).unwrap();
+            }
+            assert_eq!(session.portfolio_snapshot().held_market_count, Some(1));
+            assert_eq!(session.portfolio.policy().max_unresolved_markets, 64);
+            session.validate().unwrap();
+            tape.extend(operations);
+        }
+        assert_eq!(session.public_resolution_count, 71);
+        let snapshot = session.portfolio_snapshot();
+        assert_eq!(snapshot.initial_cash_pico, "1000000000000000");
+        assert_eq!(snapshot.realized_pnl_pico, "213000000000000");
+        let mut restored = new(&config).unwrap();
+        replay(&mut restored, &values(&tape).unwrap()).unwrap();
+        assert!(same_state_without_clock(&session, &restored).unwrap());
+    }
+    #[test]
+    fn late_public_resolution_keeps_the_next_complete_set_merge_clock_monotonic() {
+        let mut session = new(&limits()).unwrap();
+        let mut tape = executed_window();
+        let mut second = executed_window();
+        for operation in &mut second {
+            match operation {
+                Operation::Market {
+                    condition_id,
+                    start_ms,
+                    end_ms,
+                } => {
+                    *condition_id = id('b');
+                    *start_ms = Some(300_000);
+                    *end_ms = Some(600_000);
+                }
+                Operation::Book { now_ms, .. }
+                | Operation::Quotes { now_ms, .. }
+                | Operation::Advance { now_ms }
+                | Operation::ObservedTrade { now_ms, .. }
+                | Operation::CancelAll { now_ms } => *now_ms += 20_000,
+                _ => {}
+            }
+        }
+        second.insert(
+            6,
+            Operation::ObservedTrade {
+                now_ms: 20_060,
+                outcome: "down".into(),
+                price_micros: 400_000,
+                quantity_micros: 5_000_000,
+                fingerprint: "b".repeat(64),
+            },
+        );
+        tape.extend(second);
+        tape.push(Operation::PublicResolution {
+            evidence: crate::paper_resolution::tests::evidence(
+                crate::paper_resolution::Target {
+                    condition_id: id('a'),
+                    start_ms: 0,
+                    end_ms: 300_000,
+                },
+                true,
+                600_100,
+            ),
+            at_ms: 600_150,
+        });
+        tape.push(Operation::Market {
+            condition_id: id('c'),
+            start_ms: Some(600_000),
+            end_ms: Some(900_000),
+        });
+        for operation in &tape {
+            apply(&mut session, operation).unwrap();
+        }
+        assert_eq!(session.portfolio_snapshot().cash_pico, "104000000000000");
+        assert_eq!(
+            session.portfolio_snapshot().realized_pnl_pico,
+            "4000000000000"
+        );
+        let mut restored = new(&limits()).unwrap();
+        replay(&mut restored, &values(&tape).unwrap()).unwrap();
+        assert!(same_state_without_clock(&session, &restored).unwrap());
+    }
+    #[test]
+    fn public_resolution_rejects_wrong_market_and_clock_without_credit_and_is_exactly_idempotent() {
+        let mut session = new(&limits()).unwrap();
+        for operation in executed_window() {
+            apply(&mut session, &operation).unwrap();
+        }
+        apply(
+            &mut session,
+            &Operation::Market {
+                condition_id: id('b'),
+                start_ms: Some(300_000),
+                end_ms: Some(600_000),
+            },
+        )
+        .unwrap();
+        let target = crate::paper_resolution::Target {
+            condition_id: id('a'),
+            start_ms: 0,
+            end_ms: 300_000,
+        };
+        let evidence = crate::paper_resolution::tests::evidence(target, true, 300_000);
+        let before = session.clone();
+        let mut wrong = evidence.clone();
+        wrong.target.condition_id = id('c');
+        assert!(
+            apply(
+                &mut session,
+                &Operation::PublicResolution {
+                    evidence: wrong,
+                    at_ms: 300_000
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            apply(
+                &mut session,
+                &Operation::PublicResolution {
+                    evidence: evidence.clone(),
+                    at_ms: 299_999
+                }
+            )
+            .is_err()
+        );
+        assert!(same_state_without_clock(&before, &session).unwrap());
+        let operation = Operation::PublicResolution {
+            evidence,
+            at_ms: 300_000,
+        };
+        apply(&mut session, &operation).unwrap();
+        let after = session.clone();
+        apply(&mut session, &operation).unwrap();
+        assert!(same_state_without_clock(&after, &session).unwrap());
+        let mut reobserved = operation.clone();
+        if let Operation::PublicResolution { evidence, at_ms } = &mut reobserved {
+            evidence.observed_at_ms += 1000;
+            *at_ms += 1000;
+        }
+        apply(&mut session, &reobserved).unwrap();
+        assert!(same_state_without_clock(&after, &session).unwrap());
+        assert_eq!(session.portfolio_snapshot().held_market_count, Some(0));
+        assert_eq!(session.public_resolution_count, 1);
     }
     #[test]
     fn observed_trade_duplicate_is_idempotent_and_changed_market_bounds_reject() {

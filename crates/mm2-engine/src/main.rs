@@ -118,6 +118,16 @@ async fn run() -> Result<(), String> {
         .await?;
         actor.attach_live(live);
     }
+    let resolution_task = if config.feed_source == mm2_engine::config::FeedSource::Public {
+        handle.simulation_handle().map(|paper| {
+            tokio::spawn(mm2_engine::paper_resolution::run(
+                paper,
+                shutdown_rx.clone(),
+            ))
+        })
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|_| "cannot bind HTTP listener")?;
@@ -186,6 +196,9 @@ async fn run() -> Result<(), String> {
         }
         if let Some(paper) = &mut paper_task {
             let _ = paper.await;
+        }
+        if let Some(resolution) = resolution_task {
+            let _ = resolution.await;
         }
     })
     .await;

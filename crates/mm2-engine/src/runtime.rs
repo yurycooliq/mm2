@@ -49,6 +49,11 @@ enum Operation {
     Command(Command, oneshot::Sender<Reply>),
     Mirror(Command),
     Market(Market, oneshot::Sender<Result<(), String>>),
+    ResolutionTargets(oneshot::Sender<Vec<crate::paper_resolution::Target>>),
+    PublicResolution(
+        crate::paper_resolution::Evidence,
+        oneshot::Sender<Result<(), String>>,
+    ),
     SourceStatus(&'static str, Option<String>, Option<u64>),
 }
 
@@ -62,6 +67,36 @@ pub struct Handle {
     fee_policy: watch::Sender<Option<mm2_live::fees::FeePolicy>>,
 }
 impl Handle {
+    pub fn simulation_handle(&self) -> Option<Handle> {
+        if self.state.borrow()["execution_mode"] == "simulation" {
+            Some(self.clone())
+        } else {
+            self.paper.as_deref().cloned()
+        }
+    }
+    pub async fn resolution_targets(&self) -> Result<Vec<crate::paper_resolution::Target>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .try_send(Operation::ResolutionTargets(tx))
+            .map_err(|_| "resolution target queue unavailable")?;
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| "resolution target request timed out")?
+            .map_err(|_| "resolution actor unavailable".into())
+    }
+    pub async fn resolve_paper(
+        &self,
+        evidence: crate::paper_resolution::Evidence,
+    ) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .try_send(Operation::PublicResolution(evidence, tx))
+            .map_err(|_| "paper resolution queue unavailable")?;
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| "paper resolution acknowledgement unknown")?
+            .map_err(|_| "paper resolution actor unavailable")?
+    }
     pub fn fee_policy(&self, policy: Option<mm2_live::fees::FeePolicy>) {
         let policy = policy.filter(|p| p.validate().is_ok() && p.maker_zero());
         self.fee_policy.send_replace(policy.clone());
@@ -224,6 +259,7 @@ struct Publication {
     live: Option<Arc<mm2_live::LiveSnapshot>>,
     journal_metrics: Option<crate::journal::JournalMetrics>,
     paper_portfolio: Option<mm2_portfolio::Snapshot>,
+    paper_resolution: Option<Value>,
     paper: Option<Arc<Value>>,
     paper_error: Option<String>,
 }
@@ -718,6 +754,10 @@ impl Actor {
                 .simulation
                 .as_ref()
                 .map(|session| session.telemetry_portfolio_snapshot()),
+            paper_resolution: self
+                .simulation
+                .as_ref()
+                .map(|paper| paper.resolution_status()),
             paper: self
                 .paper
                 .as_ref()
@@ -1052,6 +1092,83 @@ impl Actor {
             Err(_) => Err("market identity journal writer stopped".into()),
         }
     }
+    async fn admit_public_resolution(
+        &mut self,
+        evidence: crate::paper_resolution::Evidence,
+    ) -> Result<(), String> {
+        if self.source != "public" || self.execution_mode != "simulation" {
+            return Err("public outcome admission requires the independent simulation lane".into());
+        }
+        let Some(session) = &self.simulation else {
+            return Err("no paper ledger".into());
+        };
+        let mut candidate = session.clone();
+        let operation = SimulationOperation::PublicResolution {
+            at_ms: wall_ms().max(evidence.observed_at_ms),
+            evidence,
+        };
+        simulation::apply(&mut candidate, &operation)?;
+        candidate.validate()?;
+        if simulation::same_state_without_clock(session, &candidate)? {
+            return Ok(());
+        }
+        let values = simulation::values(&[operation])?;
+        let Some(mut journal) = self.journal.take() else {
+            return Err("paper journal unavailable".into());
+        };
+        match tokio::task::spawn_blocking(move || {
+            let result = journal.commit_execution(values);
+            (journal, result)
+        })
+        .await
+        {
+            Ok((journal, result)) => {
+                self.journal_bytes = journal.bytes();
+                self.journal = Some(journal);
+                if let Err(error) = result {
+                    self.latch(error.clone());
+                    return Err(error);
+                }
+                self.simulation = Some(candidate);
+                self.evaluate();
+                // A newly realized loss must cancel existing possible fills immediately.
+                self.simulation_step(false).await;
+                self.publish();
+                Ok(())
+            }
+            Err(_) => {
+                self.latch("paper resolution journal writer stopped".into());
+                Err("paper resolution journal writer stopped".into())
+            }
+        }
+    }
+    async fn select_market(&mut self, market: Market) -> Result<(), String> {
+        // A failed paper rollover is an inspectable paused actor, not a dead source/API.
+        if self.fatal.is_some() && self.simulation.is_some() {
+            return Ok(());
+        }
+        let mut candidate = self.core.clone();
+        candidate.set_market(market.clone())?;
+        let previous = std::mem::replace(&mut self.core, candidate);
+        if let Err(error) = self.bind_simulation_market(&market.condition_id).await {
+            self.core = previous;
+            self.simulation_error = Some(error.clone());
+            self.latch(error.clone());
+            self.simulation_step(true).await;
+            self.publish();
+            return if self.simulation.is_some() {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        self.condition = Some(market.condition_id);
+        self.observation_barrier = Some(mono_ms(self.start));
+        self.awaiting_source_refresh = false;
+        self.evaluate();
+        self.publish();
+        Ok(())
+    }
     async fn observed_trades(&mut self, events: &[FeedEvent]) {
         let Some(session) = &self.simulation else {
             return;
@@ -1162,7 +1279,9 @@ impl Actor {
                 json!({"receipt":receipt,"state":self.state.borrow().as_ref(),"replayed":true}),
             );
         }
-        if self.fatal.is_some() || self.closing {
+        let stopping_command =
+            matches!(&command,Command::Control {action,..} if action=="pause" || action=="kill");
+        if (self.fatal.is_some() && !stopping_command) || self.closing {
             return Err(Failure::new(
                 "unavailable",
                 "fault latched; restart required",
@@ -1346,10 +1465,15 @@ impl Actor {
                         Some(Operation::Market(market, reply)) => {
                             // The source owner joins the old stream first. Drain its queued generation.
                             while self.feeds.try_recv().is_ok() {}
-                            let mut result = self.core.set_market(market.clone());
-                            if result.is_ok() && let Err(error)=self.bind_simulation_market(&market.condition_id).await {self.latch(error.clone());result=Err(error);}
-                            if result.is_ok() { self.condition = Some(market.condition_id); self.observation_barrier = Some(mono_ms(self.start)); self.awaiting_source_refresh = false; }
-                            self.evaluate(); self.publish(); let _ = reply.send(result);
+                            let result = self.select_market(market).await;
+                            let _ = reply.send(result);
+                        }
+                        Some(Operation::ResolutionTargets(reply)) => {
+                            let _ = reply.send(self.simulation.as_ref().map_or_else(Vec::new, |s|s.resolution_targets()));
+                        }
+                        Some(Operation::PublicResolution(evidence,reply)) => {
+                            let result = self.admit_public_resolution(evidence).await;
+                            let _ = reply.send(result);
                         }
                         Some(Operation::SourceStatus(phase,message,retry)) => {
                             self.source_status=json!({"phase":phase,"message":message.map(|m|m.chars().take(256).collect::<String>()),"retry_in_ms":retry,"at_ms":wall_ms()});self.publish();
@@ -1428,6 +1552,12 @@ impl Actor {
                 }
                 Operation::SourceStatus(..) => {}
                 Operation::Mirror(_) => {}
+                Operation::ResolutionTargets(reply) => {
+                    let _ = reply.send(Vec::new());
+                }
+                Operation::PublicResolution(_, reply) => {
+                    let _ = reply.send(Err("service shutting down".into()));
+                }
             }
         }
     }
@@ -1519,6 +1649,7 @@ impl Publication {
             "decision_ns_p50":percentile(50),"decision_ns_p99":if ordered.len()>=1000 {percentile(99)} else {None},
             "measurement":"core and strategy evaluation; excludes transport, parsing, queue wait, execution durability and snapshot publication"});
         let diagnostics = json!({
+            "paper_resolution":self.paper_resolution.or_else(||self.paper.as_ref().map(|paper|paper["paper_resolution"].clone())),
             "fee_check":self.fee_check,
             "feed_diagnostics":self.feed_diagnostics,
             "feed_diagnostics_policy":"bounded atomic counters sampled independently; local boot scope, not a durable event stream",
@@ -1658,6 +1789,170 @@ mod tests {
         }
     }
 
+    fn retained_windows(config: &Config, count: u64) {
+        let mut journal = Journal::open_streaming(
+            &config.state_dir,
+            crate::journal::JournalOptions::default(),
+            config.limits.canonical().unwrap(),
+        )
+        .unwrap();
+        for i in 0..count {
+            let now = i * 20_000;
+            let inputs = vec![
+                SimulationOperation::Market {
+                    condition_id: format!("0x{:064x}", i + 1),
+                    start_ms: Some(i * 300_000),
+                    end_ms: Some((i + 1) * 300_000),
+                },
+                SimulationOperation::Book {
+                    now_ms: now,
+                    outcome: "up".into(),
+                    bid: 400_000,
+                    ask: 500_000,
+                    ahead_micros: 0,
+                },
+                SimulationOperation::Quotes {
+                    now_ms: now,
+                    quotes: vec![simulation::Quote {
+                        slot: "up".into(),
+                        outcome: "up".into(),
+                        price_micros: 400_000,
+                        quantity_micros: 5_000_000,
+                    }],
+                },
+                SimulationOperation::Advance { now_ms: now + 50 },
+                SimulationOperation::Trade {
+                    now_ms: now + 60,
+                    outcome: "up".into(),
+                    worst_price_micros: 400_000,
+                    quantity_micros: 5_000_000,
+                },
+                SimulationOperation::Advance { now_ms: now + 100 },
+                SimulationOperation::CancelAll { now_ms: now + 100 },
+                SimulationOperation::Advance { now_ms: now + 1000 },
+            ];
+            journal
+                .commit_execution(simulation::values(&inputs).unwrap())
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_cap_pauses_without_killing_actor_and_retains_readable_state_and_owner_receipt()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = batch_config(directory.path());
+        config.limits.initial_collateral_usd = "1000".into();
+        retained_windows(&config, 64);
+        let (_tx, rx) = mpsc::channel(16);
+        let (_fault, fault) = watch::channel(None);
+        let (stop, shutdown) = watch::channel(false);
+        let (handle, actor) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+        let task = tokio::spawn(actor.run());
+        let market = Market {
+            slug: "offline-cap-regression".into(),
+            condition_id: format!("0x{:064x}", 65),
+            up_token: "11".into(),
+            down_token: "12".into(),
+            window_start_ms: 64 * 300_000,
+            window_end_ms: 65 * 300_000,
+            tick_micro: 1000,
+        };
+        handle.select_market(market).await.unwrap();
+        let state = handle.state.borrow().clone();
+        assert_eq!(state["mode"], "paused");
+        assert!(
+            state["fault"]
+                .as_str()
+                .unwrap()
+                .contains("unresolved market capacity")
+        );
+        assert_eq!(state["paper_portfolio"]["held_market_count"], 64);
+        assert_eq!(
+            state["paper_portfolio"]["initial_cash_pico"],
+            "1000000000000000"
+        );
+        assert_eq!(
+            state["simulation_market_condition"],
+            format!("0x{:064x}", 64)
+        );
+        assert!(!task.is_finished());
+        let reply = handle
+            .command(Command::Control {
+                id: "capacity-pause".into(),
+                expected_version: 0,
+                action: "pause".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply["receipt"]["applied_version"], 1);
+        assert!(
+            handle
+                .command(Command::Control {
+                    id: "capacity-resume".into(),
+                    expected_version: 1,
+                    action: "resume".into()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(handle.resolution_targets().await.unwrap().len(), 63);
+        stop.send_replace(true);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalized_paper_credit_is_durable_and_sync_failure_does_not_publish_candidate_cash() {
+        for fail_sync in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = batch_config(directory.path());
+            retained_windows(&config, 2);
+            let (_tx, rx) = mpsc::channel(16);
+            let (_fault, fault) = watch::channel(None);
+            let (_stop, shutdown) = watch::channel(false);
+            let (_, mut actor) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+            let before = actor.simulation.as_ref().unwrap().portfolio_snapshot();
+            let target = crate::paper_resolution::Target {
+                condition_id: format!("0x{:064x}", 1),
+                start_ms: 0,
+                end_ms: 300_000,
+            };
+            let proof = crate::paper_resolution::tests::evidence(target, true, 300_000);
+            if fail_sync {
+                actor.journal.as_mut().unwrap().inject_sync_failure();
+            }
+            let result = actor.admit_public_resolution(proof).await;
+            let after = actor.simulation.as_ref().unwrap().portfolio_snapshot();
+            if fail_sync {
+                assert!(result.is_err());
+                assert_eq!(before.cash_pico, after.cash_pico);
+                assert!(actor.fatal.is_some());
+            } else {
+                result.unwrap();
+                assert_eq!(after.held_market_count, Some(1));
+                assert_eq!(after.realized_pnl_pico, "3000000000000");
+                drop(actor);
+                let (_tx, rx) = mpsc::channel(16);
+                let (_fault, fault) = watch::channel(None);
+                let (_stop, shutdown) = watch::channel(false);
+                let (_, recovered) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+                assert_eq!(
+                    recovered
+                        .simulation
+                        .as_ref()
+                        .unwrap()
+                        .portfolio_snapshot()
+                        .cash_pico,
+                    after.cash_pico
+                );
+                assert_eq!(
+                    recovered.simulation.as_ref().unwrap().resolution_status()["completed"],
+                    1
+                );
+            }
+        }
+    }
+
     async fn batch_actor(config: &Config) -> Actor {
         let (_feeds, rx) = mpsc::channel(16);
         let (_fault, fault) = watch::channel(None);
@@ -1779,7 +2074,9 @@ mod tests {
             FEED_BATCH_LIMIT + operations_before
         );
         // Apply fill notices before comparing exact cash, inventory and reservations.
-        let drain = SimulationOperation::Advance { now_ms: now + 1000 };
+        let drain = SimulationOperation::Advance {
+            now_ms: actor.simulation.as_ref().unwrap().now_ms() + 1000,
+        };
         simulation::apply(actor.simulation.as_mut().unwrap(), &drain).unwrap();
         actor
             .journal
@@ -1913,8 +2210,14 @@ mod tests {
         });
         let mut actor = batch_actor(&config).await;
         assert_eq!(actor.feed_batch_limit, 1);
-        for chunk in trades(&actor, FEED_BATCH_LIMIT).chunks(actor.feed_batch_limit) {
-            actor.observed_trades(chunk).await;
+        for index in 0..FEED_BATCH_LIMIT {
+            // Each durable write may exceed the source freshness window on a slow disk.
+            // Admit a freshly observed, distinct trade for each supported one-event batch.
+            let mut event = trades(&actor, 1).remove(0);
+            if let FeedEvent::Trade { fingerprint, .. } = &mut event {
+                *fingerprint = format!("{index:064x}");
+            }
+            actor.observed_trades(&[event]).await;
         }
         assert!(actor.fatal.is_none(), "{:?}", actor.fatal);
         assert_eq!(actor.execution_trade_commits, FEED_BATCH_LIMIT as u64);

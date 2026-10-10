@@ -7,6 +7,7 @@ publish = false
 default-run = "mm2-engine"
 
 [dependencies]
+alloy = { version = "1.6.3", default-features = false, features = ["sol-types"] }
 mm2-core = { path = "../mm2-core" }
 mm2-emulator = { path = "../mm2-emulator" }
 mm2-live = { path = "../mm2-live" }

@@ -1,5 +1,37 @@
 # Validation evidence
 
+## Public simulation resolution and inspectable rollover failure: October 10, 2026
+
+R6 exhausted 64 held unresolved markets because public rollover had no outcome
+worker. The fix reads exact standard binary CTF payouts at one canonical finalized
+Polygon block, journals checked evidence before synthetic credit, retains unknown
+positions and preserves all original capital/risk/storage limits. A failed paper
+rollover now remains paused with its diagnostic API available. See
+[the resolution and rollback contract](PAPER_RESOLUTION.md).
+
+Formatting, all-target Clippy with `-D warnings` and **288 Rust workspace tests**
+passed, including **84 engine library tests**. Ten new regressions cover finalized
+outcome/token identity, unfinalized/split/foreign/reorganized observations, more than
+64 windows with unchanged capacity and finite cash, exact replay/idempotency,
+delayed settlement across a complete-set merge, durable credit/sync failure, and
+the retained capacity-faulted actor with Pause acknowledgement and blocked Resume.
+Two existing batching tests now admit fresh timestamps and drain from the current
+logical clock, preserving the production freshness policy on slow storage.
+
+All **499 Python tests** passed in dependency-complete Linux (console 118, data 21,
+latency 34, ops 148, research 178), with no skips. The strategy/reference **25 Node
+checks** passed; the unchanged dashboard's 30 checks and production build are also
+validated by the console image build. Initial Windows sandbox and read-only Linux
+fixture attempts failed because their temporary directories were unavailable;
+the successful run used an isolated writable Linux project copy.
+
+The read-only production diagnostic verified a real completed R6 market against
+the public CTF payout vector and independently derived both token IDs. This proves
+the public observation path for that market; no engine ledger or funded wallet was
+changed. Exact-image smoke, stopped-ledger recovery and the repeat forward run
+remain separately recorded deployment receipts. A running repeat is not a completed
+24-hour acceptance or economic result.
+
 ## Automated maker fee evidence and live reconciliation: October 9, 2026
 
 Public quote readiness now requires strict current-market fee metadata, refreshed off
