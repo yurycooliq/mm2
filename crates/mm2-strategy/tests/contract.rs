@@ -1,4 +1,5 @@
 use mm2_core::{Outcome, SCALE};
+use mm2_strategy::decide_inventory_aware;
 use mm2_strategy::{Bbo, Gate, Input, Rules, Signals, Widening, decide, half_width, session_lot};
 
 fn input() -> Input {
@@ -25,6 +26,101 @@ fn input() -> Input {
         min_order_micros: 5 * SCALE,
         signals: Signals::default(),
     }
+}
+
+#[test]
+fn paper_inventory_policy_stops_overweight_lots_and_caps_complement_by_actual_paid_cost() {
+    let r = Rules {
+        half_width_micros: 10_000,
+        lot_full_micros: 5 * SCALE,
+        max_imbalance_micros: 10 * SCALE,
+        ..Rules::default()
+    };
+    let mut i = input();
+    i.inventory_down_micros = 5_050_000;
+    let cost = 3_230_000_000_000;
+    assert!(decide(&r, &i).unwrap().quotes.len() > 1);
+    let d = decide_inventory_aware(&r, &i, Some([0, cost])).unwrap();
+    assert_eq!(d.quotes.len(), 1);
+    let q = &d.quotes[0];
+    assert_eq!(q.slot, "up:hedge");
+    assert_eq!(q.quantity_micros, 5_050_000);
+    assert_eq!(q.price_micros, 360_000);
+    assert!(cost + u128::from(q.price_micros) * 5_050_000 <= u128::from(SCALE) * 5_050_000);
+}
+
+#[test]
+fn paper_inventory_cost_cap_is_symmetric_and_rounds_down_with_required_edge() {
+    for owned in [0, 1] {
+        for price in [20_001_u64, 371_111, 640_001, 979_999] {
+            let r = Rules {
+                lot_full_micros: 5 * SCALE,
+                half_width_micros: 10_000,
+                max_pair_edge_micros: 20_000,
+                ..Rules::default()
+            };
+            let mut i = input();
+            if owned == 0 {
+                i.inventory_up_micros = 5 * SCALE;
+            } else {
+                i.inventory_down_micros = 5 * SCALE;
+            }
+            let mut costs = [0, 0];
+            costs[owned] = u128::from(price) * 5_000_000;
+            let d = decide_inventory_aware(&r, &i, Some(costs)).unwrap();
+            for q in d.quotes {
+                assert_eq!(
+                    q.outcome,
+                    if owned == 0 {
+                        Outcome::Down
+                    } else {
+                        Outcome::Up
+                    }
+                );
+                assert!(
+                    costs[owned] + u128::from(q.price_micros) * 5_000_000
+                        <= u128::from(SCALE - r.max_pair_edge_micros) * 5_000_000
+                );
+                assert!(q.price_micros.is_multiple_of(i.tick_micros));
+            }
+        }
+    }
+}
+
+#[test]
+fn paper_dust_and_missing_cost_never_create_a_fresh_overweight_lot() {
+    let r = Rules::default();
+    let mut i = input();
+    i.inventory_up_micros = SCALE / 2;
+    let d = decide_inventory_aware(&r, &i, Some([200_000_000_000, 0])).unwrap();
+    assert_eq!(d.reason, Gate::InventoryDust);
+    assert!(d.quotes.is_empty());
+    assert_eq!(
+        decide_inventory_aware(&r, &i, None).unwrap().reason,
+        Gate::OwnedCostUnknown
+    );
+    i.up.received_ms -= 1001;
+    assert_eq!(
+        decide_inventory_aware(&r, &i, None).unwrap().reason,
+        Gate::StaleBook
+    );
+}
+
+#[test]
+fn balanced_paper_inventory_keeps_two_sided_work_and_invalid_cost_is_rejected() {
+    let r = Rules::default();
+    let mut i = input();
+    assert_eq!(
+        decide_inventory_aware(&r, &i, Some([0, 0])).unwrap(),
+        decide(&r, &i).unwrap()
+    );
+    i.inventory_up_micros = 5 * SCALE;
+    i.inventory_down_micros = 5 * SCALE;
+    assert_eq!(
+        decide_inventory_aware(&r, &i, Some([2_000_000_000_000, 2_000_000_000_000])).unwrap(),
+        decide(&r, &i).unwrap()
+    );
+    assert!(decide_inventory_aware(&r, &i, Some([0, 2_000_000_000_000])).is_err());
 }
 
 #[test]

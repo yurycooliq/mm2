@@ -220,6 +220,21 @@ pub struct Portfolio {
     halted: Option<String>,
 }
 
+fn gross_loss_bound(quantities: [u64; 2], costs: [u128; 2]) -> u128 {
+    let matched = quantities[0].min(quantities[1]);
+    let owned = usize::from(quantities[1] > quantities[0]);
+    let residual = if quantities[owned] == 0 {
+        0
+    } else {
+        let quantity = u128::from(quantities[owned]);
+        let difference = u128::from(quantities[owned] - matched);
+        (costs[owned] / quantity) * difference
+            + ((costs[owned] % quantity) * difference).div_ceil(quantity)
+    };
+    // Matched profit cannot offset a later negative redemption under gross-loss policy.
+    residual.max((costs[0] + costs[1]).saturating_sub(u128::from(matched) * u128::from(SCALE)))
+}
+
 fn check_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 128
@@ -304,6 +319,60 @@ impl Portfolio {
     }
     pub fn policy(&self) -> &RiskPolicy {
         &self.policy
+    }
+
+    /// Admission before execution, including every retained unresolved market.
+    /// Positive realized returns never replenish the configured gross loss budget.
+    pub fn permits_execution_risk(
+        &self,
+        market_id: &str,
+        possible_fills: [u64; 2],
+        max_fill_price_micros: u64,
+    ) -> Result<bool> {
+        if max_fill_price_micros >= SCALE
+            || possible_fills.iter().any(|q| *q > MAX_QUANTITY)
+            || (max_fill_price_micros == 0 && possible_fills != [0, 0])
+        {
+            return Err("invalid prospective execution risk".into());
+        }
+        let current = self.market(market_id).ok_or("unknown execution market")?;
+        let remaining = (u128::from(self.policy.max_daily_loss_micros) * u128::from(SCALE))
+            .saturating_sub(self.daily_loss_pico)
+            .min(
+                (u128::from(self.policy.max_drawdown_micros) * u128::from(SCALE))
+                    .saturating_sub(self.drawdown_pico()),
+            );
+        let retained: u128 = self
+            .markets
+            .values()
+            .filter(|p| p.market.id != market_id)
+            .map(|p| {
+                gross_loss_bound(
+                    [p.up.quantity_micros, p.down.quantity_micros],
+                    [p.up.cost_pico, p.down.cost_pico],
+                )
+            })
+            .sum();
+        let mut worst = 0;
+        for mask in 0..4 {
+            let mut quantities = [current.up.quantity_micros, current.down.quantity_micros];
+            let mut costs = [current.up.cost_pico, current.down.cost_pico];
+            for side in 0..2 {
+                if mask & (1 << side) != 0 {
+                    quantities[side] = quantities[side]
+                        .checked_add(possible_fills[side])
+                        .filter(|q| *q <= MAX_QUANTITY)
+                        .ok_or("prospective inventory bound")?;
+                    // The aggregate adapter may allocate a batch's cost between sides.
+                    // Its allocated unit cost cannot exceed the highest possible fill price.
+                    costs[side] +=
+                        u128::from(possible_fills[side]) * u128::from(max_fill_price_micros);
+                }
+            }
+            worst = worst.max(gross_loss_bound(quantities, costs));
+        }
+        // Equality trips the existing realized guard; admit strictly below it.
+        Ok(self.halted.is_none() && retained + worst < remaining)
     }
     pub fn halt(&mut self, reason: impl Into<String>) {
         self.halted = Some(reason.into());

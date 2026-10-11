@@ -9,6 +9,7 @@ COPY config ./config
 COPY fixtures ./fixtures
 RUN --mount=type=cache,id=mo-money-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=mm2-target-1.98.1-${TARGETARCH},target=/build/target,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
     cargo test --workspace --locked -- --test-threads=2 && cargo build --release --locked --workspace \
     && cp target/release/mm2-engine /build/mm2-engine \
     && cp target/release/mm2-paper-outcome /build/mm2-paper-outcome \

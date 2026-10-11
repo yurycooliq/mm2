@@ -1,5 +1,39 @@
 # Validation evidence
 
+## Simulation inventory cost and prospective loss admission: October 11, 2026
+
+R7 stopped after a partial 18-minute run at the unchanged gross realized-loss
+guard. Exact journal replay identifies new lots on the already overweight side
+and complement quotes whose combined price with owned inventory exceeded $1.
+The simulation policy now quotes only the lagging hedge, caps it by exact BUY
+fill costs and the retained portfolio basis, and checks unresolved positions and
+all possible fills against the original daily-loss/drawdown headroom before new
+intents. See [STRATEGY.md](STRATEGY.md). No risk, capital, feed or journal limit,
+realized accounting policy, old receipt, or funded quote policy was changed.
+
+Formatting, all-target Clippy with `-D warnings` and **301 Rust workspace tests**
+passed, including **87 engine library tests**. Thirteen new regressions exercise
+partial/cancel-race costs, unknown legacy checkpoints, symmetric conservative
+price caps, dust, old unresolved risk, retained-order deduplication, independent
+possible fills, strict unchanged loss thresholds, drawdown and actual merge/
+redemption of admitted partial-fill batches for either final outcome.
+
+All **499 Python tests** passed in dependency-complete Linux, with no skips.
+The unchanged historical strategy/reference **25 Node checks** passed. Simulation
+inventory management is a separate contract from the historical quote oracle.
+Timing-sensitive journal tests initially failed on Docker Desktop's slow temporary
+filesystem; the successful complete suite and production image build use temporary
+test journals on tmpfs, preserving all production freshness and timeout rules.
+Selected-host durable ledger recovery remains a separate deployment check.
+
+On the same short observed R7 tape, a synthetic counterfactual with the new rules
+did not trip the loss guard. It remained negative and spent most quote opportunities
+abstaining on a below-minimum imbalance. This is a regression diagnostic fitted to
+the incident, not an independent holdout, a full day, profitability, real PnL or ROI.
+Runtime image/browser integration and the fresh 24-hour experiment have separate
+dated receipts; waiting due to `loss_budget` or `inventory_dust` must not be presented
+as continuous active quoting or economic acceptance.
+
 ## Public simulation resolution and inspectable rollover failure: October 10, 2026
 
 R6 exhausted 64 held unresolved markets because public rollover had no outcome

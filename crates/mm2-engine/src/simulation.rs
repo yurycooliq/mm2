@@ -73,6 +73,92 @@ impl MultiMarketPaper {
     pub fn portfolio_halt(&self) -> Option<&str> {
         self.portfolio.halt_reason()
     }
+    /// Strategy admission only: replayed execution inputs and accounting are unchanged.
+    pub fn guard_strategy_quotes(
+        &self,
+        rules: &mm2_strategy::Rules,
+        decision: &mut mm2_strategy::Decision,
+    ) -> Result<(), String> {
+        if decision.quotes.is_empty() {
+            return Ok(());
+        }
+        let current = self
+            .current_market
+            .as_deref()
+            .ok_or("missing strategy market")?;
+        let position = self
+            .portfolio
+            .market(current)
+            .ok_or("missing strategy inventory")?;
+        // Retain the old aggregate accounting contract too. Its allocated average
+        // can differ from exact execution costs; neither cost cap may be exceeded.
+        for quote in &mut decision.quotes {
+            if quote.slot.ends_with(":hedge") {
+                let owned = if quote.outcome == Outcome::Up {
+                    &position.down
+                } else {
+                    &position.up
+                };
+                if owned.quantity_micros == 0 {
+                    return Err("hedge without owned inventory".into());
+                }
+                let average = owned.cost_pico.div_ceil(u128::from(owned.quantity_micros));
+                let tick = self.session.limits().tick_micros;
+                let cap = (u128::from(mm2_core::SCALE - rules.max_pair_edge_micros)
+                    .saturating_sub(average)
+                    / u128::from(tick)) as u64
+                    * tick;
+                quote.price_micros = quote.price_micros.min(cap);
+            }
+        }
+        decision
+            .quotes
+            .retain(|q| q.price_micros >= rules.min_price_micros);
+        if decision.quotes.is_empty() {
+            decision.reason = mm2_strategy::Gate::InventoryCost;
+            return Ok(());
+        }
+        if !self.quote_risk_permitted(&decision.quotes)? {
+            decision.quotes.clear();
+            decision.reason = mm2_strategy::Gate::LossBudget;
+        }
+        Ok(())
+    }
+
+    pub fn quote_risk_permitted(&self, quotes: &[DesiredQuote]) -> Result<bool, String> {
+        let current = self
+            .current_market
+            .as_deref()
+            .ok_or("missing risk market")?;
+        let snapshot = self.session.snapshot();
+        let mut possible = [0_u64; 2];
+        let mut max_price = 0;
+        for order in &snapshot.orders {
+            let side = usize::from(order.quote.outcome == Outcome::Down);
+            possible[side] = possible[side]
+                .checked_add(order.reserved_quantity_micros)
+                .ok_or("possible fill overflow")?;
+            max_price = max_price.max(order.quote.price_micros);
+        }
+        for quote in quotes {
+            // A retained desired order is the same commitment, including partial fills.
+            // Replacements still count both old possible fills and the new intent.
+            if !snapshot.orders.iter().any(|order| {
+                order.quote.slot == quote.slot
+                    && order.quote.outcome == quote.outcome
+                    && order.quote.price_micros == quote.price_micros
+                    && order.requested_quantity_micros == quote.quantity_micros
+            }) {
+                let side = usize::from(quote.outcome == Outcome::Down);
+                possible[side] = possible[side]
+                    .checked_add(quote.quantity_micros)
+                    .ok_or("new fill overflow")?;
+                max_price = max_price.max(quote.price_micros);
+            }
+        }
+        self.portfolio
+            .permits_execution_risk(current, possible, max_price)
+    }
     pub fn validate(&self) -> Result<(), String> {
         if let Some(policy) = &self.fee_policy {
             policy.validate()?;
@@ -702,6 +788,92 @@ mod tests {
             Operation::CancelAll { now_ms: 100 },
             Operation::Advance { now_ms: 1000 },
         ]
+    }
+    #[test]
+    fn loss_admission_counts_cancel_races_and_deduplicates_retained_desired_orders() {
+        let mut session = new(&limits()).unwrap();
+        for index in 0..4 {
+            for mut operation in executed_window() {
+                match &mut operation {
+                    Operation::Market {
+                        condition_id,
+                        start_ms,
+                        end_ms,
+                    } => {
+                        *condition_id = format!("0x{:064x}", index + 1);
+                        *start_ms = Some(index * 300_000);
+                        *end_ms = Some((index + 1) * 300_000);
+                    }
+                    Operation::Book { now_ms, .. }
+                    | Operation::Quotes { now_ms, .. }
+                    | Operation::Advance { now_ms }
+                    | Operation::CancelAll { now_ms } => *now_ms += index * 2000,
+                    Operation::ObservedTrade {
+                        now_ms,
+                        fingerprint,
+                        ..
+                    } => {
+                        *now_ms += index * 2000;
+                        *fingerprint = format!("{index:064x}");
+                    }
+                    _ => {}
+                }
+                apply(&mut session, &operation).unwrap();
+            }
+        }
+        apply(
+            &mut session,
+            &Operation::Market {
+                condition_id: id('f'),
+                start_ms: Some(1_200_000),
+                end_ms: Some(1_500_000),
+            },
+        )
+        .unwrap();
+        let now = session.now_ms();
+        session
+            .set_book(
+                now,
+                Outcome::Up,
+                Book {
+                    bid: Some(300_000),
+                    ask: Some(310_000),
+                    bid_levels: vec![],
+                },
+            )
+            .unwrap();
+        let quote = DesiredQuote {
+            slot: "up:lot".into(),
+            outcome: Outcome::Up,
+            price_micros: 300_000,
+            quantity_micros: 5_000_000,
+        };
+        assert!(
+            session
+                .quote_risk_permitted(std::slice::from_ref(&quote))
+                .unwrap()
+        );
+        session.quote(now, vec![quote.clone()]).unwrap();
+        session.advance(now + 100).unwrap();
+        assert!(
+            session
+                .quote_risk_permitted(std::slice::from_ref(&quote))
+                .unwrap()
+        );
+        session.cancel_all(now + 100).unwrap();
+        let replacement = DesiredQuote {
+            price_micros: 310_000,
+            ..quote
+        };
+        assert!(
+            !session
+                .quote_risk_permitted(std::slice::from_ref(&replacement))
+                .unwrap()
+        );
+        session.advance(now + 1000).unwrap();
+        assert!(session.quote_risk_permitted(&[replacement]).unwrap());
+        assert_eq!(session.portfolio.policy().max_daily_loss_micros, 10_000_000);
+        session.validate().unwrap();
     }
     #[test]
     fn rollover_preserves_unpaired_positions_and_finite_cash_and_replays_exactly() {

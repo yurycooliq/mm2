@@ -554,7 +554,26 @@ impl Actor {
                     min_order_micros: 5_000_000,
                     signals: mm2_strategy::Signals::default(),
                 };
-                match mm2_strategy::decide(&rules, &input) {
+                let decision = if self.execution_mode == "simulation"
+                    && let Some(account) = &account
+                {
+                    let costs = account
+                        .outcome_spent_pico
+                        .as_ref()
+                        .and_then(|costs| Some([costs[0].parse().ok()?, costs[1].parse().ok()?]));
+                    mm2_strategy::decide_inventory_aware(&rules, &input, costs)
+                } else {
+                    mm2_strategy::decide(&rules, &input)
+                };
+                let decision = decision.and_then(|mut decision| {
+                    if self.execution_mode == "simulation"
+                        && let Some(paper) = &self.simulation
+                    {
+                        paper.guard_strategy_quotes(&rules, &mut decision)?;
+                    }
+                    Ok(decision)
+                });
+                match decision {
                     Ok(decision) => {
                         self.strategy_gate = Some(decision.reason);
                         self.desired_quotes = decision.quotes;
@@ -1977,6 +1996,73 @@ mod tests {
         actor
     }
     #[tokio::test]
+    async fn paper_actor_uses_exact_fill_basis_before_proposing_a_complement() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = batch_config(directory.path());
+        config.feed_source = crate::config::FeedSource::Demo;
+        let mut actor = batch_actor(&config).await;
+        let now = actor.simulation.as_ref().unwrap().now_ms();
+        for operation in [
+            SimulationOperation::Book {
+                now_ms: now,
+                outcome: "down".into(),
+                bid: 640_000,
+                ask: 650_000,
+                ahead_micros: 0,
+            },
+            SimulationOperation::Quotes {
+                now_ms: now,
+                quotes: vec![simulation::Quote {
+                    slot: "down:lot".into(),
+                    outcome: "down".into(),
+                    price_micros: 640_000,
+                    quantity_micros: 5_000_000,
+                }],
+            },
+            SimulationOperation::Advance { now_ms: now + 100 },
+            SimulationOperation::Trade {
+                now_ms: now + 101,
+                outcome: "down".into(),
+                worst_price_micros: 640_000,
+                quantity_micros: 5_000_000,
+            },
+            SimulationOperation::Advance { now_ms: now + 1000 },
+        ] {
+            simulation::apply(actor.simulation.as_mut().unwrap(), &operation).unwrap();
+        }
+        let condition = actor.condition.clone().unwrap();
+        for (outcome, bid, ask) in [
+            (Outcome::Up, 600_000, 610_000),
+            (Outcome::Down, 390_000, 400_000),
+        ] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: condition.clone(),
+                    outcome,
+                    exchange_ms: wall_ms(),
+                    observed_mono_ms: mono_ms(actor.start),
+                    bids: vec![crate::domain::Level {
+                        price_micro: bid,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: ask,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::Quote));
+        assert_eq!(actor.desired_quotes.len(), 1);
+        assert_eq!(actor.desired_quotes[0].slot, "up:hedge");
+        assert_eq!(actor.desired_quotes[0].price_micros, 360_000);
+        assert_eq!(actor.desired_quotes[0].quantity_micros, 5_000_000);
+        assert_eq!(actor.limits, config.limits.canonical().unwrap());
+    }
+    #[tokio::test]
     async fn public_fee_gate_requires_current_market_and_fresh_evidence() {
         let directory = tempfile::tempdir().unwrap();
         let mut actor = batch_actor(&batch_config(directory.path())).await;
@@ -2007,6 +2093,59 @@ mod tests {
         assert_eq!(
             actor.fee_check(now)["status"],
             "BLOCKED_MISSING_STALE_OR_UNSUPPORTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulation_actor_gates_new_risk_against_old_unresolved_positions() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = batch_config(directory.path());
+        retained_windows(&config, 4);
+        let mut actor = batch_actor(&config).await;
+        let condition = actor.condition.clone().unwrap();
+        for (outcome, bid, ask) in [
+            (Outcome::Up, 600_000, 610_000),
+            (Outcome::Down, 390_000, 400_000),
+        ] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: condition.clone(),
+                    outcome,
+                    exchange_ms: wall_ms(),
+                    observed_mono_ms: mono_ms(actor.start),
+                    bids: vec![crate::domain::Level {
+                        price_micro: bid,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: ask,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::LossBudget));
+        assert!(actor.desired_quotes.is_empty());
+        assert!(actor.fatal.is_none());
+        assert_eq!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .portfolio_snapshot()
+                .held_market_count,
+            Some(4)
+        );
+        assert!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .portfolio_halt()
+                .is_none()
         );
     }
 
