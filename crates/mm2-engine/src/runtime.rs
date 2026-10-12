@@ -495,9 +495,13 @@ impl Actor {
     }
 
     fn evaluate(&mut self) {
+        self.evaluate_with_paper(None);
+    }
+    fn evaluate_with_paper(&mut self, advanced: Option<&simulation::MultiMarketPaper>) {
         let began = Instant::now();
         let now = wall_ms();
         let mono = mono_ms(self.start);
+        let paper = advanced.or(self.simulation.as_ref());
         self.last_decision = self.core.evaluate(now, mono);
         self.desired_quotes.clear();
         self.live_quotes.clear();
@@ -508,17 +512,14 @@ impl Actor {
                 StopReason::NoLegalQuote(_) | StopReason::BudgetExceeded
             )
         });
-        let paper_halted = self
-            .simulation
-            .as_ref()
-            .is_some_and(|paper| paper.portfolio_halt().is_some());
+        let paper_halted = paper.is_some_and(|paper| paper.portfolio_halt().is_some());
         if paper_halted {
             self.strategy_gate = Some(mm2_strategy::Gate::InsufficientCapital);
         }
         if self.last_decision.stop_reasons.is_empty() && !paper_halted {
             let snapshot = self.core.snapshot();
             if let Some(market) = &snapshot.market {
-                let account = self.simulation.as_ref().map(|s| s.snapshot().account);
+                let account = paper.map(|s| s.snapshot().account);
                 let mut rules = self.strategy.clone();
                 rules.half_width_micros = snapshot.config.half_width_micro;
                 rules.lot_full_micros = snapshot.config.lot_micro;
@@ -567,7 +568,7 @@ impl Actor {
                 };
                 let decision = decision.and_then(|mut decision| {
                     if self.execution_mode == "simulation"
-                        && let Some(paper) = &self.simulation
+                        && let Some(paper) = paper
                     {
                         paper.guard_strategy_quotes(&rules, &mut decision)?;
                     }
@@ -842,23 +843,6 @@ impl Actor {
             .saturating_add(mono_ms(self.start))
             .max(session.snapshot().now_ms);
         let mut operations = vec![SimulationOperation::Advance { now_ms: now }];
-        if active && snapshot.pending_events == 0 && snapshot.orders.is_empty() {
-            let minimum_cost = self
-                .last_decision
-                .intents
-                .iter()
-                .map(|intent| u128::from(intent.price_micro) * 5_000_000u128 / 1_000_000u128)
-                .min();
-            if minimum_cost
-                .is_some_and(|cost| cost > u128::from(snapshot.account.available_micros_floor))
-            {
-                let _ = self.core.control(Action::Pause);
-                self.evaluate();
-                active = false;
-                self.simulation_error =
-                    Some("finite simulated collateral exhausted; session is paused".into());
-            }
-        }
         if !active || settling {
             operations.push(SimulationOperation::CancelAll { now_ms: now });
         }
@@ -887,6 +871,17 @@ impl Actor {
                 self.latch(format!("simulation invariant: {error}"));
                 return;
             }
+        }
+        // Execution time may run ahead while draining cancels at rollover. Risk
+        // days use separately recorded UTC, never that synthetic future clock.
+        let risk_at = wall_ms().max(candidate.risk_clock_ms());
+        if active && !settling && candidate.risk_window_due(risk_at) {
+            let operation = SimulationOperation::RiskWindow { at_ms: risk_at };
+            if let Err(error) = simulation::apply(&mut candidate, &operation) {
+                self.latch(format!("simulation risk window invariant: {error}"));
+                return;
+            }
+            operations.push(operation);
         }
         if active && !settling {
             let books = self.core.snapshot();
@@ -935,6 +930,29 @@ impl Actor {
                     return;
                 }
                 operations.push(operation);
+                active = false;
+            }
+        }
+        if active && !settling {
+            // Advance has confirmed fills/cancels and changed inventory, costs
+            // and possible fills. Only this candidate may authorize the quote.
+            self.evaluate_with_paper(Some(&candidate));
+            let current = candidate.snapshot();
+            let minimum_cost = self
+                .last_decision
+                .intents
+                .iter()
+                .map(|intent| u128::from(intent.price_micro) * 5_000_000u128 / 1_000_000u128)
+                .min();
+            if current.pending_events == 0
+                && current.orders.is_empty()
+                && minimum_cost
+                    .is_some_and(|cost| cost > u128::from(current.account.available_micros_floor))
+            {
+                let _ = self.core.control(Action::Pause);
+                self.evaluate_with_paper(Some(&candidate));
+                self.simulation_error =
+                    Some("finite simulated collateral exhausted; session is paused".into());
                 active = false;
             }
         }
@@ -1075,7 +1093,10 @@ impl Actor {
                 .market;
             operations.push(SimulationOperation::DemoResolution {
                 condition_id: previous.clone(),
-                at_ms: previous_market.end_ms,
+                at_ms: previous_market
+                    .end_ms
+                    .max(wall_ms())
+                    .max(candidate.risk_clock_ms()),
                 winning_outcome: if (previous_market.start_ms / 300_000).is_multiple_of(2) {
                     "up"
                 } else {
@@ -1123,7 +1144,9 @@ impl Actor {
         };
         let mut candidate = session.clone();
         let operation = SimulationOperation::PublicResolution {
-            at_ms: wall_ms().max(evidence.observed_at_ms),
+            at_ms: wall_ms()
+                .max(evidence.observed_at_ms)
+                .max(candidate.risk_clock_ms()),
             evidence,
         };
         simulation::apply(&mut candidate, &operation)?;
@@ -2093,6 +2116,116 @@ mod tests {
         assert_eq!(
             actor.fee_check(now)["status"],
             "BLOCKED_MISSING_STALE_OR_UNSUPPORTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_is_recomputed_after_pending_partial_fill_and_cancel_keeps_possible_fills() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = batch_config(directory.path());
+        config.feed_source = crate::config::FeedSource::Demo;
+        let mut actor = batch_actor(&config).await;
+        let now = actor.simulation.as_ref().unwrap().now_ms();
+        let setup = [
+            SimulationOperation::Book {
+                now_ms: now,
+                outcome: "up".into(),
+                bid: 600_000,
+                ask: 610_000,
+                ahead_micros: 0,
+            },
+            SimulationOperation::Quotes {
+                now_ms: now,
+                quotes: vec![simulation::Quote {
+                    slot: "up:lot".into(),
+                    outcome: "up".into(),
+                    price_micros: 600_000,
+                    quantity_micros: 5_000_000,
+                }],
+            },
+            SimulationOperation::Advance { now_ms: now + 100 },
+            SimulationOperation::Trade {
+                now_ms: now + 101,
+                outcome: "up".into(),
+                worst_price_micros: 600_000,
+                quantity_micros: 50_000,
+            },
+        ];
+        for operation in &setup {
+            simulation::apply(actor.simulation.as_mut().unwrap(), operation).unwrap();
+        }
+        actor
+            .journal
+            .as_mut()
+            .unwrap()
+            .commit_execution(simulation::values(&setup).unwrap())
+            .unwrap();
+        assert_eq!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .account
+                .up_inventory_micros,
+            0
+        );
+        let condition = actor.condition.clone().unwrap();
+        for (outcome, bid, ask) in [
+            (Outcome::Up, 600_000, 610_000),
+            (Outcome::Down, 390_000, 400_000),
+        ] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: condition.clone(),
+                    outcome,
+                    exchange_ms: wall_ms(),
+                    observed_mono_ms: mono_ms(actor.start),
+                    bids: vec![crate::domain::Level {
+                        price_micro: bid,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: ask,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::Quote));
+        assert!(
+            actor
+                .desired_quotes
+                .iter()
+                .any(|quote| quote.slot == "up:lot")
+        );
+        actor.simulation_origin_ms = (now + 1000).saturating_sub(mono_ms(actor.start));
+        actor.simulation_last_trade_ms = now + 1000;
+        actor.simulation_step(false).await;
+        assert!(actor.fatal.is_none());
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::InventoryDust));
+        assert!(actor.desired_quotes.is_empty());
+        let cancelling = actor.simulation.as_ref().unwrap().snapshot();
+        assert_eq!(cancelling.account.up_inventory_micros, 50_000);
+        assert!(cancelling.pending_events > 0);
+        assert!(cancelling.account.reserved_micros_ceil > 0);
+        actor.simulation_step(true).await;
+        let terminal = actor.simulation.as_ref().unwrap().snapshot();
+        assert_eq!(terminal.pending_events, 0);
+        assert_eq!(terminal.account.reserved_micros_ceil, 0);
+        assert!(terminal.orders.is_empty());
+        assert_eq!(terminal.account.up_inventory_micros, 50_000);
+        let journal = actor.journal.as_ref().unwrap();
+        let mut replayed = simulation::new(journal.bootstrap()).unwrap();
+        journal
+            .visit_execution(|entries| simulation::replay(&mut replayed, entries))
+            .unwrap();
+        assert!(
+            simulation::same_state_without_clock(&replayed, actor.simulation.as_ref().unwrap())
+                .unwrap()
         );
     }
 

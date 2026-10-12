@@ -73,6 +73,12 @@ impl MultiMarketPaper {
     pub fn portfolio_halt(&self) -> Option<&str> {
         self.portfolio.halt_reason()
     }
+    pub fn risk_window_due(&self, at_ms: u64) -> bool {
+        self.portfolio.risk_window_due(at_ms)
+    }
+    pub fn risk_clock_ms(&self) -> u64 {
+        self.portfolio.risk_clock_ms()
+    }
     /// Strategy admission only: replayed execution inputs and accounting are unchanged.
     pub fn guard_strategy_quotes(
         &self,
@@ -292,6 +298,10 @@ pub enum Operation {
     Advance {
         now_ms: u64,
     },
+    /// Explicit UTC risk window; legacy Advance keeps its original replay semantics.
+    RiskWindow {
+        at_ms: u64,
+    },
     Quotes {
         now_ms: u64,
         quotes: Vec<Quote>,
@@ -422,6 +432,7 @@ pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<()
         Operation::Advance { now_ms } => {
             session.advance(*now_ms).map_err(|error| error.to_string())
         }
+        Operation::RiskWindow { at_ms } => session.portfolio.advance_risk_window(*at_ms),
         Operation::CancelAll { now_ms } => session
             .cancel_all(*now_ms)
             .map_err(|error| error.to_string()),
@@ -659,7 +670,8 @@ pub fn from_core_quotes(quotes: &[DesiredQuote]) -> Vec<Quote> {
         .collect()
 }
 
-/// Clock-only advances have no causal effect. Any pending event, reservation,
+/// Execution-clock-only advances have no causal effect. Recorded UTC risk windows,
+/// any pending event, reservation,
 /// account, venue, desired order, sequence or audit change remains compared.
 pub fn same_state_without_clock(
     left: &MultiMarketPaper,
@@ -681,6 +693,44 @@ pub fn same_state_without_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recorded_utc_window_replays_without_using_synthetic_future_time() {
+        let mut session = new(&limits()).unwrap();
+        let mut tape = executed_window();
+        tape.extend([
+            Operation::Market {
+                condition_id: id('b'),
+                start_ms: Some(300_000),
+                end_ms: Some(600_000),
+            },
+            Operation::DemoResolution {
+                condition_id: id('a'),
+                winning_outcome: "down".into(),
+                at_ms: 300_000,
+            },
+        ]);
+        replay(&mut session, &values(&tape).unwrap()).unwrap();
+        let loss = session.portfolio_snapshot().daily_loss_pico;
+        assert_ne!(loss, "0");
+        let before = session.clone();
+        let future = Operation::Advance { now_ms: 86_401_000 };
+        apply(&mut session, &future).unwrap();
+        tape.push(future);
+        assert_eq!(session.portfolio_snapshot().daily_loss_pico, loss);
+        assert_eq!(session.portfolio_snapshot().risk_day_utc, Some(0));
+        assert!(same_state_without_clock(&before, &session).unwrap());
+        let risk = Operation::RiskWindow { at_ms: 86_400_000 };
+        apply(&mut session, &risk).unwrap();
+        tape.push(risk);
+        assert_eq!(session.portfolio_snapshot().daily_loss_pico, "0");
+        assert!(!same_state_without_clock(&before, &session).unwrap());
+        let mut recovered = new(&limits()).unwrap();
+        replay(&mut recovered, &values(&tape).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&recovered).unwrap(),
+            serde_json::to_value(&session).unwrap()
+        );
+    }
     fn limits() -> Limits {
         Limits {
             initial_collateral_usd: "100".into(),

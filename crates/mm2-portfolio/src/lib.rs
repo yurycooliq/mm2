@@ -176,6 +176,10 @@ pub struct Snapshot {
     pub returned_pico: String,
     pub realized_pnl_pico: String,
     pub daily_loss_pico: String,
+    #[serde(default)]
+    pub risk_day_utc: Option<u64>,
+    #[serde(default)]
+    pub risk_clock_ms: u64,
     pub drawdown_pico: String,
     pub open_cost_pico: String,
     pub available_cash_micros: u64,
@@ -319,6 +323,20 @@ impl Portfolio {
     }
     pub fn policy(&self) -> &RiskPolicy {
         &self.policy
+    }
+
+    pub fn risk_window_due(&self, at_ms: u64) -> bool {
+        self.day != Some(at_ms / 86_400_000)
+    }
+
+    pub fn risk_clock_ms(&self) -> u64 {
+        self.last_event_ms
+    }
+
+    /// Caller-supplied UTC, persisted by the execution actor before new risk.
+    /// Advancing a day never releases reservations, old inventory or a latched halt.
+    pub fn advance_risk_window(&mut self, at_ms: u64) -> Result<()> {
+        self.advance_day(at_ms)
     }
 
     /// Admission before execution, including every retained unresolved market.
@@ -958,6 +976,8 @@ impl Portfolio {
             returned_pico: self.returned_pico.to_string(),
             realized_pnl_pico: self.realized_pnl_pico.to_string(),
             daily_loss_pico: self.daily_loss_pico.to_string(),
+            risk_day_utc: self.day,
+            risk_clock_ms: self.last_event_ms,
             drawdown_pico: self.drawdown_pico().to_string(),
             open_cost_pico: self.open_cost_pico().to_string(),
             available_cash_micros: self.available_cash_micros(),

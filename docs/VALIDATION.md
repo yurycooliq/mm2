@@ -1,5 +1,29 @@
 # Validation evidence
 
+## October 12, 2026 — paper quote ordering and UTC risk windows
+
+The actor recalculates paper quotes on the candidate after fill/cancel acknowledgements,
+venue and fee rules, immediately before applying intents. Partial inventory therefore
+cannot retain an ordinary lot from the earlier position. Cancel races keep their
+possible-fill reservations until terminal acknowledgement.
+
+An explicit journaled `risk_window` input advances the daily gross-loss window from
+caller-supplied UTC before active admission, including idle ticks. Synthetic execution
+time used to drain rollover events cannot advance that window. Legacy `advance` inputs
+retain their original accounting semantics, and a day change preserves drawdown, old
+inventory, reservations and latched halts. Late resolutions are charged at their recorded
+processing time without rewinding the risk clock. No configured limits were increased.
+
+Offline locked workspace formatting, Clippy with warnings denied, and **308 Rust tests**
+passed, including seven new regressions. The retained first R8 journal segment replays
+with its original execution/accounting under the new code; this is compatibility evidence,
+not a new forward run or economic holdout. Full stopped-journal recovery, exact-image
+container checks, selected-host installation and a fresh one-day run have separate receipts
+under `output/simulation-restart-20261012`; do not infer their completion from unit tests.
+
+The prior additional Telegram operator code is included in this release. The primary
+owner and additional allowlist must be retained when migrating from the console overlay.
+
 ## October 12, 2026 — additional Telegram operator access
 
 The optional bounded Telegram allowlist preserves the primary owner and signed
