@@ -1,5 +1,25 @@
 # Validation evidence
 
+## October 12, 2026 — additional Telegram operator access
+
+The optional bounded Telegram allowlist preserves the primary owner and signed
+Mini App authentication. Both operators receive private replies; charts go to the
+requesting chat. A pending command, including an older owner-only record, cannot
+be taken over by another operator. Session TTL, launch-data age, replay fences,
+aggregate rate limits and all execution risk limits retain their existing bounds.
+
+The local Python console suite passed **126 tests**. The existing operations suite
+passed **148 tests with 13 platform skips** on Windows. The final Linux operations
+suite passed **154 tests without skips** offline. Six console overlay tests also
+passed on Windows, covering an unchanged
+engine/proxy, exact IDs/images, safe no-op and refusal of unrelated deployments.
+These are local fixture checks; actual Telegram-client acceptance is a separate gate.
+
+The console-only recovery overlay uses an independently pinned image and never
+changes the current release, runtime secrets, active engine profile or engine
+container. Its source/profile/image gates stop applying it after an unrelated
+deployment. A later full release must carry the configured additional IDs forward.
+
 ## Simulation inventory cost and prospective loss admission: October 11, 2026
 
 R7 stopped after a partial 18-minute run at the unchanged gross realized-loss

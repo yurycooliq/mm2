@@ -67,9 +67,12 @@ class Sessions:
             self._replays[digest] = self.clock() + TELEGRAM_MAX_AGE + TELEGRAM_FUTURE_SKEW + 1
 
 
-def _telegram_identity(init_data, bot_token, owner_id, now=None):
+def _telegram_identity(init_data, bot_token, owner_id, now=None, *, allowed_ids=frozenset()):
     if not isinstance(bot_token, str) or not bot_token or type(owner_id) is not int or not 0 < owner_id < 2**52:
         raise ValueError("Telegram authentication is disabled")
+    if not isinstance(allowed_ids, frozenset) or len(allowed_ids) > 16 or any(
+            type(user_id) is not int or not 0 < user_id < 2**52 for user_id in allowed_ids):
+        raise ValueError("invalid Telegram access configuration")
     if not isinstance(init_data, str) or not 1 <= len(init_data.encode("utf-8")) <= 8192:
         raise ValueError("invalid Telegram authentication length")
     if re.search(r"%(?![0-9a-fA-F]{2})", init_data):
@@ -99,23 +102,23 @@ def _telegram_identity(init_data, bot_token, owner_id, now=None):
         return dict(pairs)
     user = json.loads(fields.get("user", "null"), object_pairs_hook=unique_object,
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite Telegram user")))
-    if not isinstance(user, dict) or type(user.get("id")) is not int or user["id"] != owner_id or user.get("is_bot") is True:
-        raise ValueError("Telegram user is not the configured owner")
+    if not isinstance(user, dict) or type(user.get("id")) is not int or user["id"] not in allowed_ids | {owner_id} or user.get("is_bot") is True:
+        raise ValueError("Telegram user is not authorized")
     return digest, age
 
 
-def validate_telegram(init_data, bot_token, owner_id, now=None):
-    digest, age = _telegram_identity(init_data, bot_token, owner_id, now)
+def validate_telegram(init_data, bot_token, owner_id, now=None, *, allowed_ids=frozenset()):
+    digest, age = _telegram_identity(init_data, bot_token, owner_id, now, allowed_ids=allowed_ids)
     if age > TELEGRAM_MAX_AGE:
         raise ValueError("Telegram authentication expired")
     return digest
 
 
-def telegram_session(sessions, existing, init_data, bot_token, owner_id, now=None):
+def telegram_session(sessions, existing, init_data, bot_token, owner_id, now=None, *, allowed_ids=frozenset()):
     # Always validate signed identity, even with a cookie: a switched owner or
     # tampered launch must revoke access at the caller. Old data can ONLY reuse
     # its original still-live bound session, never mint or extend a new one.
-    digest, age = _telegram_identity(init_data, bot_token, owner_id, now)
+    digest, age = _telegram_identity(init_data, bot_token, owner_id, now, allowed_ids=allowed_ids)
     if sessions.valid(existing, telegram_digest=digest):
         return existing
     if age > TELEGRAM_MAX_AGE:

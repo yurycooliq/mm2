@@ -111,17 +111,17 @@ class TelegramBot:
         message = update.get("message") if isinstance(update, dict) else None
         if not isinstance(message, dict):
             return None
-        owner = self.app.config.telegram_owner
         sender, chat = message.get("from", {}), message.get("chat", {})
         if not isinstance(sender, dict) or not isinstance(chat, dict) or type(sender.get("id")) is not int or type(chat.get("id")) is not int:
             return None
-        if sender.get("id") != owner or chat.get("id") != owner or chat.get("type") != "private" or sender.get("is_bot"):
+        user_id = sender["id"]
+        if user_id not in self.app.config.telegram_users or chat["id"] != user_id or chat.get("type") != "private" or sender.get("is_bot"):
             return None
         text = message.get("text", "")
         if not isinstance(text, str) or len(text) > 256:
             return None
         command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
-        result = {"chat_id": owner, "text": "Команды: /start /status /stats /active /pause /resume /kill /reset /logs"}
+        result = {"chat_id": user_id, "text": "Команды: /start /status /stats /active /pause /resume /kill /reset /logs"}
         if command in {"/start", "/status"}:
             result["text"] = self._status()
             if command == "/start" and self.app.config.miniapp_url:
@@ -158,13 +158,18 @@ class TelegramBot:
             previous = json.loads(self.app.store.get_meta("telegram_command", "null"))
             action = command[1:]
             if previous and (previous.get("update_id") == update_id or previous.get("pending")):
+                # Records from the original owner-only console have no sender_id.
+                # Another operator must never take over an uncertain command.
+                if previous.get("sender_id", self.app.config.telegram_owner) != user_id:
+                    result["text"] = "Another operator's command has an unknown outcome. That operator must reconcile the original command first."
+                    return result
                 if previous["payload"]["action"] != action:
                     result["text"] = "A prior command has an unknown outcome. Repeat that same command to reconcile its original ID and payload."
                     return result
                 payload = previous["payload"]
             else:
-                payload = {"id": f"tg-{owner}-{update_id}", "expected_version": state["command_version"], "action": action}
-                previous = {"update_id": update_id, "payload": payload, "pending": True}
+                payload = {"id": f"tg-{user_id}-{update_id}", "expected_version": state["command_version"], "action": action}
+                previous = {"update_id": update_id, "sender_id": user_id, "payload": payload, "pending": True}
                 # Persist identity before a possibly outcome-unknown request.
                 self.app.store.set_meta("telegram_command", json.dumps(previous))
             reply = self.app.proxy(payload)
@@ -238,10 +243,12 @@ class TelegramBot:
                 self.app.log("WARN", "Telegram execution notification delivery unknown; cursor retained, no blind resend")
 
     def send_reply(self, reply):
+        if type(reply.get("chat_id")) is not int or reply["chat_id"] not in self.app.config.telegram_users:
+            raise ValueError("Telegram reply recipient is not authorized")
         photo = reply.pop("_photo", None)
         self.transport.call("sendMessage", reply)
         if photo is not None and not self.stop.is_set():
-            self.transport.call("sendPhoto", {"chat_id": self.app.config.telegram_owner, "photo": photo,
+            self.transport.call("sendPhoto", {"chat_id": reply["chat_id"], "photo": photo,
                 "caption": "Стоимость депозита USD за последние 24 ч: 1 снимок/мин, оценка по best bid без глубины/комиссий. REAL и VIRTUAL разделены. Пробелы — неизвестная стоимость. История начинается с включения сбора; виртуальные сделки синтетические.",
                 "protect_content": True})
 
