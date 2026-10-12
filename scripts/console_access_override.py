@@ -61,15 +61,21 @@ def call(args, timeout=10, **kwargs):
 
 def inventory(run=call):
     rows = run(["docker", "ps", "--all", "--no-trunc", "--filter", "label=com.docker.compose.project=" + PROJECT,
-                "--filter", "label=com.docker.compose.oneoff=False", "--filter", "label!=" + GUARD_LABEL,
-                "--format", '{{.ID}} {{.Label "com.docker.compose.service"}}'])
+                "--filter", "label=com.docker.compose.oneoff=False", "--format", '{{.ID}} {{.Label "com.docker.compose.service"}}'])
     result = {}
     for row in rows.splitlines():
         cid, role = row.split()
-        if role not in ROLES or role in result or not re.fullmatch(r"[0-9a-f]{64}", cid):
+        if role not in ROLES or not re.fullmatch(r"[0-9a-f]{64}", cid):
             raise ValueError("ambiguous production inventory")
         identity = json.loads(run(["docker", "inspect", "--format",
-            '{"id":{{json .Id}},"image":{{json .Image}},"started_at":{{json .State.StartedAt}},"running":{{json .State.Running}}}', cid]))
+            '{"id":{{json .Id}},"image":{{json .Image}},"started_at":{{json .State.StartedAt}},"running":{{json .State.Running}},"name":{{json .Name}},"guard":{{json (index .Config.Labels "mm2.console-access.guard")}},"compose_hash":{{json (index .Config.Labels "com.docker.compose.config-hash")}}}', cid]))
+        if identity.get("guard"):
+            if (role != "console" or identity.get("name") != "/" + GUARD_NAME or identity["running"]
+                    or not COMMIT.fullmatch(identity["guard"]) or identity.get("compose_hash")):
+                raise ValueError("unexpected update guard in inventory")
+            continue
+        if role in result:
+            raise ValueError("ambiguous production inventory")
         result[role] = identity
     if set(result) != ROLES:
         raise ValueError("incomplete production inventory")

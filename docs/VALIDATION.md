@@ -10,7 +10,7 @@ aggregate rate limits and all execution risk limits retain their existing bounds
 
 The local Python console suite passed **126 tests**. The existing operations suite
 passed **148 tests with 13 platform skips** on Windows. The final Linux operations
-suite passed **156 tests without skips** offline. Eight console overlay tests also
+suite passed **157 tests without skips** offline. Nine console overlay tests also
 passed on Windows, covering an unchanged
 engine/proxy, exact IDs/images, safe no-op and refusal of unrelated deployments.
 These are local fixture checks; actual Telegram-client acceptance is a separate gate.

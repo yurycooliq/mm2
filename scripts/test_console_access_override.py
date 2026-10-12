@@ -127,6 +127,21 @@ class ConsoleAccessOverrideTests(unittest.TestCase):
                     overlay.cleanup_guard(self.settings, fake)
                 self.assertFalse(any("rm" in args for args in calls))
 
+    def test_inventory_ignores_only_a_valid_stopped_guard(self):
+        values = {character * 64: {**self.before[role], "name": "/fixture-" + role, "guard": "", "compose_hash": "fixture"}
+                  for role, character in (("engine", "e"), ("console", "f"), ("proxy", "c"))}
+        values["d" * 64] = {"id": "d" * 64, "image": self.settings["console_image"], "running": False,
+            "name": "/" + overlay.GUARD_NAME, "guard": self.settings["console_commit"], "compose_hash": ""}
+        rows = "\n".join(cid + " " + role for cid, role in (("e" * 64, "engine"), ("f" * 64, "console"),
+                                                          ("c" * 64, "proxy"), ("d" * 64, "console")))
+        def fake(args, **kwargs):
+            self.assertFalse(any("label!=" in item for item in args))
+            return rows if args[:2] == ["docker", "ps"] else json.dumps(values[args[-1]])
+        self.assertEqual(set(overlay.inventory(fake)), overlay.ROLES)
+        values["d" * 64]["running"] = True
+        with self.assertRaises(ValueError):
+            overlay.inventory(fake)
+
 
 if __name__ == "__main__":
     unittest.main()
