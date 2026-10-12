@@ -1,5 +1,6 @@
 """Console-only overlay safety: exact source, IDs and no engine/proxy operations."""
 import copy
+from contextlib import nullcontext
 import hashlib
 import json
 from pathlib import Path
@@ -45,7 +46,8 @@ class ConsoleAccessOverrideTests(unittest.TestCase):
         profile = Mock(); profile.read_bytes.return_value = b"profile"
         with patch.object(overlay, "Path", return_value=profile), patch.object(overlay, "private_file", side_effect=reads):
             return overlay.reconcile(self.settings, self.release, Path("runtime"), Path("overlay"),
-                                     run=self.fake_run, collect=collect, access=lambda cid, run: access or self.access)
+                                     run=self.fake_run, collect=collect, access=lambda cid, run: access or self.access,
+                                     guard=lambda settings, run: nullcontext())
 
     def test_only_console_is_recreated_and_primary_identities_are_preserved(self):
         result = self.reconcile()
@@ -61,14 +63,14 @@ class ConsoleAccessOverrideTests(unittest.TestCase):
     def test_matching_console_is_a_noop(self):
         result = self.reconcile(before=self.after)
         self.assertFalse(result["changed"])
-        self.assertEqual(self.calls, [])
+        self.assertFalse(any(args[:2] != ["docker", "ps"] for args in self.calls))
 
     def test_unrelated_engine_or_console_release_is_never_modified(self):
         for role in ("engine", "console"):
             before = copy.deepcopy(self.before)
             before[role]["image"] = "sha256:" + "f" * 64
             self.assertFalse(self.reconcile(before=before)["applicable"])
-        self.assertEqual(self.calls, [])
+        self.assertFalse(any(args[:2] != ["docker", "ps"] for args in self.calls))
 
     def test_wrong_owner_or_overlay_aborts_before_compose(self):
         for values in ({"runtime": b"MM2_TELEGRAM_OWNER_ID=99\nMM2_TELEGRAM_BOT_TOKEN=offline\n"}, {"overlay_bytes": b"{}"}):
@@ -88,6 +90,42 @@ class ConsoleAccessOverrideTests(unittest.TestCase):
             invalid = {**self.settings, key: value}
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 overlay.checked_settings(invalid)
+
+    def test_guard_is_never_started_has_no_compose_hash_and_is_removed_on_failure(self):
+        calls = []
+        def fake(args, **kwargs):
+            calls.append(args)
+            return "d" * 64 if args[:2] == ["docker", "create"] else ""
+        sleep = Mock()
+        with self.assertRaisesRegex(ValueError, "fixture failure"):
+            with overlay.update_guard(self.settings, fake, sleep):
+                raise ValueError("fixture failure")
+        sleep.assert_called_once_with(2.5)
+        self.assertEqual(calls[0][:2], ["docker", "create"])
+        self.assertIn("com.docker.compose.service=console", calls[0])
+        self.assertFalse(any("config-hash" in item for item in calls[0]))
+        self.assertNotIn("--mount", calls[0])
+        self.assertEqual(calls[-1], ["docker", "container", "rm", "d" * 64])
+        self.assertFalse(any("start" in args or "stop" in args or "pause" in args for args in calls))
+
+    def test_stale_guard_cleanup_requires_exact_owned_stopped_container(self):
+        labels = {overlay.GUARD_LABEL: self.settings["console_commit"], "com.docker.compose.project": overlay.PROJECT,
+                  "com.docker.compose.service": "console", "com.docker.compose.oneoff": "False"}
+        value = {"name": "/" + overlay.GUARD_NAME, "image": self.settings["console_image"], "running": False, "labels": labels}
+        for valid in (False, True):
+            state = copy.deepcopy(value)
+            state["running"] = not valid
+            calls = []
+            def fake(args, **kwargs):
+                calls.append(args)
+                return "d" * 64 if args[:2] == ["docker", "ps"] else json.dumps(state)
+            if valid:
+                overlay.cleanup_guard(self.settings, fake)
+                self.assertEqual(calls[-1], ["docker", "container", "rm", "d" * 64])
+            else:
+                with self.assertRaises(ValueError):
+                    overlay.cleanup_guard(self.settings, fake)
+                self.assertFalse(any("rm" in args for args in calls))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ try:
     import fcntl
 except ImportError:  # Pure validation/command-construction tests also run on Windows.
     fcntl = None
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -12,12 +13,15 @@ import re
 import stat
 import subprocess
 import sys
+import time
 
 PROJECT = "mm2-production"
 SETTINGS = Path("/etc/mm2/console-access.json")
 IMAGE = re.compile(r"sha256:[0-9a-f]{64}")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 ROLES = {"engine", "console", "proxy"}
+GUARD_LABEL = "mm2.console-access.guard"
+GUARD_NAME = "mm2-console-access-update-guard"
 
 
 def checked_settings(value):
@@ -57,7 +61,8 @@ def call(args, timeout=10, **kwargs):
 
 def inventory(run=call):
     rows = run(["docker", "ps", "--all", "--no-trunc", "--filter", "label=com.docker.compose.project=" + PROJECT,
-                "--filter", "label=com.docker.compose.oneoff=False", "--format", '{{.ID}} {{.Label "com.docker.compose.service"}}'])
+                "--filter", "label=com.docker.compose.oneoff=False", "--filter", "label!=" + GUARD_LABEL,
+                "--format", '{{.ID}} {{.Label "com.docker.compose.service"}}'])
     result = {}
     for row in rows.splitlines():
         cid, role = row.split()
@@ -78,8 +83,51 @@ def console_access(cid, run=call):
         "print(json.dumps({'owner_id':c.telegram_owner,'users':sorted(getattr(c,'telegram_users',{c.telegram_owner}))}))"]))
 
 
-def reconcile(settings, release, runtime_path, overlay_path, run=call, collect=inventory, access=console_access):
+def cleanup_guard(settings, run=call):
+    ids = run(["docker", "ps", "--all", "--no-trunc", "--filter", "label=" + GUARD_LABEL,
+               "--format", "{{.ID}}"])
+    if not ids:
+        return
+    if not re.fullmatch(r"[0-9a-f]{64}", ids):
+        raise ValueError("ambiguous console update guard")
+    value = json.loads(run(["docker", "inspect", "--format",
+        '{"name":{{json .Name}},"image":{{json .Image}},"running":{{json .State.Running}},"labels":{{json .Config.Labels}}}', ids]))
+    labels = value["labels"]
+    if (value["name"] != "/" + GUARD_NAME or value["image"] != settings["console_image"] or value["running"]
+            or labels.get(GUARD_LABEL) != settings["console_commit"]
+            or labels.get("com.docker.compose.project") != PROJECT
+            or labels.get("com.docker.compose.service") != "console"
+            or labels.get("com.docker.compose.oneoff") != "False"
+            or "com.docker.compose.config-hash" in labels):
+        raise ValueError("console update guard identity rejected")
+    run(["docker", "container", "rm", ids])
+
+
+@contextmanager
+def update_guard(settings, run=call, sleep=time.sleep):
+    # The base supervisor degrades duplicate secondaries, without suspending
+    # engine supervision. Compose lists only containers carrying config-hash;
+    # this never-started guard deliberately lacks that label. It has no mounts.
+    cid = run(["docker", "create", "--name", GUARD_NAME, "--network", "none", "--read-only",
+               "--label", "com.docker.compose.project=" + PROJECT, "--label", "com.docker.compose.service=console",
+               "--label", "com.docker.compose.oneoff=False", "--label", GUARD_LABEL + "=" + settings["console_commit"],
+               "--entrypoint", "/bin/true", settings["console_image"]])
+    if not re.fullmatch(r"[0-9a-f]{64}", cid):
+        raise ValueError("invalid console update guard ID")
+    try:
+        # The original supervisor polls once/second; allow two full polls to
+        # observe degradation and cancel any already pending recovery helper.
+        sleep(2.5)
+        yield
+    finally:
+        # No force: the guard must never have started or acquired execution.
+        run(["docker", "container", "rm", cid])
+
+
+def reconcile(settings, release, runtime_path, overlay_path, run=call, collect=inventory, access=console_access,
+              guard=update_guard):
     settings = checked_settings(settings)
+    cleanup_guard(settings, run)
     if release.resolve(strict=True).name != settings["base_commit"]:
         # A later complete deployment owns its own access configuration.
         return {"applicable": False, "reason": "base_release_changed", "engine_touched": False}
@@ -111,14 +159,15 @@ def reconcile(settings, release, runtime_path, overlay_path, run=call, collect=i
         raise ValueError("console overlay changed")
     environment = {key: value for key, value in os.environ.items() if not key.startswith("MM2_")}
     environment.update({"MM2_ENGINE_IMAGE": settings["engine_image"], "MM2_CONSOLE_IMAGE": settings["console_image"], "MM2_PROXY_IMAGE": settings["proxy_image"]})
-    run(["docker", "compose", "--project-name", PROJECT, "--project-directory", str(release),
-         "--env-file", str(runtime_path), "-f", "infra/aws/compose.yaml", "-f", str(overlay_path),
-         "up", "--detach", "--no-deps", "--no-build", "--pull", "never", "console"], timeout=35, cwd=release, env=environment)
-    after = collect(run)
-    if after["engine"] != before["engine"] or after["proxy"] != before["proxy"] or private_file(runtime_path, 16384) != runtime:
-        raise ValueError("primary identity or runtime changed during console update")
-    if after["console"]["image"] != settings["console_image"] or not after["console"]["running"] or access(after["console"]["id"], run) != desired:
-        raise ValueError("console access did not match requested IDs")
+    with guard(settings, run):
+        run(["docker", "compose", "--project-name", PROJECT, "--project-directory", str(release),
+             "--env-file", str(runtime_path), "-f", "infra/aws/compose.yaml", "-f", str(overlay_path),
+             "up", "--detach", "--no-deps", "--no-build", "--pull", "never", "console"], timeout=35, cwd=release, env=environment)
+        after = collect(run)
+        if after["engine"] != before["engine"] or after["proxy"] != before["proxy"] or private_file(runtime_path, 16384) != runtime:
+            raise ValueError("primary identity or runtime changed during console update")
+        if after["console"]["image"] != settings["console_image"] or not after["console"]["running"] or access(after["console"]["id"], run) != desired:
+            raise ValueError("console access did not match requested IDs")
     return {"applicable": True, "changed": True, "engine_touched": False, "runtime_unchanged": True,
             "before": before, "after": after, "access": desired, "console_commit": settings["console_commit"]}
 

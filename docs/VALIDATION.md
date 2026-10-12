@@ -10,10 +10,16 @@ aggregate rate limits and all execution risk limits retain their existing bounds
 
 The local Python console suite passed **126 tests**. The existing operations suite
 passed **148 tests with 13 platform skips** on Windows. The final Linux operations
-suite passed **154 tests without skips** offline. Six console overlay tests also
+suite passed **156 tests without skips** offline. Eight console overlay tests also
 passed on Windows, covering an unchanged
 engine/proxy, exact IDs/images, safe no-op and refusal of unrelated deployments.
 These are local fixture checks; actual Telegram-client acceptance is a separate gate.
+
+A real isolated Compose fixture also verified that a never-started guard container
+degrades only console recovery in the original supervisor, stays outside Compose's
+managed-container filter, and is removed after a successful replacement. This
+prevents simultaneous recovery from restoring the previous console during an update.
+The engine supervisor continues polling throughout this procedure.
 
 The console-only recovery overlay uses an independently pinned image and never
 changes the current release, runtime secrets, active engine profile or engine
