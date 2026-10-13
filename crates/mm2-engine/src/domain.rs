@@ -38,6 +38,91 @@ pub fn parse_micro(input: &str) -> Result<u64, String> {
         .ok_or_else(|| "decimal overflow".into())
 }
 
+#[cfg(test)]
+mod tick_recovery_tests {
+    use super::*;
+    #[test]
+    fn duplicate_tick_metadata_is_idempotent_without_refreshing_the_book() {
+        let mut core = Core::new(CoreConfig {
+            initial_collateral_micro: 1_000_000_000,
+            max_imbalance_micro: 10_000_000,
+            lot_micro: 5_000_000,
+            half_width_micro: 10_000,
+            max_feed_age_ms: 1000,
+        })
+        .unwrap();
+        let condition = format!("0x{}", "a".repeat(64));
+        core.set_market(Market {
+            slug: "tick-idempotency".into(),
+            condition_id: condition.clone(),
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: 100,
+            window_end_ms: 300100,
+            tick_micro: 10000,
+        })
+        .unwrap();
+        core.apply(FeedEvent::Snapshot {
+            condition_id: condition.clone(),
+            outcome: Outcome::Up,
+            exchange_ms: 101,
+            observed_mono_ms: 1,
+            bids: vec![Level {
+                price_micro: 490000,
+                quantity_micro: 5000000,
+            }],
+            asks: vec![Level {
+                price_micro: 510000,
+                quantity_micro: 5000000,
+            }],
+        })
+        .unwrap();
+        let tick = |at, old, new| FeedEvent::Tick {
+            condition_id: condition.clone(),
+            outcome: Outcome::Up,
+            exchange_ms: at,
+            observed_mono_ms: at - 100,
+            old_tick_micro: Some(old),
+            new_tick_micro: new,
+        };
+        core.apply(tick(102, 10000, 1000)).unwrap();
+        let book = core.snapshot().up_book;
+        core.apply(tick(103, 10000, 1000)).unwrap();
+        assert_eq!(core.snapshot().up_book, book);
+        assert!(core.clone().apply(tick(104, 1234, 1000)).is_err());
+        assert!(core.apply(tick(102, 10000, 1000)).is_err());
+        let mut core = Core::new(CoreConfig {
+            initial_collateral_micro: 1_000_000_000,
+            max_imbalance_micro: 10_000_000,
+            lot_micro: 5_000_000,
+            half_width_micro: 10_000,
+            max_feed_age_ms: 1000,
+        })
+        .unwrap();
+        core.set_market(Market {
+            slug: "tick-incompatible".into(),
+            condition_id: condition,
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: 100,
+            window_end_ms: 300100,
+            tick_micro: 10000,
+        })
+        .unwrap();
+        assert!(
+            core.apply(FeedEvent::Tick {
+                condition_id: format!("0x{}", "a".repeat(64)),
+                outcome: Outcome::Up,
+                exchange_ms: 101,
+                observed_mono_ms: 1,
+                old_tick_micro: Some(1000),
+                new_tick_micro: 100000
+            })
+            .is_err()
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Up,
@@ -570,7 +655,10 @@ impl Core {
                 }
                 let book = &self.books[outcome.index()];
                 if !valid_tick_micro(new_tick_micro)
-                    || old_tick_micro.is_some_and(|t| t != book.tick_micro)
+                    || old_tick_micro.is_some_and(|t| {
+                        !valid_tick_micro(t)
+                            || (t != book.tick_micro && new_tick_micro != book.tick_micro)
+                    })
                     || book.tick_exchange_ms.is_some_and(|t| exchange_ms < t)
                 {
                     return Err(self.invalid("invalid or incompatible tick transition"));

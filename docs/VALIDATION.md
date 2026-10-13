@@ -1,5 +1,35 @@
 # Validation evidence
 
+## October 13, 2026 — native snapshots after split public updates
+
+The first R11 installation remained Paused and failed its pre-Resume acceptance:
+no Resume was sent, no daily run began, and all costs/returns/reserves remained zero.
+Its complete journal and original failed-command receipts are retained separately.
+A public-only domain probe observed 17,798 events, including nine transient crossed
+updates and ten subsequent deltas after book invalidation. Those are input events,
+not fills. Normalized rejected events are retained; the full accepted tape and the
+first primary rejected frame were not captured.
+
+Split deltas are never treated as a trusted complete book. After a crossed delta,
+new quotes are inhibited until full native snapshots have re-established both books.
+Intervening deltas cannot initialize the cleared books. Actual public trade witnesses
+and possible-fill reservations retain their separate processing. The native wait is
+bounded by the unchanged 1,000 ms feed-age policy; timeout escalates to the existing
+source-generation recovery, whose repeated failures still latch a fault. Full
+snapshots remain subject to identity, clock, depth, spread and freshness admission.
+An idempotent repeat of an already-confirmed tick cannot refresh book timestamps;
+unsupported ticks, incompatible changes and regressed clocks remain errors.
+Only fixed public failure categories/details are logged.
+
+The final offline Rust check passed **326 tests**, formatting and all-target Clippy
+with warnings denied. Its source binding and subsequent exact-image/container and
+selected-host receipts belong to `output/audit-fixes-20261013-r12`. The 520 Linux
+Python checks and six TypeScript parity cases from the previous candidate cover
+unchanged Python/TypeScript source; image integration is verified again for the
+final images. A daily test exists only after its original Resume receipt and run
+identity are confirmed. Risk, capital, feed-age and journal quotas are unchanged;
+public observation and synthetic execution do not establish real profitability.
+
 ## October 13, 2026 — exact paper costs, feed recovery and observed queues
 
 New paper histories persist an `exact_accounting` version at a zero-spend

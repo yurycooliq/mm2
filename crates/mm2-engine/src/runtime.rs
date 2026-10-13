@@ -20,12 +20,37 @@ pub fn wall_ms() -> u64 {
 pub fn mono_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
+#[cfg(test)]
 fn valid_feed_prefix(core: &Core, batch: &[FeedEvent]) -> usize {
+    valid_feed_prefix_with_recovery(core, batch, None)
+}
+fn valid_feed_prefix_with_recovery(
+    core: &Core,
+    batch: &[FeedEvent],
+    mut native_snapshots: Option<[bool; 2]>,
+) -> usize {
     let mut checked = core.clone();
-    batch
-        .iter()
-        .take_while(|event| checked.apply((*event).clone()).is_ok())
-        .count()
+    for (index, event) in batch.iter().enumerate() {
+        if native_snapshots.is_some() && matches!(event, FeedEvent::Delta { .. }) {
+            continue;
+        }
+        if checked.apply(event.clone()).is_err() {
+            return index;
+        }
+        match event {
+            FeedEvent::Snapshot { outcome, .. } => {
+                if let Some(seen) = &mut native_snapshots {
+                    seen[usize::from(*outcome == crate::domain::Outcome::Down)] = true;
+                    if seen.iter().all(|seen| *seen) {
+                        native_snapshots = None;
+                    }
+                }
+            }
+            FeedEvent::Disconnect { .. } => native_snapshots = None,
+            _ => {}
+        }
+    }
+    batch.len()
 }
 pub fn mode_name(mode: Mode) -> &'static str {
     match mode {
@@ -209,6 +234,7 @@ pub struct Actor {
     simulation_books: [(u64, u64); 2],
     simulation_depth: [Vec<mm2_emulator::Level>; 2],
     source_refresh_failures: VecDeque<Instant>,
+    native_snapshot_recovery: Option<(Instant, [bool; 2])>,
     execution_noop_ticks: u64,
     execution_periodic_overruns: u64,
     execution_feed_batches: u64,
@@ -244,6 +270,7 @@ struct Publication {
     source_status: Value,
     fee_check: Value,
     awaiting_source_refresh: bool,
+    awaiting_native_snapshots: bool,
     fatal: Option<String>,
     committing: bool,
     closing: bool,
@@ -401,6 +428,7 @@ pub fn prepare(
         simulation_books: [(0, 0); 2],
         simulation_depth: [Vec::new(), Vec::new()],
         source_refresh_failures: VecDeque::new(),
+        native_snapshot_recovery: None,
         execution_noop_ticks: 0,
         execution_periodic_overruns: 0,
         execution_feed_batches: 0,
@@ -701,7 +729,8 @@ impl Actor {
             && live.snapshot().phase == mm2_live::LivePhase::Running
             && self.fatal.is_none()
             && !self.closing
-            && !self.awaiting_source_refresh;
+            && !self.awaiting_source_refresh
+            && self.native_snapshot_recovery.is_none();
         let quotes = if active {
             snapshot.market.as_ref().map_or_else(Vec::new, |market| {
                 self.live_quotes
@@ -758,6 +787,7 @@ impl Actor {
             source_status: self.source_status.clone(),
             fee_check: self.fee_check(wall_ms()),
             awaiting_source_refresh: self.awaiting_source_refresh,
+            awaiting_native_snapshots: self.native_snapshot_recovery.is_some(),
             fatal: self.fatal.clone(),
             committing: self.committing,
             closing: self.closing,
@@ -1291,51 +1321,114 @@ impl Actor {
         self.condition = Some(market.condition_id);
         self.observation_barrier = Some(mono_ms(self.start));
         self.awaiting_source_refresh = false;
+        self.native_snapshot_recovery = None;
         self.evaluate();
         self.publish();
         Ok(())
     }
     fn apply_feed_event(&mut self, event: FeedEvent) -> bool {
         self.feed_events = self.feed_events.saturating_add(1);
+        let delta = matches!(&event, FeedEvent::Delta { .. });
+        if delta && self.native_snapshot_recovery.is_some() {
+            // A split price update must not initialize a cleared book. Wait for
+            // independently validated full native snapshots; trades still flow.
+            return true;
+        }
+        let snapshot_outcome = match &event {
+            FeedEvent::Snapshot { outcome, .. } => {
+                Some(usize::from(*outcome == crate::domain::Outcome::Down))
+            }
+            FeedEvent::Disconnect { .. } => {
+                self.native_snapshot_recovery = None;
+                None
+            }
+            _ => None,
+        };
         if let Err(error) = self.core.apply(event)
             && self.source == "public"
         {
-            // Join the old source generation before accepting a new snapshot. This
-            // is an internal refresh, not an owner Reset/Resume or a risk reset.
-            let _ = self.core.apply(FeedEvent::Disconnect {
-                source: crate::domain::FeedSource::Clob,
-                reason: "book validation requires source refresh".into(),
-            });
-            let now = Instant::now();
-            while self
-                .source_refresh_failures
-                .front()
-                .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
-            {
-                self.source_refresh_failures.pop_front();
+            if delta && error == "crossed or oversized batch result" {
+                // Public updates can add a new best price before removing the
+                // opposite old price in a separate frame. Never trade that
+                // intermediate book, or infer an atomic cross-frame ordering.
+                self.native_snapshot_recovery = Some((Instant::now(), [false; 2]));
+                self.observation_barrier = Some(mono_ms(self.start));
+                self.simulation_books = [(0, 0); 2];
+                self.simulation_depth = [Vec::new(), Vec::new()];
+                tracing::warn!(
+                    validation_detail = "crossed_or_oversized_delta",
+                    "public book waiting for native snapshots"
+                );
+                self.source_status = json!({"phase":"resynchronizing","message":"waiting for validated full native books","validation_detail":"crossed_or_oversized_delta","at_ms":wall_ms()});
+                self.evaluate();
+                self.drive_live();
+                self.publish();
+                return false;
             }
-            self.source_refresh_failures.push_back(now);
-            self.awaiting_source_refresh = true;
-            self.observation_barrier = Some(mono_ms(self.start));
-            self.simulation_books = [(0, 0); 2];
-            self.simulation_depth = [Vec::new(), Vec::new()];
-            let class = crate::feeds::input_failure_class(&error);
-            tracing::warn!(
-                validation_class = class,
-                "public input validation requested source refresh"
-            );
-            self.source_status = json!({"phase":"refreshing","message":"book validation requires fresh source snapshots","validation_class":class,"at_ms":wall_ms()});
-            if self.source_refresh_failures.len() >= 3 {
-                self.latch("repeated public input validation failure; inspection required".into());
-            }
-            self.evaluate();
-            self.drive_live();
-            self.publish();
+            self.refresh_after_validation_failure(&error);
             return false;
+        }
+        if let (Some(outcome), Some((_, seen))) =
+            (snapshot_outcome, &mut self.native_snapshot_recovery)
+        {
+            seen[outcome] = true;
+            if seen.iter().all(|seen| *seen) {
+                self.native_snapshot_recovery = None;
+                tracing::info!(
+                    "native book snapshots restored; freshness admission still required"
+                );
+                self.source_status = json!({"phase":"streaming","message":"validated native books restored; freshness admission still required","at_ms":wall_ms()});
+            }
         }
         self.evaluate();
         self.drive_live();
         true
+    }
+    fn expire_native_snapshot_recovery(&mut self) {
+        let maximum = Duration::from_millis(self.core.snapshot().config.max_feed_age_ms);
+        if self
+            .native_snapshot_recovery
+            .is_some_and(|(started, _)| started.elapsed() >= maximum)
+        {
+            self.native_snapshot_recovery = None;
+            self.refresh_after_validation_failure("native snapshot recovery deadline exceeded");
+        }
+    }
+    fn refresh_after_validation_failure(&mut self, error: &str) {
+        self.native_snapshot_recovery = None;
+        // Join the old source generation before accepting a new snapshot. This
+        // is an internal refresh, not an owner Reset/Resume or a risk reset.
+        let _ = self.core.apply(FeedEvent::Disconnect {
+            source: crate::domain::FeedSource::Clob,
+            reason: "book validation requires source refresh".into(),
+        });
+        let now = Instant::now();
+        while self
+            .source_refresh_failures
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
+        {
+            self.source_refresh_failures.pop_front();
+        }
+        self.source_refresh_failures.push_back(now);
+        self.awaiting_source_refresh = true;
+        self.observation_barrier = Some(mono_ms(self.start));
+        self.simulation_books = [(0, 0); 2];
+        self.simulation_depth = [Vec::new(), Vec::new()];
+        let class = crate::feeds::input_failure_class(error);
+        let detail = crate::feeds::input_failure_detail(error);
+        tracing::warn!(
+            validation_class = class,
+            validation_detail = detail,
+            "public input validation requested source refresh"
+        );
+        self.source_status = json!({"phase":"refreshing","message":"book validation requires fresh source snapshots","validation_class":class,"validation_detail":detail,"at_ms":wall_ms()});
+        if self.source_refresh_failures.len() >= 3 {
+            self.latch("repeated public input validation failure; inspection required".into());
+        }
+        self.evaluate();
+        self.drive_live();
+        self.publish();
     }
     async fn observed_trades(&mut self, events: &[FeedEvent]) {
         let Some(session) = &self.simulation else {
@@ -1594,6 +1687,7 @@ impl Actor {
             let _ = self.core.control(Action::Pause);
         }
         if resets {
+            self.native_snapshot_recovery = None;
             self.reset_epoch += 1;
             self.observation_barrier = Some(mono_ms(self.start));
             // Public Reset requires the source owner to join its old socket and acknowledge
@@ -1664,6 +1758,7 @@ impl Actor {
                 }
                 _ = timer.tick() => {
                     let began = tokio::time::Instant::now();
+                    self.expire_native_snapshot_recovery();
                     self.evaluate(); self.drive_live(); self.simulation_step(false).await;
                     #[cfg(test)]
                     tokio::time::sleep(self.timer_work_delay).await;
@@ -1696,7 +1791,7 @@ impl Actor {
                             self.execution_feed_batches = self.execution_feed_batches.saturating_add(1);
                             // Never execute a trade in the suffix of a batch whose
                             // preceding book update failed validation.
-                            let valid_prefix = valid_feed_prefix(&self.core, &batch);
+                            let valid_prefix = valid_feed_prefix_with_recovery(&self.core, &batch, self.native_snapshot_recovery.map(|(_,seen)|seen));
                             self.observed_trades(&batch[..valid_prefix]).await;
                             // A fault/stop received during sync must inhibit effects before
                             // processing the next input, even though this batch is durable.
@@ -1753,6 +1848,7 @@ impl Publication {
             && !self.committing
             && !self.closing
             && !self.awaiting_source_refresh
+            && !self.awaiting_native_snapshots
         {
             self.desired_quotes
                 .iter()
@@ -1767,6 +1863,7 @@ impl Publication {
         let now = self.now;
         let mono = self.mono;
         let feed_ready = !self.awaiting_source_refresh
+            && !self.awaiting_native_snapshots
             && snapshot
                 .market
                 .as_ref()
@@ -1832,6 +1929,7 @@ impl Publication {
             "decision_ns_p50":percentile(50),"decision_ns_p99":if ordered.len()>=1000 {percentile(99)} else {None},
             "measurement":"core and strategy evaluation; excludes transport, parsing, queue wait, execution durability and snapshot publication"});
         let diagnostics = json!({
+            "awaiting_native_snapshots":self.awaiting_native_snapshots,
             "paper_resolution":self.paper_resolution.or_else(||self.paper.as_ref().map(|paper|paper["paper_resolution"].clone())),
             "fee_check":self.fee_check,
             "feed_diagnostics":self.feed_diagnostics,
@@ -1983,17 +2081,18 @@ mod tests {
                 quantity_micro: 10_000_000,
             }],
         };
-        let adverse = || FeedEvent::Delta {
+        let adverse = || FeedEvent::Snapshot {
             condition_id: market.condition_id.clone(),
+            outcome: Outcome::Up,
             exchange_ms: now + 1,
             observed_mono_ms: 2,
-            changes: vec![crate::domain::Change {
-                outcome: Outcome::Up,
-                side: crate::domain::BookSide::Bid,
-                level: crate::domain::Level {
-                    price_micro: 520_000,
-                    quantity_micro: 1_000_000,
-                },
+            bids: vec![crate::domain::Level {
+                price_micro: 520_000,
+                quantity_micro: 1_000_000,
+            }],
+            asks: vec![crate::domain::Level {
+                price_micro: 510_000,
+                quantity_micro: 1_000_000,
             }],
         };
         for attempt in 0..3 {
@@ -2034,6 +2133,105 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn split_delta_waits_for_both_native_books_without_owner_or_finance_reset() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = batch_config(directory.path());
+        let (_tx, rx) = mpsc::channel(16);
+        let (_fault, fault) = watch::channel(None);
+        let (_stop, shutdown) = watch::channel(false);
+        let (handle, mut actor) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+        let now = wall_ms();
+        let market = Market {
+            slug: "split-public-update".into(),
+            condition_id: format!("0x{}", "a".repeat(64)),
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: now - 1000,
+            window_end_ms: now + 299_000,
+            tick_micro: 10_000,
+        };
+        actor.select_market(market.clone()).await.unwrap();
+        actor.core.control(Action::Resume).unwrap();
+        let finance = actor.simulation.as_ref().unwrap().portfolio_snapshot();
+        let seed = |outcome, at| FeedEvent::Snapshot {
+            condition_id: market.condition_id.clone(),
+            outcome,
+            exchange_ms: now,
+            observed_mono_ms: at,
+            bids: vec![crate::domain::Level {
+                price_micro: 490_000,
+                quantity_micro: 10_000_000,
+            }],
+            asks: vec![crate::domain::Level {
+                price_micro: 510_000,
+                quantity_micro: 10_000_000,
+            }],
+        };
+        actor.core.apply(seed(Outcome::Up, 1)).unwrap();
+        actor.core.apply(seed(Outcome::Down, 1)).unwrap();
+        let crossed = FeedEvent::Delta {
+            condition_id: market.condition_id.clone(),
+            exchange_ms: now + 1,
+            observed_mono_ms: 2,
+            changes: vec![crate::domain::Change {
+                outcome: Outcome::Up,
+                side: crate::domain::BookSide::Bid,
+                level: crate::domain::Level {
+                    price_micro: 510_000,
+                    quantity_micro: 5_000_000,
+                },
+            }],
+        };
+        assert!(!actor.apply_feed_event(crossed.clone()));
+        assert!(actor.native_snapshot_recovery.is_some());
+        assert!(!actor.awaiting_source_refresh && actor.source_refresh_failures.is_empty());
+        let recovering = actor.publication().render();
+        assert_eq!(recovering["awaiting_native_snapshots"], true);
+        assert_eq!(recovering["feed_ready"], false);
+        assert!(recovering["shadow_intents"].as_array().unwrap().is_empty());
+        let batch = [
+            crossed.clone(),
+            seed(Outcome::Up, 3),
+            seed(Outcome::Down, 3),
+            crossed.clone(),
+        ];
+        assert_eq!(
+            valid_feed_prefix_with_recovery(&actor.core, &batch, Some([false; 2])),
+            3
+        );
+        assert!(actor.apply_feed_event(crossed.clone()));
+        assert!(actor.apply_feed_event(seed(Outcome::Up, 3)));
+        assert!(actor.native_snapshot_recovery.is_some());
+        assert!(actor.apply_feed_event(seed(Outcome::Down, 3)));
+        assert!(actor.native_snapshot_recovery.is_none());
+        assert!(!actor.awaiting_source_refresh && actor.source_refresh_failures.is_empty());
+        assert_eq!(
+            actor.simulation.as_ref().unwrap().portfolio_snapshot(),
+            finance
+        );
+        assert_eq!(actor.version, 0);
+        assert_eq!(actor.reset_epoch, 0);
+        let mut next_crossed = crossed;
+        if let FeedEvent::Delta {
+            observed_mono_ms, ..
+        } = &mut next_crossed
+        {
+            *observed_mono_ms = 4;
+        }
+        assert!(!actor.apply_feed_event(next_crossed));
+        actor.native_snapshot_recovery.as_mut().unwrap().0 =
+            Instant::now() - Duration::from_millis(config.limits.max_feed_age_ms + 1);
+        actor.expire_native_snapshot_recovery();
+        assert!(actor.awaiting_source_refresh && actor.native_snapshot_recovery.is_none());
+        assert_eq!(actor.source_refresh_failures.len(), 1);
+        assert_eq!(handle.state.borrow()["command_version"], 0);
+        assert_eq!(
+            actor.simulation.as_ref().unwrap().portfolio_snapshot(),
+            finance
+        );
     }
 
     fn batch_config(directory: &std::path::Path) -> Config {
