@@ -1,5 +1,31 @@
 # Validation evidence
 
+## October 13, 2026 — preserve queued native recovery
+
+R12 stopped after about 29 minutes with a confirmed protective Pause; it did not
+complete a day. Its original failure sequence contained a native snapshot timeout
+and two clock validation failures. The rejected frames and exact clock subtype
+were not retained. A new isolated Paused public probe reproduced a native timeout;
+it subsequently stopped on bounded feed backpressure while local checks were
+running. That observation does not identify the old clock subtype.
+
+A deterministic regression exposes a concrete recovery defect: the first split
+crossed delta stopped the bounded batch, discarding already queued native books.
+Its processing-time barrier also discarded valid later inputs from the same
+source generation. The repair keeps that FIFO batch and independent trade
+witnesses, skips intermediate deltas, and inhibits new quotes until both native
+books are validated. Genuine invalid input still cuts its suffix; the original
+source-generation barrier, 1,000 ms native deadline and three-failure guard remain.
+Clock failures now retain distinct fixed public receive/exchange details and
+bounded prior clock values, without raw provider content or credentials.
+
+The old source fails the new queued-recovery regression. The repaired source
+passes **327 Rust tests**, formatting and all-target Clippy with warnings denied,
+including trade-witness retention during recovery. Exact image, stopped-copy
+replay, selected-host installation and the new daily run have separate receipts
+under `output/feed-recovery-fix-20261013-r13`; this check is not a completed day.
+Strategy, capital, loss, drawdown, feed-age and journal limits are unchanged.
+
 ## October 13, 2026 — native snapshots after split public updates
 
 The first R11 installation remained Paused and failed its pre-Resume acceptance:

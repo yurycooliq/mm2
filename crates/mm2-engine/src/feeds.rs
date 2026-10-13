@@ -424,6 +424,8 @@ pub fn input_failure_detail(reason: &str) -> &'static str {
         "delta before snapshot or invalid price" => "delta_without_snapshot_or_invalid_price",
         "invalid or incompatible tick transition" => "incompatible_tick_transition",
         "native snapshot recovery deadline exceeded" => "native_snapshot_timeout",
+        "CLOB receive clock regressed" => "clob_receive_clock_regressed",
+        "CLOB exchange clock regressed" => "clob_exchange_clock_regressed",
         "zero trade quantity" => "zero_trade_quantity",
         "unsupported CLOB event type" => "unsupported_clob_event_type",
         "invalid CLOB JSON" => "invalid_clob_json",
@@ -445,6 +447,29 @@ pub fn input_failure_detail(reason: &str) -> &'static str {
         "feed backpressure deadline exceeded" => "feed_backpressure_timeout",
         "feed consumer closed" => "feed_consumer_closed",
         _ => "unclassified_feed_failure",
+    }
+}
+
+#[cfg(test)]
+mod clock_detail_tests {
+    #[test]
+    fn clock_failures_have_distinct_fixed_public_details() {
+        assert_eq!(
+            super::input_failure_class("CLOB receive clock regressed"),
+            "invalid_exchange_clock"
+        );
+        assert_eq!(
+            super::input_failure_detail("CLOB receive clock regressed"),
+            "clob_receive_clock_regressed"
+        );
+        assert_eq!(
+            super::input_failure_detail("CLOB exchange clock regressed"),
+            "clob_exchange_clock_regressed"
+        );
+        assert_eq!(
+            super::input_failure_detail("provider payload must not be echoed"),
+            "unclassified_feed_failure"
+        );
     }
 }
 

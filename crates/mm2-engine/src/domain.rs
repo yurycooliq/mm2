@@ -89,6 +89,13 @@ mod tick_recovery_tests {
         let book = core.snapshot().up_book;
         core.apply(tick(103, 10000, 1000)).unwrap();
         assert_eq!(core.snapshot().up_book, book);
+        let context = core.feed_clock_context(&tick(102, 10000, 1000)).unwrap();
+        assert_eq!(context.event_kind, "tick");
+        assert_eq!(context.previous_receive_ms, Some(3));
+        assert_eq!(context.book_exchange_ms, [Some(101), None]);
+        assert_eq!(context.tick_exchange_ms, [Some(103), None]);
+        assert_eq!(context.exchange_ms, 102);
+        assert_eq!(context.observed_mono_ms, 2);
         assert!(core.clone().apply(tick(104, 1234, 1000)).is_err());
         assert!(core.apply(tick(102, 10000, 1000)).is_err());
         let mut core = Core::new(CoreConfig {
@@ -214,6 +221,16 @@ pub enum FeedEvent {
         source: FeedSource,
         reason: String,
     },
+}
+/// Bounded public clocks only; never carries provider payloads or credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct FeedClockContext {
+    pub event_kind: &'static str,
+    pub exchange_ms: u64,
+    pub observed_mono_ms: u64,
+    pub previous_receive_ms: Option<u64>,
+    pub book_exchange_ms: [Option<u64>; 2],
+    pub tick_exchange_ms: [Option<u64>; 2],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -495,6 +512,34 @@ impl Core {
             }
         }
         Ok(())
+    }
+    pub fn feed_clock_context(&self, event: &FeedEvent) -> Option<FeedClockContext> {
+        let (event_kind, exchange_ms, observed_mono_ms) = match event {
+            FeedEvent::Snapshot {
+                exchange_ms,
+                observed_mono_ms,
+                ..
+            } => ("snapshot", *exchange_ms, *observed_mono_ms),
+            FeedEvent::Delta {
+                exchange_ms,
+                observed_mono_ms,
+                ..
+            } => ("delta", *exchange_ms, *observed_mono_ms),
+            FeedEvent::Tick {
+                exchange_ms,
+                observed_mono_ms,
+                ..
+            } => ("tick", *exchange_ms, *observed_mono_ms),
+            _ => return None,
+        };
+        Some(FeedClockContext {
+            event_kind,
+            exchange_ms,
+            observed_mono_ms,
+            previous_receive_ms: self.last_clob_mono_ms,
+            book_exchange_ms: self.books.each_ref().map(|book| book.exchange_ms),
+            tick_exchange_ms: self.books.each_ref().map(|book| book.tick_exchange_ms),
+        })
     }
     fn accept_clob_clock(
         &self,

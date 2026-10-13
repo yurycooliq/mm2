@@ -20,9 +20,12 @@ pub fn wall_ms() -> u64 {
 pub fn mono_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
-#[cfg(test)]
 fn valid_feed_prefix(core: &Core, batch: &[FeedEvent]) -> usize {
-    valid_feed_prefix_with_recovery(core, batch, None)
+    let mut checked = core.clone();
+    batch
+        .iter()
+        .position(|event| checked.apply(event.clone()).is_err())
+        .unwrap_or(batch.len())
 }
 fn valid_feed_prefix_with_recovery(
     core: &Core,
@@ -34,7 +37,13 @@ fn valid_feed_prefix_with_recovery(
         if native_snapshots.is_some() && matches!(event, FeedEvent::Delta { .. }) {
             continue;
         }
-        if checked.apply(event.clone()).is_err() {
+        if let Err(error) = checked.apply(event.clone()) {
+            if matches!(event, FeedEvent::Delta { .. })
+                && error == "crossed or oversized batch result"
+            {
+                native_snapshots = Some([false; 2]);
+                continue;
+            }
             return index;
         }
         match event {
@@ -1344,15 +1353,25 @@ impl Actor {
             }
             _ => None,
         };
+        let clock_context = self.core.feed_clock_context(&event);
         if let Err(error) = self.core.apply(event)
             && self.source == "public"
         {
+            if error == "CLOB receive clock regressed" || error == "CLOB exchange clock regressed" {
+                tracing::warn!(
+                    validation_detail = crate::feeds::input_failure_detail(&error),
+                    clock_context = ?clock_context,
+                    "public clock validation failed"
+                );
+            }
             if delta && error == "crossed or oversized batch result" {
                 // Public updates can add a new best price before removing the
                 // opposite old price in a separate frame. Never trade that
                 // intermediate book, or infer an atomic cross-frame ordering.
                 self.native_snapshot_recovery = Some((Instant::now(), [false; 2]));
-                self.observation_barrier = Some(mono_ms(self.start));
+                // This is the same FIFO source generation. A processing-time
+                // barrier would discard already queued recovery snapshots and
+                // trade witnesses, although they arrived after the split delta.
                 self.simulation_books = [(0, 0); 2];
                 self.simulation_depth = [Vec::new(), Vec::new()];
                 tracing::warn!(
@@ -1363,7 +1382,9 @@ impl Actor {
                 self.evaluate();
                 self.drive_live();
                 self.publish();
-                return false;
+                // Keep the rest of this bounded batch: it may already contain
+                // both native snapshots. Admission remains blocked until then.
+                return true;
             }
             self.refresh_after_validation_failure(&error);
             return false;
@@ -1789,9 +1810,12 @@ impl Actor {
                                 !self.observation_barrier.is_some_and(|barrier| observed.is_some_and(|rx|rx<=barrier))
                             });
                             self.execution_feed_batches = self.execution_feed_batches.saturating_add(1);
-                            // Never execute a trade in the suffix of a batch whose
-                            // preceding book update failed validation.
-                            let valid_prefix = valid_feed_prefix_with_recovery(&self.core, &batch, self.native_snapshot_recovery.map(|(_,seen)|seen));
+                            // Genuine invalid input cuts the suffix. A recoverable
+                            // split delta blocks quote admission while preserving
+                            // independently validated trade witnesses and native books.
+                            let valid_prefix = if self.source == "public" {
+                                valid_feed_prefix_with_recovery(&self.core, &batch, self.native_snapshot_recovery.map(|(_,seen)|seen))
+                            } else { valid_feed_prefix(&self.core, &batch) };
                             self.observed_trades(&batch[..valid_prefix]).await;
                             // A fault/stop received during sync must inhibit effects before
                             // processing the next input, even though this batch is durable.
@@ -2136,7 +2160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_delta_waits_for_both_native_books_without_owner_or_finance_reset() {
+    async fn split_delta_preserves_queued_native_recovery_and_source_clock_barrier() {
         let directory = tempfile::tempdir().unwrap();
         let config = batch_config(directory.path());
         let (_tx, rx) = mpsc::channel(16);
@@ -2159,7 +2183,7 @@ mod tests {
         let seed = |outcome, at| FeedEvent::Snapshot {
             condition_id: market.condition_id.clone(),
             outcome,
-            exchange_ms: now,
+            exchange_ms: now + at,
             observed_mono_ms: at,
             bids: vec![crate::domain::Level {
                 price_micro: 490_000,
@@ -2170,12 +2194,10 @@ mod tests {
                 quantity_micro: 10_000_000,
             }],
         };
-        actor.core.apply(seed(Outcome::Up, 1)).unwrap();
-        actor.core.apply(seed(Outcome::Down, 1)).unwrap();
-        let crossed = FeedEvent::Delta {
+        let crossed = |at| FeedEvent::Delta {
             condition_id: market.condition_id.clone(),
-            exchange_ms: now + 1,
-            observed_mono_ms: 2,
+            exchange_ms: now + at,
+            observed_mono_ms: at,
             changes: vec![crate::domain::Change {
                 outcome: Outcome::Up,
                 side: crate::domain::BookSide::Bid,
@@ -2185,43 +2207,68 @@ mod tests {
                 },
             }],
         };
-        assert!(!actor.apply_feed_event(crossed.clone()));
+        actor.core.apply(seed(Outcome::Up, 1)).unwrap();
+        actor.core.apply(seed(Outcome::Down, 1)).unwrap();
+        let print = FeedEvent::Trade {
+            condition_id: market.condition_id.clone(),
+            outcome: Outcome::Up,
+            exchange_ms: now,
+            observed_mono_ms: 0,
+            price_micro: 490_000,
+            quantity_micro: 5_000_000,
+            fingerprint: "f".repeat(64),
+        };
+        let queued = [
+            crossed(2),
+            print.clone(),
+            seed(Outcome::Up, 3),
+            seed(Outcome::Down, 3),
+        ];
+        assert_eq!(valid_feed_prefix(&actor.core, &queued), 0);
+        assert_eq!(
+            valid_feed_prefix_with_recovery(&actor.core, &queued, None),
+            queued.len()
+        );
+        let barrier = actor.observation_barrier;
+        assert!(actor.apply_feed_event(queued[0].clone()));
         assert!(actor.native_snapshot_recovery.is_some());
-        assert!(!actor.awaiting_source_refresh && actor.source_refresh_failures.is_empty());
+        assert_eq!(actor.observation_barrier, barrier);
         let recovering = actor.publication().render();
         assert_eq!(recovering["awaiting_native_snapshots"], true);
         assert_eq!(recovering["feed_ready"], false);
         assert!(recovering["shadow_intents"].as_array().unwrap().is_empty());
-        let batch = [
-            crossed.clone(),
-            seed(Outcome::Up, 3),
-            seed(Outcome::Down, 3),
-            crossed.clone(),
-        ];
-        assert_eq!(
-            valid_feed_prefix_with_recovery(&actor.core, &batch, Some([false; 2])),
-            3
+        assert!(actor.apply_feed_event(crossed(2))); // still waiting: a delta cannot initialize
+        actor.observed_trades(&queued).await;
+        assert!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .has_public_trade(&"f".repeat(64))
         );
-        assert!(actor.apply_feed_event(crossed.clone()));
-        assert!(actor.apply_feed_event(seed(Outcome::Up, 3)));
+        assert!(actor.apply_feed_event(print));
+        assert!(actor.apply_feed_event(queued[2].clone()));
         assert!(actor.native_snapshot_recovery.is_some());
-        assert!(actor.apply_feed_event(seed(Outcome::Down, 3)));
+        assert!(actor.apply_feed_event(queued[3].clone()));
         assert!(actor.native_snapshot_recovery.is_none());
         assert!(!actor.awaiting_source_refresh && actor.source_refresh_failures.is_empty());
+        assert_eq!(actor.observation_barrier, barrier);
         assert_eq!(
             actor.simulation.as_ref().unwrap().portfolio_snapshot(),
             finance
         );
         assert_eq!(actor.version, 0);
         assert_eq!(actor.reset_epoch, 0);
-        let mut next_crossed = crossed;
-        if let FeedEvent::Delta {
-            observed_mono_ms, ..
-        } = &mut next_crossed
-        {
-            *observed_mono_ms = 4;
+        // Genuine invalid input still cuts its trade suffix and requests a refresh.
+        let mut invalid = seed(Outcome::Up, 4);
+        if let FeedEvent::Snapshot { bids, .. } = &mut invalid {
+            bids[0].price_micro = 520_000;
         }
-        assert!(!actor.apply_feed_event(next_crossed));
+        assert_eq!(
+            valid_feed_prefix_with_recovery(&actor.core, &[invalid], None),
+            0
+        );
+        assert!(actor.apply_feed_event(crossed(4)));
         actor.native_snapshot_recovery.as_mut().unwrap().0 =
             Instant::now() - Duration::from_millis(config.limits.max_feed_age_ms + 1);
         actor.expire_native_snapshot_recovery();
