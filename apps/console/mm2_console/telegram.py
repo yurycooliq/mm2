@@ -6,7 +6,7 @@ import time
 from urllib.request import build_opener, HTTPSHandler, Request
 
 from .engine import NoRedirect, redact
-from .observability import execution_summary
+from .observability import execution_summary, money
 from .telegram_reports import active_text, deposit_chart, notification_delta, stats_text
 
 
@@ -92,6 +92,33 @@ class TelegramBot:
         if paper["selected"]:
             lines.append(f"VIRTUAL simulation: {paper['phase'] or 'unknown'}{' | cached' if paper['last_sample_only'] else ''}")
             lines.append(f"VIRTUAL funds USD: global cash {paper['cash_usd'] or 'unknown'} | current market available {paper['available_usd'] or 'unknown'} | reserved {paper['reserved_usd'] or 'unknown'}")
+            gate = state.get("strategy_gate")
+            waiting = {"inventory_dust": "остаток меньше минимальной заявки",
+                       "inventory_cost": "стоимость позиции или её точность не допускает новую заявку",
+                       "loss_budget": "недостаточно бюджета риска с учётом позиций и возможных исполнений",
+                       "invalid_book": "нет полной допустимой книги",
+                       "stale_book": "устарели рыночные данные",
+                       "close_guard": "приближается закрытие рынка"}
+            orders = (state.get("simulation") or {}).get("orders")
+            working = sum(item.get("phase") == "live" for item in orders if isinstance(item, dict)) if isinstance(orders, list) else None
+            if not envelope["connected"]:
+                reason = "текущий статус неизвестен: снимок устарел"
+            elif state.get("mode") in {"paused", "killed"}:
+                reason = "пауза" if state["mode"] == "paused" else "аварийная блокировка"
+            elif state.get("awaiting_source_refresh"):
+                reason = "восстанавливаются рыночные данные"
+            else:
+                reason = waiting.get(gate, "есть рабочие заявки" if working else "ожидание допустимых заявок")
+            lines.append(f"Виртуальный контур: {reason}; рабочих заявок: {working if working is not None else 'неизвестно'}")
+            resolution = state.get("paper_resolution") or {}
+            policy = resolution.get("risk_policy") or {}
+            portfolio = state.get("paper_portfolio") or {}
+            limit, loss = policy.get("max_daily_loss_micros"), portfolio.get("daily_loss_pico")
+            remaining = None
+            if (envelope["connected"] and resolution.get("execution_costs") == "exact_per_outcome"
+                    and type(limit) is int and 0 <= limit < 2**64 and money(loss, 10**12) is not None):
+                remaining = money(max(0, limit * 10**6 - int(loss)), 10**12)
+            lines.append(f"Остаток дневного бюджета USD до учёта открытого риска: {remaining if remaining is not None else 'неизвестен'}")
         lines.append("Economic PnL: unknown.")
         if journal["used_bytes"] is not None:
             lines.append(f"Engine journal: {journal['used_bytes']} / {journal['limit_bytes'] if journal['limit_bytes'] is not None else 'unknown'} bytes | {journal['stage']}")

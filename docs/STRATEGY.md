@@ -1,5 +1,15 @@
 # Strategy and market portfolio contract
 
+New simulation histories use exact per-outcome BUY costs. Legacy aggregate
+histories replay unchanged and cannot authorize new risk while their side basis
+is uncertain. Public execution uses versioned observed depth at relevant order
+prices, conservative cancellation priority and single-price trade prints; its
+fills remain hypothetical. A sub-minimum residual can retain an already-live
+legal opposite order under the same pair-cost, inventory and loss bounds. No new
+lot is posted just to bypass dust, and cancel-in-flight quantities stay reserved.
+Confirmed fills and terminal cancels cannot automatically post another paper lot;
+the next explicit quote operation must first pass the updated risk checks.
+
 `mm2-strategy` and `mm2-portfolio` are deterministic Rust libraries without I/O, UI,
 wall-clock access, floats, databases or network clients. The caller supplies the
 clock, market identity, current tick/minimum, observed books and authenticated

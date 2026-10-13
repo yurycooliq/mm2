@@ -23,6 +23,11 @@ pub struct MultiMarketPaper {
     last_public_resolution_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_public_resolution: Option<crate::paper_resolution::Evidence>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    exact_execution_costs: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl Deref for MultiMarketPaper {
     type Target = PaperSession;
@@ -59,6 +64,8 @@ impl MultiMarketPaper {
     pub(crate) fn resolution_status(&self) -> serde_json::Value {
         serde_json::json!({"accounting":"synthetic_redemption_from_finalized_public_ctf_outcome",
             "completed":self.public_resolution_count,"last_evidence":self.last_public_resolution,
+            "execution_costs":if self.exact_execution_costs { "exact_per_outcome" } else { "legacy_aggregate_uncertainty" },
+            "risk_policy":self.portfolio.policy(),
             "real_redemption_receipt":null})
     }
     pub(crate) fn has_public_trade(&self, fingerprint: &str) -> bool {
@@ -79,13 +86,27 @@ impl MultiMarketPaper {
     pub fn risk_clock_ms(&self) -> u64 {
         self.portfolio.risk_clock_ms()
     }
+    pub fn exact_execution_costs(&self) -> bool {
+        self.exact_execution_costs
+    }
+    pub fn can_enable_exact_costs(&self) -> bool {
+        !self.exact_execution_costs
+            && self.portfolio.snapshot().spent_pico == "0"
+            && self.session.snapshot().account.spent_pico == "0"
+            && self.session.snapshot().account.outcome_spent_pico.is_some()
+    }
     /// Strategy admission only: replayed execution inputs and accounting are unchanged.
     pub fn guard_strategy_quotes(
         &self,
         rules: &mm2_strategy::Rules,
         decision: &mut mm2_strategy::Decision,
     ) -> Result<(), String> {
-        if decision.quotes.is_empty() {
+        if !self.exact_execution_costs {
+            decision.quotes.clear();
+            decision.reason = mm2_strategy::Gate::InventoryCost;
+            return Ok(());
+        }
+        if decision.quotes.is_empty() && decision.reason != mm2_strategy::Gate::InventoryDust {
             return Ok(());
         }
         let current = self
@@ -96,8 +117,38 @@ impl MultiMarketPaper {
             .portfolio
             .market(current)
             .ok_or("missing strategy inventory")?;
-        // Retain the old aggregate accounting contract too. Its allocated average
-        // can differ from exact execution costs; neither cost cap may be exceeded.
+        if decision.reason == mm2_strategy::Gate::InventoryDust {
+            let (opposite, owned) = if position.up.quantity_micros > position.down.quantity_micros {
+                (Outcome::Down, &position.up)
+            } else {
+                (Outcome::Up, &position.down)
+            };
+            if owned.quantity_micros > 0 {
+                let cap = u128::from(mm2_core::SCALE - rules.max_pair_edge_micros)
+                    .saturating_sub(owned.cost_pico.div_ceil(u128::from(owned.quantity_micros)));
+                // Retain an immutable, already live legal order only. No fresh lot,
+                // below-minimum request, replacement or recovered queue priority.
+                for order in self.session.snapshot().orders {
+                    if order.quote.outcome == opposite
+                        && order.phase == mm2_core::OrderPhase::Live
+                        && order.reserved_quantity_micros > 0
+                        && order.requested_quantity_micros >= self.session.limits().min_order_micros
+                        && u128::from(order.quote.price_micros) <= cap
+                    {
+                        let mut quote = order.quote;
+                        quote.quantity_micros = order.requested_quantity_micros;
+                        decision.quotes.push(quote);
+                    }
+                }
+                if !decision.quotes.is_empty() {
+                    decision.reason = mm2_strategy::Gate::Quote;
+                }
+            }
+            if decision.quotes.is_empty() {
+                return Ok(());
+            }
+        }
+        // Exact side basis also caps every newly requested hedge price.
         for quote in &mut decision.quotes {
             if quote.slot.ends_with(":hedge") {
                 let owned = if quote.outcome == Outcome::Up {
@@ -132,6 +183,9 @@ impl MultiMarketPaper {
     }
 
     pub fn quote_risk_permitted(&self, quotes: &[DesiredQuote]) -> Result<bool, String> {
+        if !self.exact_execution_costs {
+            return Ok(false);
+        }
         let current = self
             .current_market
             .as_deref()
@@ -166,6 +220,9 @@ impl MultiMarketPaper {
             .permits_execution_risk(current, possible, max_price)
     }
     pub fn validate(&self) -> Result<(), String> {
+        if self.exact_execution_costs != self.session.automatic_posts_deferred() {
+            return Err("paper accounting and post admission versions disagree".into());
+        }
         if let Some(policy) = &self.fee_policy {
             policy.validate()?;
             if self.current_market.as_deref() != Some(policy.condition_id.as_str())
@@ -182,6 +239,11 @@ impl MultiMarketPaper {
                 .market(id)
                 .ok_or("missing current portfolio market")?;
             let account = self.session.snapshot().account;
+            if self.exact_execution_costs
+                && position.execution_outcome_spent_pico != account.outcome_spent_pico
+            {
+                return Err("current exact outcome costs disagree with durable portfolio".into());
+            }
             if position.execution_spent_pico
                 != account
                     .spent_pico
@@ -198,16 +260,30 @@ impl MultiMarketPaper {
     fn sync_portfolio(&mut self) -> Result<(), String> {
         if let Some(market) = &self.current_market {
             let account = self.session.snapshot().account;
-            self.portfolio.record_execution_totals(
-                market,
-                account
-                    .spent_pico
-                    .parse()
-                    .map_err(|_| "invalid exact simulated spend")?,
-                account.up_inventory_micros,
-                account.down_inventory_micros,
-                0,
-            )?;
+            if self.exact_execution_costs {
+                let costs = account
+                    .outcome_spent_pico
+                    .ok_or("missing exact execution costs")?;
+                self.portfolio.record_execution_outcome_totals(
+                    market,
+                    [
+                        costs[0].parse().map_err(|_| "invalid exact outcome cost")?,
+                        costs[1].parse().map_err(|_| "invalid exact outcome cost")?,
+                    ],
+                    [account.up_inventory_micros, account.down_inventory_micros],
+                )?;
+            } else {
+                self.portfolio.record_execution_totals(
+                    market,
+                    account
+                        .spent_pico
+                        .parse()
+                        .map_err(|_| "invalid exact simulated spend")?,
+                    account.up_inventory_micros,
+                    account.down_inventory_micros,
+                    0,
+                )?;
+            }
         }
         Ok(())
     }
@@ -268,6 +344,9 @@ impl MultiMarketPaper {
             }
             let now = self.session.now_ms();
             self.session = PaperSession::new(limits, LatencyConfig::default())?;
+            if self.exact_execution_costs {
+                self.session.defer_automatic_posts();
+            }
             self.session.advance(now)?;
         }
         self.portfolio.register_market(mm2_portfolio::Market {
@@ -285,6 +364,8 @@ impl MultiMarketPaper {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    /// Versioned at a zero-spend baseline; never rewrites legacy allocations.
+    ExactAccounting {},
     FeeRules {
         policy: mm2_live::fees::FeePolicy,
     },
@@ -316,6 +397,15 @@ pub enum Operation {
         ask: u64,
         ahead_micros: u64,
     },
+    /// Observed public depth at the best bid and relevant immutable order prices.
+    /// Levels omitted from this bounded projection cannot seed an order queue.
+    DepthBook {
+        now_ms: u64,
+        outcome: String,
+        bid: u64,
+        ask: u64,
+        bid_levels: Vec<Level>,
+    },
     Trade {
         now_ms: u64,
         outcome: String,
@@ -323,6 +413,13 @@ pub enum Operation {
         quantity_micros: u64,
     },
     ObservedTrade {
+        now_ms: u64,
+        outcome: String,
+        price_micros: u64,
+        quantity_micros: u64,
+        fingerprint: String,
+    },
+    ObservedTradeV2 {
         now_ms: u64,
         outcome: String,
         price_micros: u64,
@@ -398,11 +495,20 @@ pub fn new(limits: &Limits) -> Result<MultiMarketPaper, String> {
         public_resolution_count: 0,
         last_public_resolution_at_ms: 0,
         last_public_resolution: None,
+        exact_execution_costs: false,
     })
 }
 
 pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<(), String> {
     let result = match operation {
+        Operation::ExactAccounting {} => {
+            if !session.exact_execution_costs && !session.can_enable_exact_costs() {
+                return Err("legacy accounting uncertainty blocks version change".into());
+            }
+            session.exact_execution_costs = true;
+            session.session.defer_automatic_posts();
+            Ok(())
+        }
         Operation::FeeRules { policy } => {
             policy.validate()?;
             if session.current_market.as_deref() != Some(&policy.condition_id)
@@ -439,6 +545,22 @@ pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<()
         Operation::Quotes { now_ms, quotes } => {
             if !quotes.is_empty() && session.portfolio_halt().is_some() {
                 return Err("paper portfolio loss/drawdown halt blocks new quotes".into());
+            }
+            if session.exact_execution_costs && !quotes.is_empty() {
+                let desired = quotes
+                    .iter()
+                    .map(|quote| {
+                        Ok(DesiredQuote {
+                            slot: quote.slot.clone(),
+                            outcome: outcome(&quote.outcome)?,
+                            price_micros: quote.price_micros,
+                            quantity_micros: quote.quantity_micros,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                if !session.quote_risk_permitted(&desired)? {
+                    return Err("exact paper risk budget blocks new quotes".into());
+                }
             }
             session
                 .quote(
@@ -489,6 +611,28 @@ pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<()
                 },
             )
             .map_err(|error| error.to_string()),
+        Operation::DepthBook {
+            now_ms,
+            outcome: name,
+            bid,
+            ask,
+            bid_levels,
+        } => {
+            if !session.exact_execution_costs {
+                return Err("observed depth requires versioned accounting".into());
+            }
+            session
+                .set_book_conservative(
+                    *now_ms,
+                    outcome(name)?,
+                    Book {
+                        bid: Some(*bid),
+                        ask: Some(*ask),
+                        bid_levels: bid_levels.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())
+        }
         Operation::Trade {
             now_ms,
             outcome: name,
@@ -509,6 +653,13 @@ pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<()
             price_micros,
             quantity_micros,
             fingerprint,
+        }
+        | Operation::ObservedTradeV2 {
+            now_ms,
+            outcome: name,
+            price_micros,
+            quantity_micros,
+            fingerprint,
         } => {
             if fingerprint.len() != 64 || !fingerprint.bytes().all(|c| c.is_ascii_hexdigit()) {
                 return Err("invalid observed trade fingerprint".into());
@@ -516,7 +667,14 @@ pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<()
             if session.public_trades.contains(fingerprint) {
                 return Ok(());
             }
-            session.trade(*now_ms, outcome(name)?, *price_micros, *quantity_micros)?;
+            if matches!(operation, Operation::ObservedTradeV2 { .. }) {
+                if !session.exact_execution_costs {
+                    return Err("observed trade requires versioned accounting".into());
+                }
+                session.trade_at_price(*now_ms, outcome(name)?, *price_micros, *quantity_micros)?;
+            } else {
+                session.trade(*now_ms, outcome(name)?, *price_micros, *quantity_micros)?;
+            }
             if session.public_trades.len() == 8192 {
                 session.public_trades.pop_front();
             }
@@ -842,6 +1000,7 @@ mod tests {
     #[test]
     fn loss_admission_counts_cancel_races_and_deduplicates_retained_desired_orders() {
         let mut session = new(&limits()).unwrap();
+        apply(&mut session, &Operation::ExactAccounting {}).unwrap();
         for index in 0..4 {
             for mut operation in executed_window() {
                 match &mut operation {

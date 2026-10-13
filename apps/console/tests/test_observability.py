@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from mm2_console.app import App
 from mm2_console.config import Config
@@ -44,6 +45,30 @@ def state(profile="both"):
 
 
 class ObservabilityTests(unittest.TestCase):
+    def test_waiting_reason_and_exact_budget_do_not_claim_active_trading(self):
+        sample = state("simulation")
+        sample.update({"strategy_gate": "loss_budget", "paper_resolution": {
+            "execution_costs": "exact_per_outcome", "risk_policy": {"max_daily_loss_micros": 10_000_000}}})
+        sample["simulation"]["orders"] = []
+        sample["paper_portfolio"]["daily_loss_pico"] = "7250000000000"
+        self.engine.state = sample
+        self.app.sample_once()
+        text = self.bot()._status()
+        self.assertIn("недостаточно бюджета риска", text)
+        self.assertIn("рабочих заявок: 0", text)
+        self.assertIn("до учёта открытого риска: 2.75", text)
+        self.assertIn("Economic PnL: unknown", text)
+        self.assertEqual(len(self.engine.calls), 1)
+
+    def test_legacy_or_missing_budget_remains_unknown(self):
+        sample = state("simulation")
+        sample["paper_resolution"] = {"execution_costs": "legacy_aggregate_uncertainty",
+            "risk_policy": {"max_daily_loss_micros": 10_000_000}}
+        sample["paper_portfolio"]["daily_loss_pico"] = "0"
+        self.engine.state = sample
+        self.app.sample_once()
+        self.assertIn("до учёта открытого риска: неизвестен", self.bot()._status())
+
     def test_closeout_status_is_bounded_and_does_not_expose_signed_wire_or_infer_net_pnl(self):
         sample = state("trading")
         baseline = health_identity(sample)
@@ -199,7 +224,10 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(journal_summary(self.engine.state)["stage"], "full")
         self.assertEqual(journal_summary({"journal_bytes": 0})["stage"], "unknown")
 
-    def test_secondary_lane_capacity_stages_and_prepare_error_log_once(self):
+    @patch("mm2_console.app.time.time")
+    def test_secondary_lane_capacity_stages_and_prepare_error_log_once(self, clock):
+        # Exercise health transitions, not the host's SQLite/fsync speed.
+        clock.return_value = self.engine.state["published_at_ms"] / 1000
         self.engine.state["live"].update(journal_bytes=100, journal_max_bytes=1000,
                                         last_prepare_error=None)
         self.engine.state["parallel_simulation"]["journal"] = {"total_bytes": 100, "total_max_bytes": 1000}

@@ -91,6 +91,9 @@ pub struct MarketPosition {
     pub execution_down_micros: u64,
     #[serde(with = "u128_decimal")]
     pub execution_fee_pico: u128,
+    /// Present only for versioned imports with exact, fee-inclusive side costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_outcome_spent_pico: Option<[String; 2]>,
     pub totals_imported: bool,
 }
 
@@ -312,6 +315,7 @@ impl Portfolio {
                 execution_up_micros: 0,
                 execution_down_micros: 0,
                 execution_fee_pico: 0,
+                execution_outcome_spent_pico: None,
                 totals_imported: false,
             },
         );
@@ -646,6 +650,9 @@ impl Portfolio {
             .markets
             .get(market_id)
             .ok_or("unknown execution market")?;
+        if market.execution_outcome_spent_pico.is_some() {
+            return Err("cannot mix aggregate and exact outcome accounting".into());
+        }
         if market.resolution.is_some()
             || up_micros > MAX_QUANTITY
             || down_micros > MAX_QUANTITY
@@ -701,6 +708,68 @@ impl Portfolio {
         self.fees_pico += delta_fee;
         self.check_cash_invariant()?;
         Ok(true)
+    }
+
+    /// Exact cumulative maker execution costs. Never reinterpret an aggregate history.
+    /// The current paper execution core has no maker fees; nonzero fee history is rejected.
+    pub fn record_execution_outcome_totals(
+        &mut self,
+        market_id: &str,
+        costs: [u128; 2],
+        quantities: [u64; 2],
+    ) -> Result<bool> {
+        let prior = self.market(market_id).ok_or("unknown execution market")?;
+        let previous = match &prior.execution_outcome_spent_pico {
+            Some(value) => [
+                value[0]
+                    .parse::<u128>()
+                    .map_err(|_| "invalid exact outcome cost")?,
+                value[1]
+                    .parse::<u128>()
+                    .map_err(|_| "invalid exact outcome cost")?,
+            ],
+            None if prior.execution_spent_pico == 0 => [0, 0],
+            None => return Err("legacy outcome cost uncertainty blocks exact import".into()),
+        };
+        if prior.execution_fee_pico != 0 {
+            return Err("exact maker accounting cannot import fee uncertainty".into());
+        }
+        for side in 0..2 {
+            let old_quantity = [prior.execution_up_micros, prior.execution_down_micros][side];
+            if quantities[side] < old_quantity || costs[side] < previous[side] {
+                return Err("exact execution totals regressed".into());
+            }
+            let quantity = quantities[side] - old_quantity;
+            let cost = costs[side] - previous[side];
+            if (quantity == 0) != (cost == 0) || cost > u128::from(quantity) * u128::from(SCALE) {
+                return Err("exact outcome cost contradicts quantity".into());
+            }
+        }
+        let total = costs[0]
+            .checked_add(costs[1])
+            .ok_or("exact cost overflow")?;
+        let old_basis = [prior.up.cost_pico, prior.down.cost_pico];
+        let was_exact = prior.execution_outcome_spent_pico.is_some();
+        // Reuse the aggregate import's capital, quantity, reservation and identity
+        // validation on a private candidate, then replace only its side allocation.
+        let mut candidate = self.clone();
+        candidate
+            .markets
+            .get_mut(market_id)
+            .expect("checked market")
+            .execution_outcome_spent_pico = None;
+        let changed =
+            candidate.record_execution_totals(market_id, total, quantities[0], quantities[1], 0)?;
+        let position = candidate
+            .markets
+            .get_mut(market_id)
+            .expect("checked market");
+        position.up.cost_pico = old_basis[0] + costs[0] - previous[0];
+        position.down.cost_pico = old_basis[1] + costs[1] - previous[1];
+        position.execution_outcome_spent_pico = Some(costs.map(|cost| cost.to_string()));
+        candidate.validate()?;
+        *self = candidate;
+        Ok(changed || !was_exact)
     }
 
     pub fn merge_complete_sets(
@@ -892,6 +961,19 @@ impl Portfolio {
         }
         for (id, market) in &self.markets {
             market.market.validate()?;
+            if let Some(costs) = &market.execution_outcome_spent_pico {
+                let up = costs[0]
+                    .parse::<u128>()
+                    .map_err(|_| "invalid exact outcome cost")?;
+                let down = costs[1]
+                    .parse::<u128>()
+                    .map_err(|_| "invalid exact outcome cost")?;
+                if up.checked_add(down) != Some(market.execution_spent_pico)
+                    || market.execution_fee_pico != 0
+                {
+                    return Err("exact outcome cost invariant failed".into());
+                }
+            }
             if id != &market.market.id
                 || market.up.quantity_micros > MAX_QUANTITY
                 || market.down.quantity_micros > MAX_QUANTITY

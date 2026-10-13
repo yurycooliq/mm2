@@ -433,6 +433,10 @@ pub fn input_failure_detail(reason: &str) -> &'static str {
         "missing string spread" => "missing_spread_string",
         "missing string fee_rate_bps" => "missing_fee_string",
         "invalid optional decimal field" => "invalid_optional_decimal_type",
+        "invalid book side" => "invalid_order_side",
+        "missing string timestamp" | "invalid CLOB timestamp" => "invalid_clob_timestamp",
+        "missing lifecycle assets" | "invalid lifecycle asset count" => "invalid_lifecycle_assets",
+        "invalid lifecycle token" | "duplicate lifecycle token" => "invalid_lifecycle_token",
         "feed backpressure deadline exceeded" => "feed_backpressure_timeout",
         "feed consumer closed" => "feed_consumer_closed",
         _ => "unclassified_feed_failure",
@@ -835,10 +839,13 @@ async fn rest_recovery(
 }
 
 fn side(value: &Map<String, Value>) -> Result<BookSide, String> {
-    match string(value, "side")? {
-        "BUY" => Ok(BookSide::Bid),
-        "SELL" => Ok(BookSide::Ask),
-        _ => Err("invalid book side".into()),
+    let side = string(value, "side")?;
+    if side.eq_ignore_ascii_case("BUY") {
+        Ok(BookSide::Bid)
+    } else if side.eq_ignore_ascii_case("SELL") {
+        Ok(BookSide::Ask)
+    } else {
+        Err("invalid book side".into())
     }
 }
 
@@ -850,9 +857,14 @@ fn clob_member(
     let value = object(value)?;
     let event_type = string(value, "event_type")?;
     let identity = condition(string(value, "market")?)?;
-    let exchange_ms = if matches!(event_type, "new_market" | "market_resolved") {
+    let informational = matches!(
+        event_type,
+        "best_bid_ask" | "new_market" | "market_resolved"
+    );
+    let exchange_ms = if informational {
         value
             .get("timestamp")
+            .filter(|value| !value.is_null())
             .map(|_| clob_clock(value))
             .transpose()?
             .unwrap_or(0)
@@ -957,7 +969,15 @@ fn clob_member(
             // conservatively in the paper lane; they never update the real account.
             use sha2::{Digest, Sha256};
             let fingerprint = hex::encode(Sha256::digest(
-                serde_json::to_vec(value).map_err(|_| "cannot fingerprint public trade")?,
+                serde_json::to_vec(&(
+                    &identity,
+                    string(value, "asset_id")?,
+                    exchange_ms,
+                    price_micro,
+                    quantity_micro,
+                    trade_side == BookSide::Ask,
+                ))
+                .map_err(|_| "cannot fingerprint public trade")?,
             ));
             Ok(outcome
                 .filter(|_| trade_side == BookSide::Ask)
@@ -986,6 +1006,33 @@ fn clob_member(
             Ok(Vec::new())
         }
         "market_resolved" | "new_market" => {
+            // Lifecycle metadata is not a book update or settlement receipt. Missing
+            // optional assets cannot change token mappings or create execution volume.
+            if value.get("assets_ids").is_none_or(Value::is_null) {
+                if identity != market.condition_id || event_type == "new_market" {
+                    if identity == market.condition_id
+                        && value.get("slug").is_some()
+                        && string(value, "slug")? != market.slug
+                    {
+                        return Err("selected lifecycle slug changed".into());
+                    }
+                    return Ok(Vec::new());
+                }
+                let winner = string(value, "winning_asset_id")?;
+                token_outcome(winner, &identity, market)?;
+                let expected = if winner == market.up_token {
+                    "Up"
+                } else {
+                    "Down"
+                };
+                if string(value, "winning_outcome")? != expected {
+                    return Err("selected winner mapping changed".into());
+                }
+                return Ok(vec![FeedEvent::Disconnect {
+                    source: FeedSource::Clob,
+                    reason: "selected market resolved".into(),
+                }]);
+            }
             let assets = value
                 .get("assets_ids")
                 .and_then(Value::as_array)

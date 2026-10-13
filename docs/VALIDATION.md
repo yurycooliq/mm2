@@ -1,5 +1,43 @@
 # Validation evidence
 
+## October 13, 2026 — exact paper costs, feed recovery and observed queues
+
+New paper histories persist an `exact_accounting` version at a zero-spend
+baseline. Exact cumulative outcome costs replace proportional allocation before
+merge/redemption and prospective risk admission. Legacy operations retain their
+historical accounting; legacy cost uncertainty blocks new quotes and cannot be
+silently upgraded. The retained 34-operation R10 regression still reproduces the
+original legacy result. With the new version its residual basis is $0.80 and the
+additional lot is rejected by the unchanged $10 gross-loss policy.
+Automatic refill is also deferred until an explicit new quote operation has
+passed admission on the updated position. Legacy refill semantics remain intact.
+
+Optional informational timestamps/assets and normalized BUY/SELL casing are
+handled separately from required execution witnesses. Semantic trade fingerprints
+deduplicate spelling differences. Required input and full-frame atomicity checks
+remain strict. Core validation failures request a source-generation refresh without
+owner commands, risk resets or released possible fills; three failures within one
+minute latch a fault. Only fixed public failure classes are logged.
+
+Versioned public inputs persist observed depth at the best bid and relevant order
+prices. Queue decreases are credited only from witnessed prints, and a print is
+applied only at its own price. This is a conservative synthetic queue model, not
+calibrated venue execution. Sub-minimum residuals may retain an already-live legal
+complement at its immutable price/size when pair cost and risk permit; they never
+create a new undersized lot or recover queue priority. Telegram status explains
+waiting, working virtual orders and the remaining gross-loss budget before open risk.
+
+Offline Rust formatting, all-target Clippy and regression tests, console checks,
+image integration, historical ledger recovery and selected-host deployment have
+separate receipts under `output/audit-fixes-20261013-r11`. Deployment and a completed
+day must be confirmed there; this source description does not establish either or
+real profitability. The final local checks passed **323 Rust tests**, formatting
+and Clippy with warnings denied; **520 Python tests** passed in Linux without skips
+(128 console, 157 operations, 21 data, 34 latency and 180 research). The bounded
+historical TypeScript quote oracle passed six cases. Image and selected-host
+checks have their own receipts. No capital, loss, drawdown, feed-age or journal
+limit is raised.
+
 ## October 13, 2026 — optional CLOB fields and feed failure diagnostics
 
 The retained R9 engine log records a fatal CLOB `invalid_public_input` immediately

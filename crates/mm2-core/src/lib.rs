@@ -158,6 +158,11 @@ pub struct Core {
     inventory: [u64; 2],
     stats: ExecutionStats,
     halted: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    defer_automatic_posts: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl Core {
     pub fn new(limits: RiskLimits) -> Result<Self> {
@@ -174,10 +179,18 @@ impl Core {
             inventory: [0, 0],
             stats: ExecutionStats::default(),
             halted: None,
+            defer_automatic_posts: false,
         })
     }
     pub fn limits(&self) -> &RiskLimits {
         &self.limits
+    }
+    /// Paper V2 must reauthorize risk after fills/cancels before another post.
+    pub fn defer_automatic_posts(&mut self) {
+        self.defer_automatic_posts = true;
+    }
+    pub fn automatic_posts_deferred(&self) -> bool {
+        self.defer_automatic_posts
     }
     pub fn order(&self, id: u64) -> Option<&Order> {
         self.orders.get(&id)
@@ -234,7 +247,7 @@ impl Core {
             return Err("execution is halted".into());
         }
         self.desired = desired;
-        self.reconcile(now_ms)
+        self.reconcile_inner(now_ms, true)
     }
     pub fn cancel_all(&mut self, now_ms: u64) -> Result<Vec<Action>> {
         self.desired.clear();
@@ -394,6 +407,9 @@ impl Core {
             .sum()
     }
     fn reconcile(&mut self, now_ms: u64) -> Result<Vec<Action>> {
+        self.reconcile_inner(now_ms, !self.defer_automatic_posts)
+    }
+    fn reconcile_inner(&mut self, now_ms: u64, allow_new_posts: bool) -> Result<Vec<Action>> {
         let mut actions = vec![];
         let keys: Vec<String> = self
             .slots
@@ -421,7 +437,10 @@ impl Core {
                 }
                 continue;
             }
-            if self.halted.is_some() || self.cooldowns.get(&key).is_some_and(|at| now_ms < *at) {
+            if !allow_new_posts
+                || self.halted.is_some()
+                || self.cooldowns.get(&key).is_some_and(|at| now_ms < *at)
+            {
                 continue;
             }
             let Some(mut q) = self.desired.get(&key).cloned() else {

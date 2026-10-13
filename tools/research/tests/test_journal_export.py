@@ -32,6 +32,31 @@ def engine_fixture(source):
 
 
 class JournalExportTests(unittest.TestCase):
+    def test_versioned_paper_inputs_remain_bounded_public_evidence(self):
+        operations = [{"kind": "exact_accounting"}, {"kind": "risk_window", "at_ms": 86_400_000},
+            {"kind": "depth_book", "now_ms": 7, "outcome": "up", "bid": 490000, "ask": 510000,
+             "bid_levels": [{"price_micros": 490000, "quantity_micros": 1000000}]},
+            {"kind": "observed_trade_v2", "now_ms": 8, "outcome": "up", "price_micros": 490000,
+             "quantity_micros": 1000000, "fingerprint": "f" * 64}]
+        for operation in operations:
+            self.assertEqual(exporter._operation(operation), operation)
+            with self.assertRaises(exporter.ExportError):
+                exporter._operation({**operation, "signed_wire": "private"})
+        oversized = {**operations[2], "bid_levels": operations[2]["bid_levels"] * 257}
+        with self.assertRaises(exporter.ExportError):
+            exporter._operation(oversized)
+
+    def test_final_public_outcome_projection_never_accepts_private_fields(self):
+        evidence = {"target": {"condition_id": "0x" + "a" * 64, "start_ms": 0, "end_ms": 300000},
+            "chain_id": 137, "conditional_tokens": "0x" + "b" * 40, "token_ids": ["1", "2"],
+            "block_number": 1, "block_hash": "0x" + "c" * 64, "block_timestamp_ms": 300001,
+            "observed_at_ms": 300002, "payout_numerators": [1, 0], "payout_denominator": 1,
+            "metadata_sha256": "d" * 64}
+        operation = {"kind": "public_resolution", "evidence": evidence, "at_ms": 300003}
+        self.assertEqual(exporter._operation(operation), operation)
+        with self.assertRaises(exporter.ExportError):
+            exporter._operation({**operation, "evidence": {**evidence, "signature": "private"}})
+
     def test_public_fee_evidence_is_strict_and_keeps_exact_rate(self):
         policy = {"condition_id": "0x" + "a" * 64, "up_token": "1", "down_token": "2",
             "rate": "0.07", "exponent": 1, "taker_only": True, "observed_at_ms": 1000,

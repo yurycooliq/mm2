@@ -586,6 +586,21 @@ impl Core {
         self.input_invalid = false;
         Ok(())
     }
+    /// Bounded projection of observed L2 at prices used by immutable paper orders.
+    pub fn bid_depth_at(&self, outcome: Outcome, prices: &[u64]) -> Vec<Level> {
+        let book = &self.books[outcome.index()];
+        let selected: std::collections::BTreeSet<_> = prices.iter().copied().collect();
+        selected
+            .into_iter()
+            .rev()
+            .filter_map(|price_micro| {
+                book.bids.get(&price_micro).map(|quantity_micro| Level {
+                    price_micro,
+                    quantity_micro: *quantity_micro,
+                })
+            })
+            .collect()
+    }
     pub fn evaluate(&mut self, now_wall_ms: u64, now_mono_ms: u64) -> Decision {
         self.clear_proposals();
         let mut reasons = Vec::new();

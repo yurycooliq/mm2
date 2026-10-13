@@ -48,14 +48,19 @@ LEDGER_FIELDS = {
     "fee_policies", "execution_fees",
 }
 OP_FIELDS = {
+    "exact_accounting": set(),
+    "risk_window": {"at_ms"},
     "market": {"condition_id", "start_ms", "end_ms"},
     "advance": {"now_ms"}, "quotes": {"now_ms", "quotes"}, "cancel_all": {"now_ms"},
     "book": {"now_ms", "outcome", "bid", "ask", "ahead_micros"},
     "trade": {"now_ms", "outcome", "worst_price_micros", "quantity_micros"},
     "observed_trade": {"now_ms", "outcome", "price_micros", "quantity_micros", "fingerprint"},
+    "observed_trade_v2": {"now_ms", "outcome", "price_micros", "quantity_micros", "fingerprint"},
+    "depth_book": {"now_ms", "outcome", "bid", "ask", "bid_levels"},
     "venue_rules": {"now_ms", "tick_micros", "min_order_micros"},
     "fee_rules": {"policy"},
     "demo_resolution": {"condition_id", "winning_outcome", "at_ms"},
+    "public_resolution": {"evidence", "at_ms"},
     "limits": {"now_ms", "limits"},
 }
 LIMIT_FIELDS = {"initial_collateral_usd", "max_imbalance_shares", "lot_shares", "half_width", "max_feed_age_ms"}
@@ -162,7 +167,26 @@ def _operation(value):
     for key, item in value.items():
         if key == "kind":
             continue
-        if key == "policy":
+        if key == "bid_levels":
+            if not isinstance(item, list) or len(item) > 256:
+                raise ExportError("depth projection exceeds bound")
+            level_fields = {"price_micros", "quantity_micros"}
+            result[key] = [{k: integer(v) for k, v in fields(level, level_fields, level_fields).items()} for level in item]
+        elif key == "evidence":
+            public_fields = {"target", "chain_id", "conditional_tokens", "token_ids", "block_number", "block_hash",
+                             "block_timestamp_ms", "observed_at_ms", "payout_numerators", "payout_denominator", "metadata_sha256"}
+            fields(item, public_fields, public_fields)
+            target_fields = {"condition_id", "start_ms", "end_ms"}
+            target = fields(item["target"], target_fields, target_fields)
+            if (not isinstance(item["token_ids"], list) or len(item["token_ids"]) != 2
+                    or not isinstance(item["payout_numerators"], list) or len(item["payout_numerators"]) != 2):
+                raise ExportError("unsupported binary public resolution")
+            result[key] = {"target": {k: identity(v) if k == "condition_id" else integer(v) for k, v in target.items()},
+                           "token_ids": [uint_string(v) for v in item["token_ids"]],
+                           "payout_numerators": [integer(v) for v in item["payout_numerators"]]}
+            for name in public_fields - {"target", "token_ids", "payout_numerators"}:
+                result[key][name] = digest(item[name]) if name == "metadata_sha256" else identity(item[name]) if name in {"conditional_tokens", "block_hash"} else integer(item[name])
+        elif key == "policy":
             policy_fields = {"condition_id", "up_token", "down_token", "rate", "exponent", "taker_only", "observed_at_ms", "response_sha256"}
             policy = fields(item, policy_fields, policy_fields)
             rate = policy["rate"]

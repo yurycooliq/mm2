@@ -431,10 +431,23 @@ async fn run_public(
             Transition::Refresh => {
                 let _ = handle.source_status(
                     "refreshing",
-                    Some("durable Reset requires fresh source snapshots".into()),
+                    Some("source refresh requires fresh snapshots".into()),
                     None,
                 );
                 owned.stop(FEED_STOP_TIMEOUT).await?;
+                if interruptible(
+                    async {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Ok(())
+                    },
+                    shutdown,
+                    fault,
+                )
+                .await?
+                .is_none()
+                {
+                    return Ok(());
+                }
             }
             Transition::Fault(reason) => {
                 let _ = owned.stop(FEED_STOP_TIMEOUT).await;
