@@ -162,6 +162,26 @@ fn public_print_does_not_invent_a_multi_level_sweep() {
 }
 
 #[test]
+fn boundary_public_prints_neither_fill_passive_orders_nor_fault_execution() {
+    let mut s = paper_session();
+    s.set_book_conservative(0, Outcome::Up, book(SCALE))
+        .unwrap();
+    s.quote(0, vec![quote(Outcome::Up, 490_000)]).unwrap();
+    s.advance(50).unwrap();
+    for price in [0, SCALE] {
+        let result = s
+            .trade_at_price(60, Outcome::Up, price, 10 * SCALE)
+            .unwrap();
+        assert_eq!(result.own_filled_micros, 0);
+        assert_eq!(result.unconsumed_micros, 10 * SCALE);
+    }
+    assert_eq!(s.snapshot().account.spent_pico, "0");
+    assert!(s.trade_at_price(60, Outcome::Up, SCALE + 1, SCALE).is_err());
+    assert!(s.trade_at_price(60, Outcome::Up, 0, 0).is_err());
+    assert!(s.snapshot().fault.is_none());
+}
+
+#[test]
 fn observed_depth_seeds_queue_and_cancellation_does_not_grant_priority() {
     for (depth, expected_fill) in [(SCALE, 5 * SCALE), (1000 * SCALE, 0)] {
         let mut s = paper_session();

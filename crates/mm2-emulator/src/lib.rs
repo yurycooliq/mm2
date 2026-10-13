@@ -354,6 +354,19 @@ impl PaperSession {
         price_micros: u64,
         quantity_micros: u64,
     ) -> Result<TradeResult> {
+        // Closing public prints can be at 0/1. No legal passive order can match
+        // either boundary, so retain the witness without inventing a fill or fault.
+        if price_micros == 0 || price_micros == SCALE {
+            if quantity_micros == 0 || quantity_micros > 1_000_000_000 * SCALE {
+                return Err("invalid simulated taker trade".into());
+            }
+            self.advance(now_ms)?;
+            return Ok(TradeResult {
+                input_quantity_micros: quantity_micros,
+                unconsumed_micros: quantity_micros,
+                ..TradeResult::default()
+            });
+        }
         self.trade_inner(now_ms, outcome, price_micros, quantity_micros, true)
     }
     fn trade_inner(
