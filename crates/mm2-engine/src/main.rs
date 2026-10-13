@@ -177,7 +177,7 @@ async fn run() -> Result<(), String> {
         _ = &mut actor_task => { actor_done=true; Err("core actor stopped unexpectedly".into()) },
         result = &mut source_task => { source_done=true; match result { Ok(Ok(())) => Err("source owner stopped unexpectedly".into()),Ok(Err(reason)) => Err(reason.chars().take(256).collect()),Err(_) => Err("source owner task failed".into()) } },
         _ = &mut server_task => { server_done=true; Err("HTTP server stopped unexpectedly".into()) },
-        _ = &mut relay_task => { relay_done=true; Err("feed relay stopped unexpectedly".into()) },
+        result = &mut relay_task => { relay_done=true; Err(relay_exit_reason(result)) },
     };
     shutdown_tx.send_replace(true);
     // The outer deadline also bounds a stalled disk worker; process exit releases its OS fence.
@@ -215,6 +215,18 @@ async fn run() -> Result<(), String> {
     tracing::info!("mm2 engine stopped; acknowledged actions are durable");
     result
 }
+
+fn relay_exit_reason(result: Result<Result<(), String>, tokio::task::JoinError>) -> String {
+    match result {
+        Ok(Err(reason)) => format!(
+            "feed relay failed: {}",
+            mm2_engine::feeds::input_failure_detail(&reason)
+        ),
+        Ok(Ok(())) => "feed relay stopped unexpectedly".into(),
+        Err(error) if error.is_panic() => "feed relay task panicked".into(),
+        Err(_) => "feed relay task cancelled".into(),
+    }
+}
 fn record_source_exit(
     fault: &watch::Sender<Option<String>>,
     result: &Result<(), String>,
@@ -248,6 +260,38 @@ async fn signal() {
 #[cfg(test)]
 mod source_exit_tests {
     use super::*;
+
+    #[test]
+    fn relay_exit_reports_fixed_parser_cause_without_echoing_rejected_content() {
+        assert_eq!(
+            relay_exit_reason(Ok(Err("invalid decimal length".into()))),
+            "feed relay failed: invalid_decimal"
+        );
+        assert_eq!(
+            relay_exit_reason(Ok(Err(
+                "private response https://example.invalid/secret".into()
+            ))),
+            "feed relay failed: unclassified_feed_failure"
+        );
+        assert_eq!(
+            relay_exit_reason(Ok(Ok(()))),
+            "feed relay stopped unexpectedly"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_exit_distinguishes_task_panic_and_cancellation() {
+        let panic = tokio::spawn(async { panic!("test relay failure") })
+            .await
+            .unwrap_err();
+        assert_eq!(relay_exit_reason(Err(panic)), "feed relay task panicked");
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        assert_eq!(
+            relay_exit_reason(Err(task.await.unwrap_err())),
+            "feed relay task cancelled"
+        );
+    }
 
     #[test]
     fn source_exit_preserves_first_fault_instead_of_replacing_it_with_generic_owner_stop() {

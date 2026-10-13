@@ -1,5 +1,31 @@
 # Validation evidence
 
+## October 13, 2026 — optional CLOB fields and feed failure diagnostics
+
+The retained R9 engine log records a fatal CLOB `invalid_public_input` immediately
+before `feed relay stopped unexpectedly`. The rejected original wire frame was not
+retained, so its exact parser subtype cannot be established retrospectively.
+
+The official CLOB SDK permits missing, null and empty optional decimal metadata.
+The previous parser reproducibly rejected these forms for quote hints, trade fee
+metadata and old tick metadata. They now remain absent metadata. Required book
+levels, trade prices, present trade quantities, clocks, identity, frame bounds and
+atomic batch validation retain their strict checks. A trade without a quantity
+emits no execution witness; indicative BBO metadata never creates depth or fills.
+See the [official SDK schema](https://github.com/Polymarket/ts-sdk/blob/main/packages/bindings/src/subscriptions/clob.ts).
+
+Feed failures now log a fixed public parser detail, and relay exit reporting
+distinguishes a returned failure, unexpected completion, panic and cancellation
+without echoing rejected content. No strategy, capital, loss, feed-age or journal
+limits changed; startup still requires an explicit Resume.
+
+The previous code fails three new optional-field regressions. The candidate
+passes formatting, all-target Clippy with warnings denied and **315 Rust workspace
+tests**, including seven new regressions. Original R9 preservation, stopped-copy
+replay, exact-image checks, deployment and the new daily test have separate dated
+receipts under `output/feed-relay-fix-20261013`; local tests do not establish them
+or economic suitability.
+
 ## October 12, 2026 — paper quote ordering and UTC risk windows
 
 The actor recalculates paper quotes on the candidate after fill/cancel acknowledgements,
