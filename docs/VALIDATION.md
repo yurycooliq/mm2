@@ -1,5 +1,28 @@
 # Validation evidence
 
+## October 13, 2026 — join the complete source generation
+
+The fee refresher could finish shutdown before the CLOB/Binance futures. Selecting
+that first completion dropped their enclosing JoinSet, which requests cancellation
+without joining the nested workers. A deterministic regression confirms that the
+previous coordinator acknowledged shutdown before its socket worker completed.
+This permits an overlap during source refresh; it does not establish which clock
+failed in the historical R12 frames, which were not retained.
+
+The coordinator now cancels the remaining future and joins both before returning,
+preserving the first failure. The existing six-second owner deadline still stops
+an unresponsive generation and prevents a new generation from starting. No risk,
+feed-age, backpressure or journal bound is increased. The FIFO recovery and public
+clock diagnostics from the preceding patch remain included.
+
+The final check passes **329 Rust tests**, formatting and all-target Clippy with
+warnings denied. The premature-acknowledgement regression fails with the previous
+select-first coordinator. The healthy R13 installation was never resumed: its
+15-minute selected-host check passed 181 sampled observations through four markets
+with zero costs and owner commands. Its complete preparation is preserved when
+replaced; it is not a daily experiment. Exact images, preserved R12 recovery and
+the actual new run are bound by `output/feed-generation-fix-20261013-r14` receipts.
+
 ## October 13, 2026 — preserve queued native recovery
 
 R12 stopped after about 29 minutes with a confirmed protective Pause; it did not

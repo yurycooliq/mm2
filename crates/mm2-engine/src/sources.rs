@@ -177,6 +177,32 @@ struct OwnedFeeds {
     task: Option<JoinHandle<Result<(), String>>>,
     shutdown: watch::Sender<bool>,
 }
+
+async fn join_generation<F, G>(
+    feeds: F,
+    fees: G,
+    shutdown: watch::Sender<bool>,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<(), String>>,
+    G: Future<Output = Result<(), String>>,
+{
+    tokio::pin!(feeds, fees);
+    let (feeds_finished, first) = tokio::select! {
+        result = &mut feeds => (true, result),
+        result = &mut fees => (false, result),
+    };
+    shutdown.send_replace(true);
+    // Fee shutdown may finish before the sockets. Dropping the feed future's
+    // JoinSet only requests aborts; it does not join its workers. The old
+    // generation must finish before SelectMarket acknowledges a new one.
+    let second = if feeds_finished {
+        fees.await
+    } else {
+        feeds.await
+    };
+    first.and(second)
+}
 impl OwnedFeeds {
     async fn stop(mut self, timeout: Duration) -> Result<(), String> {
         self.shutdown.send_replace(true);
@@ -402,9 +428,11 @@ async fn run_public(
             Some(handle.feed_diagnostics.clone()),
         );
         let mut owned = OwnedFeeds {
-            task: Some(tokio::spawn(async move {
-                tokio::select! { result = feed_task => result, result = fee_task => result }
-            })),
+            task: Some(tokio::spawn(join_generation(
+                feed_task,
+                fee_task,
+                feed_shutdown.clone(),
+            ))),
             shutdown: feed_shutdown,
         };
         let _ = handle.source_status(
@@ -548,6 +576,62 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn fee_shutdown_cannot_acknowledge_generation_before_socket_workers_join() {
+        let (shutdown, mut fee_stop) = watch::channel(false);
+        let mut socket_stop = shutdown.subscribe();
+        let joined = Arc::new(AtomicBool::new(false));
+        let child_joined = joined.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let feeds = async move {
+            let mut workers = tokio::task::JoinSet::new();
+            workers.spawn(async move {
+                let _ = started.send(());
+                wait_shutdown(&mut socket_stop).await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                child_joined.store(true, Ordering::SeqCst);
+            });
+            while workers.join_next().await.is_some() {}
+            Ok(())
+        };
+        let fees = async move {
+            wait_shutdown(&mut fee_stop).await;
+            Ok(())
+        };
+        let task = tokio::spawn(join_generation(feeds, fees, shutdown.clone()));
+        ready.await.unwrap();
+        OwnedFeeds {
+            task: Some(task),
+            shutdown,
+        }
+        .stop(Duration::from_secs(1))
+        .await
+        .unwrap();
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "a new source generation could overtake the old socket worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_first_failure_cancels_and_joins_the_other_future() {
+        let (shutdown, mut fee_stop) = watch::channel(false);
+        let finished = Arc::new(AtomicBool::new(false));
+        let fee_finished = finished.clone();
+        let result = join_generation(
+            async { Err("first public source failure".into()) },
+            async move {
+                wait_shutdown(&mut fee_stop).await;
+                fee_finished.store(true, Ordering::SeqCst);
+                Err("secondary cancellation failure".into())
+            },
+            shutdown.clone(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "first public source failure");
+        assert!(*shutdown.borrow() && finished.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
