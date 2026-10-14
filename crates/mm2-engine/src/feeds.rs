@@ -194,6 +194,8 @@ struct SourceDiagnostics {
     retry_delay_ms: AtomicU64,
     snapshots_seen: [AtomicU64; 2],
     snapshots_discarded_before_cutoff: [AtomicU64; 2],
+    stale_snapshots_discarded: [AtomicU64; 2],
+    book_exchange_watermark_ms: [AtomicU64; 2],
     bootstrap_cutoff_exchange_ms: [AtomicU64; 2],
     phase: AtomicU8,
     last_failure: AtomicU64,
@@ -230,6 +232,8 @@ pub struct SourceDiagnosticsSnapshot {
     retry_delay_ms: u64,
     snapshots_seen: [u64; 2],
     snapshots_discarded_before_cutoff: [u64; 2],
+    stale_snapshots_discarded: [u64; 2],
+    book_exchange_watermark_ms: [u64; 2],
     bootstrap_cutoff_exchange_ms: [u64; 2],
     phase: &'static str,
     last_failure: Option<&'static str>,
@@ -281,6 +285,12 @@ impl FeedDiagnostics {
                 }),
                 snapshots_discarded_before_cutoff: std::array::from_fn(|i| {
                     value.snapshots_discarded_before_cutoff[i].load(Ordering::Relaxed)
+                }),
+                stale_snapshots_discarded: std::array::from_fn(|i| {
+                    value.stale_snapshots_discarded[i].load(Ordering::Relaxed)
+                }),
+                book_exchange_watermark_ms: std::array::from_fn(|i| {
+                    value.book_exchange_watermark_ms[i].load(Ordering::Relaxed)
                 }),
                 bootstrap_cutoff_exchange_ms: std::array::from_fn(|i| {
                     value.bootstrap_cutoff_exchange_ms[i].load(Ordering::Relaxed)
@@ -704,12 +714,16 @@ pub fn parse_rest_book(
 struct Recovery {
     baseline: [u64; 2],
     initialized: [bool; 2],
+    latest_exchange: [u64; 2],
+    latest_receive: u64,
 }
 impl Recovery {
     fn new(baseline: [u64; 2]) -> Self {
         Self {
             baseline,
             initialized: [false; 2],
+            latest_exchange: baseline,
+            latest_receive: 0,
         }
     }
     #[cfg(test)]
@@ -717,10 +731,24 @@ impl Recovery {
         Self {
             baseline: [0; 2],
             initialized: [true; 2],
+            latest_exchange: [0; 2],
+            latest_receive: 0,
         }
     }
     fn ready(&self) -> bool {
         self.initialized.iter().all(|ready| *ready)
+    }
+    fn advance_watermark(
+        &mut self,
+        index: usize,
+        exchange_ms: u64,
+        diagnostics: Option<&SourceDiagnostics>,
+    ) {
+        self.latest_exchange[index] = self.latest_exchange[index].max(exchange_ms);
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.book_exchange_watermark_ms[index]
+                .store(self.latest_exchange[index], Ordering::Relaxed);
+        }
     }
     #[cfg(test)]
     fn filter(&mut self, events: Vec<FeedEvent>) -> Vec<FeedEvent> {
@@ -738,30 +766,48 @@ impl Recovery {
                 FeedEvent::Snapshot {
                     outcome,
                     exchange_ms,
+                    observed_mono_ms,
+                    ref bids,
+                    ref asks,
                     ..
                 } => {
                     let index = index(outcome);
                     if let Some(diagnostics) = diagnostics {
                         increment(&diagnostics.snapshots_seen[index]);
                     }
-                    if !self.initialized[index] && exchange_ms <= self.baseline[index] {
+                    let before_bootstrap =
+                        !self.initialized[index] && exchange_ms <= self.baseline[index];
+                    let obsolete = exchange_ms < self.latest_exchange[index];
+                    if (before_bootstrap || obsolete)
+                        && observed_mono_ms >= self.latest_receive
+                        && crate::domain::snapshot_shape_valid(bids, asks)
+                    {
                         if let Some(diagnostics) = diagnostics {
-                            increment(&diagnostics.snapshots_discarded_before_cutoff[index]);
+                            increment(if before_bootstrap {
+                                &diagnostics.snapshots_discarded_before_cutoff[index]
+                            } else {
+                                &diagnostics.stale_snapshots_discarded[index]
+                            });
                         }
                         return None;
                     }
                     self.initialized[index] = true;
+                    self.latest_receive = self.latest_receive.max(observed_mono_ms);
+                    self.advance_watermark(index, exchange_ms, diagnostics);
                     Some(event)
                 }
                 FeedEvent::Tick {
                     outcome,
                     exchange_ms,
+                    observed_mono_ms,
                     ..
                 } => {
                     let index = index(outcome);
                     if !self.initialized[index] && exchange_ms <= self.baseline[index] {
                         return None;
                     }
+                    self.latest_receive = self.latest_receive.max(observed_mono_ms);
+                    self.advance_watermark(index, exchange_ms, diagnostics);
                     Some(event)
                 }
                 FeedEvent::Delta {
@@ -781,6 +827,14 @@ impl Recovery {
                     if changes.is_empty() {
                         None
                     } else {
+                        self.latest_receive = self.latest_receive.max(observed_mono_ms);
+                        // Incremental updates and tick transitions remain strict:
+                        // older deltas/ticks are forwarded to Core, never discarded.
+                        // Advancing this floor also keeps a snapshot older than a
+                        // split/crossed delta from pretending to complete recovery.
+                        for change in &changes {
+                            self.advance_watermark(index(change.outcome), exchange_ms, diagnostics);
+                        }
                         Some(FeedEvent::Delta {
                             condition_id,
                             exchange_ms,
@@ -1562,6 +1616,9 @@ async fn session(
         for cutoff in &diagnostics.bootstrap_cutoff_exchange_ms {
             cutoff.store(0, Ordering::Relaxed);
         }
+        for watermark in &diagnostics.book_exchange_watermark_ms {
+            watermark.store(0, Ordering::Relaxed);
+        }
     }
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))
@@ -1623,6 +1680,7 @@ async fn session(
         if let Some(diagnostics) = diagnostics {
             for (index, value) in recovered_baseline.into_iter().enumerate() {
                 diagnostics.bootstrap_cutoff_exchange_ms[index].store(value, Ordering::Relaxed);
+                diagnostics.book_exchange_watermark_ms[index].store(value, Ordering::Relaxed);
             }
         }
         match enqueue_ordered(tx, events, settings.send, shutdown, diagnostics).await {
@@ -1639,6 +1697,7 @@ async fn session(
             if let Some(diagnostics) = diagnostics {
                 for (index, value) in baseline.into_iter().enumerate() {
                     diagnostics.bootstrap_cutoff_exchange_ms[index].store(value, Ordering::Relaxed);
+                    diagnostics.book_exchange_watermark_ms[index].store(value, Ordering::Relaxed);
                 }
             }
         }
@@ -2421,6 +2480,84 @@ mod transport_tests {
     }
 
     #[test]
+    fn r14_interleaved_native_snapshot_does_not_rewind_books_or_drop_trade_witnesses() {
+        for (latest, stale, receive, prior_receive) in [
+            (
+                1_791_944_333_584_u64,
+                1_791_944_333_571_u64,
+                13_782_271,
+                13_782_271,
+            ),
+            (1_791_944_350_054, 1_791_944_350_048, 13_798_740, 13_798_740),
+            (1_791_944_352_894, 1_791_944_352_878, 13_801_586, 13_801_579),
+        ] {
+            // These clocks are the retained R14 contexts. Level/trade values are
+            // constructed fixtures: the original rejected frames were not saved.
+            let mut selected = market();
+            selected.window_start_ms = latest - 1000;
+            selected.window_end_ms = latest + 60_000;
+            let mut core = crate::domain::Core::new(CoreConfig {
+                initial_collateral_micro: 1_000_000_000,
+                max_imbalance_micro: 10_000_000,
+                lot_micro: 5_000_000,
+                half_width_micro: 10_000,
+                max_feed_age_ms: 1000,
+            })
+            .unwrap();
+            core.set_market(selected.clone()).unwrap();
+            let mut recovery = Recovery::new([0; 2]);
+            for token in [&selected.up_token, &selected.down_token] {
+                let mut book = snapshot(&selected);
+                book["asset_id"] = token.as_str().into();
+                book["timestamp"] = (latest - 1).to_string().into();
+                for event in recovery
+                    .filter(parse_clob(&book.to_string(), &selected, prior_receive).unwrap())
+                {
+                    core.apply(event).unwrap();
+                }
+            }
+            let delta = json!({"event_type":"price_change", "market":selected.condition_id,
+                "timestamp":latest.to_string(), "price_changes":[
+                    {"asset_id":selected.up_token,"price":"0.49","size":"11","side":"BUY"},
+                    {"asset_id":selected.down_token,"price":"0.49","size":"11","side":"BUY"}]});
+            for event in
+                recovery.filter(parse_clob(&delta.to_string(), &selected, prior_receive).unwrap())
+            {
+                core.apply(event).unwrap();
+            }
+            let before = core.snapshot().up_book;
+            let mut old_book = snapshot(&selected);
+            old_book["timestamp"] = stale.to_string().into();
+            let trade = json!({"event_type":"last_trade_price","market":selected.condition_id,
+                "asset_id":selected.up_token,"timestamp":latest.to_string(),"price":"0.49",
+                "size":"1","side":"SELL","fee_rate_bps":"0"});
+            let parsed =
+                parse_clob(&json!([old_book, trade]).to_string(), &selected, receive).unwrap();
+            let mut strict = core.clone();
+            assert_eq!(
+                strict.apply(parsed[0].clone()).unwrap_err(),
+                "CLOB exchange clock regressed"
+            );
+            let accepted = recovery.filter(parsed);
+            assert_eq!(
+                accepted.len(),
+                1,
+                "an obsolete native snapshot must not reach the strict core"
+            );
+            assert!(matches!(&accepted[0], FeedEvent::Trade { .. }));
+            for event in accepted {
+                core.apply(event).unwrap();
+            }
+            let after = core.snapshot().up_book;
+            assert_eq!(after.exchange_ms, before.exchange_ms);
+            assert_eq!(after.observed_mono_ms, before.observed_mono_ms);
+            assert_eq!(after.best_bid_micro, before.best_bid_micro);
+            assert_eq!(after.best_ask_micro, before.best_ask_micro);
+            assert!(core.snapshot().last_error.is_none());
+        }
+    }
+
+    #[test]
     fn diagnostics_count_discarded_snapshots_without_initializing_or_exporting_payloads() {
         let selected = market();
         let diagnostics = FeedDiagnostics::default();
@@ -2932,8 +3069,8 @@ mod transport_tests {
     }
 
     #[test]
-    fn initialized_recovery_forwards_regressions_to_core_instead_of_preserving_stale_depth() {
-        for regressed in ["delta", "snapshot", "tick"] {
+    fn initialized_recovery_keeps_incremental_and_tick_regressions_strict() {
+        for regressed in ["delta", "tick"] {
             let mut selected = market();
             selected.tick_micro = 10_000;
             let mut core = Core::new(CoreConfig {
@@ -2970,7 +3107,6 @@ mod transport_tests {
                     json!({"event_type":"price_change","market":selected.condition_id,"timestamp":(base+150).to_string(),
                     "price_changes":[{"asset_id":selected.up_token,"price":"0.49","size":"0","side":"BUY"}]})
                 }
-                "snapshot" => book(&selected.up_token, base + 150),
                 _ => {
                     json!({"event_type":"tick_size_change","market":selected.condition_id,"asset_id":selected.up_token,
                     "timestamp":(base+150).to_string(),"old_tick_size":"0.001","new_tick_size":"0.01"})
@@ -3074,8 +3210,146 @@ mod transport_tests {
             77,
         )
         .unwrap();
-        // Once initialized, chronology is validated by Core rather than suppressed here.
-        assert_eq!(recovery.filter(recovered).len(), 2);
+        // Old full depth is redundant; tick transitions still reach the strict Core.
+        let filtered = recovery.filter(recovered);
+        assert_eq!(filtered.len(), 1);
+        assert!(matches!(filtered[0], FeedEvent::Tick { .. }));
+    }
+
+    #[test]
+    fn stale_snapshots_are_scoped_to_one_outcome_and_do_not_extend_freshness() {
+        let mut selected = market();
+        let base = selected.window_start_ms;
+        selected.window_end_ms = base + 60_000;
+        let mut core = Core::new(CoreConfig {
+            initial_collateral_micro: 1_000_000_000,
+            max_imbalance_micro: 10_000_000,
+            lot_micro: 5_000_000,
+            half_width_micro: 10_000,
+            max_feed_age_ms: 1000,
+        })
+        .unwrap();
+        core.set_market(selected.clone()).unwrap();
+        core.control(Action::Resume).unwrap();
+        let diagnostics = FeedDiagnostics::default();
+        let source = diagnostics.source(FeedSource::Clob);
+        let mut recovery = Recovery::new([base; 2]);
+        let mut full = snapshot(&selected);
+        full["timestamp"] = (base + 100).to_string().into();
+        for token in [&selected.up_token, &selected.down_token] {
+            full["asset_id"] = token.as_str().into();
+            for event in recovery.filter_observed(
+                parse_clob(&full.to_string(), &selected, 100).unwrap(),
+                Some(source),
+            ) {
+                core.apply(event).unwrap();
+            }
+        }
+        let delta = json!({"event_type":"price_change", "market":selected.condition_id,
+            "timestamp":(base + 200).to_string(), "price_changes":[
+                {"asset_id":selected.up_token,"price":"0.49","size":"11","side":"BUY"}]});
+        for event in recovery.filter_observed(
+            parse_clob(&delta.to_string(), &selected, 200).unwrap(),
+            Some(source),
+        ) {
+            core.apply(event).unwrap();
+        }
+        // Down's clock is independent of Up's newer delta.
+        full["asset_id"] = selected.down_token.as_str().into();
+        full["timestamp"] = (base + 150).to_string().into();
+        let down = recovery.filter_observed(
+            parse_clob(&full.to_string(), &selected, 250).unwrap(),
+            Some(source),
+        );
+        assert_eq!(down.len(), 1);
+        for event in down {
+            core.apply(event).unwrap();
+        }
+        full["asset_id"] = selected.up_token.as_str().into();
+        assert!(
+            recovery
+                .filter_observed(
+                    parse_clob(&full.to_string(), &selected, 1201).unwrap(),
+                    Some(source),
+                )
+                .is_empty()
+        );
+        let decision = core.evaluate(base + 1201, 1201);
+        assert!(decision.intents.is_empty());
+        assert!(
+            decision
+                .stop_reasons
+                .contains(&StopReason::StaleBook(Outcome::Up))
+        );
+        assert_eq!(core.snapshot().up_book.observed_mono_ms, Some(200));
+        assert_eq!(core.snapshot().down_book.exchange_ms, Some(base + 150));
+        let observed = diagnostics.snapshot();
+        assert_eq!(observed.clob.stale_snapshots_discarded, [1, 0]);
+        assert_eq!(
+            observed.clob.book_exchange_watermark_ms,
+            [base + 200, base + 150]
+        );
+    }
+
+    #[test]
+    fn obsolete_snapshot_cannot_hide_invalid_depth_identity_or_receive_clock() {
+        let selected = market();
+        let mut full = snapshot(&selected);
+        full["timestamp"] = "200".into();
+        for invalid in [
+            "crossed",
+            "duplicate",
+            "price",
+            "numeric",
+            "identity",
+            "receive",
+        ] {
+            let mut recovery = Recovery::new([0; 2]);
+            let mut core = Core::new(CoreConfig {
+                initial_collateral_micro: 1_000_000_000,
+                max_imbalance_micro: 10_000_000,
+                lot_micro: 5_000_000,
+                half_width_micro: 10_000,
+                max_feed_age_ms: 1000,
+            })
+            .unwrap();
+            core.set_market(selected.clone()).unwrap();
+            for event in recovery.filter(parse_clob(&full.to_string(), &selected, 100).unwrap()) {
+                core.apply(event).unwrap();
+            }
+            let mut old = full.clone();
+            old["timestamp"] = "199".into();
+            match invalid {
+                "crossed" => old["bids"][0]["price"] = "0.7".into(),
+                "duplicate" => {
+                    let level = old["bids"][0].clone();
+                    old["bids"].as_array_mut().unwrap().push(level);
+                }
+                "price" => old["asks"][0]["price"] = "1".into(),
+                "numeric" => old["asks"][0]["price"] = 1.into(),
+                "identity" => old["asset_id"] = "999".into(),
+                _ => {}
+            }
+            let parsed = parse_clob(
+                &old.to_string(),
+                &selected,
+                if invalid == "receive" { 99 } else { 101 },
+            );
+            if matches!(invalid, "duplicate" | "numeric" | "identity") {
+                assert!(
+                    parsed.is_err(),
+                    "invalid {invalid} must fail atomic parsing"
+                );
+            } else {
+                let events = recovery.filter(parsed.unwrap());
+                assert_eq!(
+                    events.len(),
+                    1,
+                    "invalid {invalid} must reach the strict Core"
+                );
+                assert!(core.apply(events.into_iter().next().unwrap()).is_err());
+            }
+        }
     }
 
     #[tokio::test]

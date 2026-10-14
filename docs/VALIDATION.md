@@ -1,5 +1,34 @@
 # Validation evidence
 
+## October 14, 2026 — discard obsolete full native snapshots
+
+R14 never received Resume. It remained Paused with zero spending and then latched
+the existing repeated-input guard. Its retained public clocks show three full
+snapshots 6–16 ms older than the current book, with nonregressing receive clocks.
+The complete rejected provider frames were not retained. A constructed fixture
+using those exact clocks fails with the old ingress and passes with this repair;
+the fixture's levels and trade are not a reconstruction of the missing payloads.
+
+Ingress now maintains separate exchange watermarks for each outcome and discards
+only well-formed full snapshots older than an already forwarded book update or
+tick. It keeps independent trade witnesses, does not advance book freshness, and
+cannot initialize recovery from obsolete depth. Malformed depth and regressed
+receive clocks still reach strict validation; incremental and tick regressions
+remain errors. Frame parsing remains atomic. The native snapshot deadline,
+source-generation shutdown, repeated-failure guard and every strategy/risk/journal
+limit are unchanged. Bounded diagnostics expose discarded counts and watermarks.
+
+The fresh-source check passes **332 Rust tests**, formatting and all-target Clippy
+with warnings denied. It covers outcome isolation, retained trades, unchanged
+freshness and invalid depth/identity/receive inputs. Earlier incomplete probes and
+test-fixture corrections remain in the operational evidence; only the final fresh
+compilation and actual failing old-code regression establish this comparison.
+Exact release images, stopped full-journal recovery, selected-host preflight and
+original Resume/Pause receipts have separate evidence under
+`output/snapshot-ordering-fix-20261014-r15`. A new daily experiment exists only
+after its original Resume and independent monitor are confirmed. Synthetic
+execution does not establish real profitability or economic suitability.
+
 ## October 13, 2026 — join the complete source generation
 
 The fee refresher could finish shutdown before the CLOB/Binance futures. Selecting
