@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 ACCOUNT = "276571117378"
@@ -120,6 +121,17 @@ def outside_repo(path, repo):
         raise RuntimeError("AWS credential/config material must stay outside the repository")
     return path
 
+def verify_new_credentials(executable, arguments, env):
+    """IAM propagation retries only these read-only checks, never key creation."""
+    retryable = {"InvalidClientTokenId", "UnrecognizedClientException", "AccessDenied", "AccessDeniedException"}
+    for attempt in range(6):
+        try:
+            return aws(executable, arguments, env=env)
+        except AwsError as error:
+            if str(error) not in retryable or attempt == 5:
+                raise
+            time.sleep(2)
+
 def credential_output(secret_path):
     secret = json.loads(dpapi(secret_path.read_bytes(), decrypt=True))
     if secret["user_arn"] != USER_ARN:
@@ -203,10 +215,10 @@ def provision(args):
     atomic_write(validation_config, section.encode(), True)
     atomic_write(validation_credentials, b"", True)
     validation_env = dict(os.environ, AWS_CONFIG_FILE=str(validation_config), AWS_SHARED_CREDENTIALS_FILE=str(validation_credentials))
-    verified = aws(args.aws, ["sts", "get-caller-identity"], env=validation_env)
+    verified = verify_new_credentials(args.aws, ["sts", "get-caller-identity"], validation_env)
     if verified["Arn"] != USER_ARN:
         raise RuntimeError("Protected credential process did not authenticate as the intended IAM user")
-    connection = aws(args.aws, ["ssm", "get-connection-status", "--target", INSTANCE], env=validation_env)
+    connection = verify_new_credentials(args.aws, ["ssm", "get-connection-status", "--target", INSTANCE], validation_env)
     atomic_write(config_path, config_after, True)
     if credentials_path.exists():
         atomic_write(credentials_path, credentials_after, True)

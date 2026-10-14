@@ -79,6 +79,22 @@ class ProfileMigrationTests(unittest.TestCase):
             self.assertFalse((Path(temp) / "must-not-exist").exists())
             self.assertEqual(invoke.call_count, 1)
 
+    def test_new_key_visibility_retries_only_the_read(self):
+        identity = {"Arn": access.USER_ARN}
+        with mock.patch.object(access, "aws", side_effect=[access.AwsError("InvalidClientTokenId"), identity]) as invoke, \
+                mock.patch.object(access.time, "sleep") as pause:
+            self.assertEqual(access.verify_new_credentials("unused", ["sts", "get-caller-identity"], {}), identity)
+            self.assertEqual(invoke.call_count, 2)
+            self.assertTrue(all(call.args[1] == ["sts", "get-caller-identity"] for call in invoke.call_args_list))
+            pause.assert_called_once_with(2)
+
+    def test_propagation_retries_are_bounded(self):
+        with mock.patch.object(access, "aws", side_effect=access.AwsError("InvalidClientTokenId")) as invoke, \
+                mock.patch.object(access.time, "sleep"):
+            with self.assertRaises(access.AwsError):
+                access.verify_new_credentials("unused", ["sts", "get-caller-identity"], {})
+            self.assertEqual(invoke.call_count, 6)
+
     @unittest.skipUnless(os.name == "nt", "Windows DPAPI integration")
     def test_dpapi_roundtrip_keeps_plaintext_out_of_blob(self):
         original = json.dumps({"test": "non-secret disposable roundtrip marker"}).encode()
