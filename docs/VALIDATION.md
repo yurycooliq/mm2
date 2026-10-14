@@ -1,5 +1,22 @@
 # Validation evidence
 
+## October 14, 2026 — experimental public-paper entry and inventory repair
+
+Fresh-source validation passes **338 Rust tests**, formatting and all-target Clippy
+with warnings denied. Public-paper new entries use a bounded one-second/one-basis-point
+Binance direction filter; reference warmup/staleness fail closed. Passive complement
+repair must strictly lower the gross-loss bound, including a minimum-sized overbuy.
+Symmetric repair, partial-fill bounds, directional admission and unchanged venue tick
+cancel/drain/replay contracts are covered. Initial failed local fixture/setup attempts
+remain in operational logs; the accepted result is `validation-final-pass.log`.
+Existing Python data/latency/ops/research suites pass 392 collected tests with 25
+Windows/optional skips (367 passed). Six TypeScript strategy parity cases and five
+execution reference cases pass. Console, exact release, container checks, R15 recovery
+and R16 server acceptance have separate receipts under
+`output/simulation-inventory-fix-20261014-r16`. Historical execution and global risk
+limits are unchanged. See [policy and limitations](PAPER_STRATEGY_R16.md).
+No completed holdout, real profitability or funded readiness is established.
+
 ## October 14, 2026 â€” discard obsolete full native snapshots
 
 R14 never received Resume. It remained Paused with zero spending and then latched

@@ -150,6 +150,23 @@ impl MultiMarketPaper {
         }
         // Exact side basis also caps every newly requested hedge price.
         for quote in &mut decision.quotes {
+            if quote.slot.ends_with(":repair") {
+                let quantities = [position.up.quantity_micros, position.down.quantity_micros];
+                let costs = [position.up.cost_pico, position.down.cost_pico];
+                let side = usize::from(quote.outcome == Outcome::Down);
+                let mut after = quantities;
+                after[side] = after[side]
+                    .checked_add(quote.quantity_micros)
+                    .ok_or("repair quantity overflow")?;
+                let mut after_costs = costs;
+                after_costs[side] +=
+                    u128::from(quote.quantity_micros) * u128::from(quote.price_micros);
+                if mm2_strategy::inventory_loss_bound(after, after_costs)
+                    >= mm2_strategy::inventory_loss_bound(quantities, costs)
+                {
+                    return Err("paper repair does not reduce gross loss bound".into());
+                }
+            }
             if quote.slot.ends_with(":hedge") {
                 let owned = if quote.outcome == Outcome::Up {
                     &position.down
@@ -366,6 +383,13 @@ impl MultiMarketPaper {
 pub enum Operation {
     /// Versioned at a zero-spend baseline; never rewrites legacy allocations.
     ExactAccounting {},
+    /// Audit witness only; execution replay still uses the original immutable quotes.
+    PaperEntrySignal {
+        anchor_exchange_ms: u64,
+        anchor_price_micro: u64,
+        latest_exchange_ms: u64,
+        latest_price_micro: u64,
+    },
     FeeRules {
         policy: mm2_live::fees::FeePolicy,
     },
@@ -501,6 +525,23 @@ pub fn new(limits: &Limits) -> Result<MultiMarketPaper, String> {
 
 pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<(), String> {
     let result = match operation {
+        Operation::PaperEntrySignal {
+            anchor_exchange_ms,
+            anchor_price_micro,
+            latest_exchange_ms,
+            latest_price_micro,
+        } => {
+            if !session.exact_execution_costs
+                || *anchor_price_micro == 0
+                || *latest_price_micro == 0
+                || latest_exchange_ms
+                    .checked_sub(*anchor_exchange_ms)
+                    .is_none_or(|span| !(1_000..=1_500).contains(&span))
+            {
+                return Err("invalid paper entry signal witness".into());
+            }
+            Ok(())
+        }
         Operation::ExactAccounting {} => {
             if !session.exact_execution_costs && !session.can_enable_exact_costs() {
                 return Err("legacy accounting uncertainty blocks version change".into());

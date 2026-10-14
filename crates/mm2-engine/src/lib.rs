@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod domain;
 pub mod feeds;
 pub mod journal;
+mod paper_guard;
 pub mod paper_resolution;
 pub mod runtime;
 pub mod simulation;

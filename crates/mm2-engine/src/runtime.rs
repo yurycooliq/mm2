@@ -256,6 +256,7 @@ pub struct Actor {
     strategy: mm2_strategy::Rules,
     desired_quotes: Vec<mm2_core::DesiredQuote>,
     strategy_gate: Option<mm2_strategy::Gate>,
+    reference_guard: crate::paper_guard::ReferenceGuard,
     live: Option<mm2_live::LiveHandle>,
     live_quotes: Vec<mm2_core::DesiredQuote>,
     paper: Option<Handle>,
@@ -450,6 +451,7 @@ pub fn prepare(
         strategy: config.strategy.clone(),
         desired_quotes: Vec::new(),
         strategy_gate: None,
+        reference_guard: Default::default(),
         live: None,
         live_quotes: Vec::new(),
         paper: None,
@@ -566,6 +568,13 @@ impl Actor {
         }
         if self.last_decision.stop_reasons.is_empty() && !paper_halted {
             let snapshot = self.core.snapshot();
+            if let Some(reference) = &snapshot.reference {
+                self.reference_guard.observe(
+                    reference.exchange_ms,
+                    reference.observed_mono_ms,
+                    reference.price_micro,
+                );
+            }
             if let Some(market) = &snapshot.market {
                 let account = paper.map(|s| s.snapshot().account);
                 let mut rules = self.strategy.clone();
@@ -610,7 +619,11 @@ impl Actor {
                         .outcome_spent_pico
                         .as_ref()
                         .and_then(|costs| Some([costs[0].parse().ok()?, costs[1].parse().ok()?]));
-                    mm2_strategy::decide_inventory_aware(&rules, &input, costs)
+                    if self.source == "public" {
+                        mm2_strategy::decide_inventory_repair(&rules, &input, costs)
+                    } else {
+                        mm2_strategy::decide_inventory_aware(&rules, &input, costs)
+                    }
                 } else {
                     mm2_strategy::decide(&rules, &input)
                 };
@@ -619,6 +632,30 @@ impl Actor {
                         && let Some(paper) = paper
                     {
                         paper.guard_strategy_quotes(&rules, &mut decision)?;
+                    }
+
+                    if self.execution_mode == "simulation"
+                        && self.source == "public"
+                        && input.inventory_up_micros == input.inventory_down_micros
+                        && decision.reason == mm2_strategy::Gate::Quote
+                    {
+                        match if snapshot.binance_connected {
+                            self.reference_guard.blocked(mono, now)
+                        } else {
+                            None
+                        } {
+                            None => {
+                                decision.quotes.clear();
+                                decision.reason = mm2_strategy::Gate::MissingSignal;
+                            }
+                            Some(Some(outcome)) => {
+                                decision.quotes.retain(|q| q.outcome != outcome);
+                                if decision.quotes.is_empty() {
+                                    decision.reason = mm2_strategy::Gate::DirectionalGuard;
+                                }
+                            }
+                            Some(None) => {}
+                        }
                     }
                     Ok(decision)
                 });
@@ -1068,6 +1105,33 @@ impl Actor {
                 now_ms: now,
                 quotes: simulation::from_core_quotes(&self.desired_quotes),
             };
+            if new_quote
+                && self.source == "public"
+                && current.account.up_inventory_micros == current.account.down_inventory_micros
+                && !self.desired_quotes.is_empty()
+            {
+                let Some((
+                    anchor_exchange_ms,
+                    anchor_price_micro,
+                    latest_exchange_ms,
+                    latest_price_micro,
+                )) = self.reference_guard.evidence()
+                else {
+                    self.latch("missing public paper entry signal witness".into());
+                    return;
+                };
+                let evidence = SimulationOperation::PaperEntrySignal {
+                    anchor_exchange_ms,
+                    anchor_price_micro,
+                    latest_exchange_ms,
+                    latest_price_micro,
+                };
+                if let Err(error) = simulation::apply(&mut candidate, &evidence) {
+                    self.latch(error);
+                    return;
+                }
+                operations.push(evidence);
+            }
             let mut quoted = candidate.clone();
             match simulation::apply(&mut quoted, &quote) {
                 Ok(()) => {
@@ -1987,6 +2051,13 @@ impl Publication {
             "committing":self.committing,"shutting_down":self.closing,"journal_bytes":self.journal_bytes,
             "metrics":metrics
         });
+        publication["paper_strategy_policy"] = if self.execution_mode == "simulation"
+            && self.source == "public"
+        {
+            json!({"id":"r16-directional-inventory-repair-v1","experimental":true,"entry_guard_bps":1,"entry_guard_horizon_ms":1000,"repair":"passive_complement_strict_gross_risk_reduction","minimum_order_shares":5,"global_risk_limits_unchanged":true})
+        } else {
+            Value::Null
+        };
         if let (Value::Object(publication), Value::Object(diagnostics)) =
             (&mut publication, diagnostics)
         {
@@ -2467,6 +2538,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn public_paper_entry_filter_blocks_adverse_side_and_missing_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = batch_config(directory.path());
+        let mut actor = batch_actor(&config).await;
+        simulation::apply(
+            actor.simulation.as_mut().unwrap(),
+            &SimulationOperation::ExactAccounting {},
+        )
+        .unwrap();
+        actor.start = Instant::now() - Duration::from_secs(2);
+        let now = wall_ms();
+        let mono = mono_ms(actor.start);
+        let condition = actor.condition.clone().unwrap();
+        let market = actor.core.snapshot().market.unwrap();
+        let (_fees, rx) = watch::channel(Some(mm2_live::fees::FeePolicy {
+            condition_id: market.condition_id,
+            up_token: market.up_token,
+            down_token: market.down_token,
+            rate: "0.07".into(),
+            exponent: 1,
+            taker_only: true,
+            observed_at_ms: now,
+            response_sha256: "a".repeat(64),
+        }));
+        actor.fee_policy = rx;
+        for (outcome, bid, ask) in [
+            (Outcome::Up, 490_000, 510_000),
+            (Outcome::Down, 490_000, 510_000),
+        ] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: condition.clone(),
+                    outcome,
+                    exchange_ms: now,
+                    observed_mono_ms: mono,
+                    bids: vec![crate::domain::Level {
+                        price_micro: bid,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: ask,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        assert!(actor.desired_quotes.is_empty());
+        actor
+            .reference_guard
+            .observe(now - 1_000, mono - 1_000, 100_000_000);
+        actor
+            .core
+            .apply(FeedEvent::Reference {
+                exchange_ms: now,
+                observed_mono_ms: mono,
+                price_micro: 100_020_000,
+            })
+            .unwrap();
+        actor.evaluate();
+        assert!(
+            !actor.desired_quotes.is_empty(),
+            "gate={:?} stops={:?} reference={:?}",
+            actor.strategy_gate,
+            actor.last_decision.stop_reasons,
+            actor
+                .reference_guard
+                .blocked(mono_ms(actor.start), wall_ms())
+        );
+        assert!(
+            actor
+                .desired_quotes
+                .iter()
+                .all(|q| q.outcome == mm2_core::Outcome::Up)
+        );
     }
 
     async fn batch_actor(config: &Config) -> Actor {
