@@ -629,12 +629,6 @@ impl Actor {
                 };
                 let decision = decision.and_then(|mut decision| {
                     if self.execution_mode == "simulation"
-                        && let Some(paper) = paper
-                    {
-                        paper.guard_strategy_quotes(&rules, &mut decision)?;
-                    }
-
-                    if self.execution_mode == "simulation"
                         && self.source == "public"
                         && input.inventory_up_micros == input.inventory_down_micros
                         && decision.reason == mm2_strategy::Gate::Quote
@@ -655,6 +649,15 @@ impl Actor {
                                 }
                             }
                             Some(None) => {}
+                        }
+                    }
+                    if self.execution_mode == "simulation"
+                        && let Some(paper) = paper
+                    {
+                        if self.source == "public" {
+                            paper.guard_public_strategy_quotes(&rules, &mut decision)?;
+                        } else {
+                            paper.guard_strategy_quotes(&rules, &mut decision)?;
                         }
                     }
                     Ok(decision)
@@ -2054,7 +2057,7 @@ impl Publication {
         publication["paper_strategy_policy"] = if self.execution_mode == "simulation"
             && self.source == "public"
         {
-            json!({"id":"r16-directional-inventory-repair-v1","experimental":true,"entry_guard_bps":1,"entry_guard_horizon_ms":1000,"repair":"passive_complement_strict_gross_risk_reduction","minimum_order_shares":5,"global_risk_limits_unchanged":true})
+            json!({"id":"r17-directional-admission-subsets-v1","experimental":true,"entry_guard_bps":1,"entry_guard_horizon_ms":1000,"entry_filter_before_risk":true,"quote_selection":"full_set_else_safe_strategy_priority_subset","repair":"passive_complement_strict_gross_risk_reduction","minimum_order_shares":5,"global_risk_limits_unchanged":true})
         } else {
             Value::Null
         };
@@ -2377,12 +2380,22 @@ mod tests {
     }
 
     fn retained_windows(config: &Config, count: u64) {
+        retained_windows_version(config, count, false)
+    }
+    fn retained_windows_version(config: &Config, count: u64, exact: bool) {
         let mut journal = Journal::open_streaming(
             &config.state_dir,
             crate::journal::JournalOptions::default(),
             config.limits.canonical().unwrap(),
         )
         .unwrap();
+        if exact {
+            journal
+                .commit_execution(
+                    simulation::values(&[SimulationOperation::ExactAccounting {}]).unwrap(),
+                )
+                .unwrap();
+        }
         for i in 0..count {
             let now = i * 20_000;
             let inputs = vec![
@@ -2618,6 +2631,99 @@ mod tests {
                 .iter()
                 .all(|q| q.outcome == mm2_core::Outcome::Up)
         );
+    }
+
+    #[tokio::test]
+    async fn public_filter_precedes_budget_and_selection_preserves_all_retained_market_risk() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = batch_config(directory.path());
+        retained_windows_version(&config, 4, true); // $8 of unresolved prior risk.
+        let mut actor = batch_actor(&config).await;
+        actor.start = Instant::now() - Duration::from_secs(2);
+        let now = wall_ms();
+        let mono = mono_ms(actor.start);
+        let market = actor.core.snapshot().market.unwrap();
+        let (_fees, rx) = watch::channel(Some(mm2_live::fees::FeePolicy {
+            condition_id: market.condition_id.clone(),
+            up_token: market.up_token,
+            down_token: market.down_token,
+            rate: "0.07".into(),
+            exponent: 1,
+            taker_only: true,
+            observed_at_ms: now,
+            response_sha256: "a".repeat(64),
+        }));
+        actor.fee_policy = rx;
+        for (outcome, bid, ask) in [
+            (Outcome::Up, 250_000, 260_000),
+            (Outcome::Down, 740_000, 750_000),
+        ] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: market.condition_id.clone(),
+                    outcome,
+                    exchange_ms: now,
+                    observed_mono_ms: mono,
+                    bids: vec![crate::domain::Level {
+                        price_micro: bid,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: ask,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::MissingSignal));
+        assert!(actor.desired_quotes.is_empty());
+        for (latest, expected_gate) in [
+            (100_020_000, mm2_strategy::Gate::Quote),
+            (100_000_000, mm2_strategy::Gate::Quote),
+            (99_980_000, mm2_strategy::Gate::LossBudget),
+        ] {
+            actor.reference_guard = Default::default();
+            actor
+                .reference_guard
+                .observe(now - 1_000, mono - 1_000, 100_000_000);
+            actor
+                .core
+                .apply(FeedEvent::Reference {
+                    exchange_ms: now,
+                    observed_mono_ms: mono,
+                    price_micro: latest,
+                })
+                .unwrap();
+            actor.evaluate();
+            assert_eq!(actor.strategy_gate, Some(expected_gate));
+            if expected_gate == mm2_strategy::Gate::Quote {
+                assert_eq!(actor.desired_quotes.len(), 1);
+                assert_eq!(actor.desired_quotes[0].outcome, mm2_core::Outcome::Up);
+                assert!(
+                    actor
+                        .simulation
+                        .as_ref()
+                        .unwrap()
+                        .quote_risk_permitted(&actor.desired_quotes)
+                        .unwrap()
+                );
+            } else {
+                assert!(actor.desired_quotes.is_empty());
+            }
+        }
+        assert_eq!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .portfolio_snapshot()
+                .held_market_count,
+            Some(4)
+        );
+        assert_eq!(actor.limits, config.limits.canonical().unwrap());
     }
 
     async fn batch_actor(config: &Config) -> Actor {
@@ -2873,10 +2979,11 @@ mod tests {
         }
         retained_windows(&config, 4);
         let mut actor = batch_actor(&config).await;
+        actor.start = Instant::now() - Duration::from_secs(2);
         let condition = actor.condition.clone().unwrap();
         for (outcome, bid, ask) in [
-            (Outcome::Up, 600_000, 610_000),
-            (Outcome::Down, 390_000, 400_000),
+            (Outcome::Up, 490_000, 510_000),
+            (Outcome::Down, 490_000, 510_000),
         ] {
             actor
                 .core
@@ -2896,6 +3003,19 @@ mod tests {
                 })
                 .unwrap();
         }
+        let now = wall_ms();
+        let mono = mono_ms(actor.start);
+        actor
+            .reference_guard
+            .observe(now - 1_000, mono - 1_000, 100_000_000);
+        actor
+            .core
+            .apply(FeedEvent::Reference {
+                exchange_ms: now,
+                observed_mono_ms: mono,
+                price_micro: 100_000_000,
+            })
+            .unwrap();
         actor.core.control(Action::Resume).unwrap();
         actor.evaluate();
         assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::LossBudget));

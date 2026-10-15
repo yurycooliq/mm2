@@ -1,5 +1,24 @@
 # Validation evidence
 
+## October 15, 2026 - public-paper filter order and quote subset admission
+
+Fresh-source formatting, all-target Clippy with warnings denied and **341 Rust
+tests** pass. Public-paper entry filtering now precedes risk admission; a complete
+affordable set is preserved, otherwise a bounded subset is selected in existing
+strategy order. Regressions cover both outcomes, strict budget equality, missing
+and adverse references, retained unresolved markets and cancel-in-flight orders.
+Initial test setup corrections remain in local logs; the accepted run is
+`rust-validation-3.log`.
+
+Python checks pass 495 tests with 25 platform/optional skips, including 128 console
+tests. Six TypeScript strategy parity and five execution reference cases pass.
+The full stopped R16 night, independent accounting, immutable release images and
+fresh R17 startup require separate receipts under
+`output/risk-admission-fix-20261015-r17`. The $10 daily gross loss and $20 realized
+drawdown caps, settlement accounting and funded behavior remain unchanged.
+See [R17 policy and replay limits](PAPER_STRATEGY_R17.md). This does not establish
+counterfactual profit, a completed holdout or funded readiness.
+
 ## October 14, 2026 — experimental public-paper entry and inventory repair
 
 Fresh-source validation passes **338 Rust tests**, formatting and all-target Clippy

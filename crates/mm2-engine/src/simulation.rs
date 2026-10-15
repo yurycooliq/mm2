@@ -101,6 +101,27 @@ impl MultiMarketPaper {
         rules: &mm2_strategy::Rules,
         decision: &mut mm2_strategy::Decision,
     ) -> Result<(), String> {
+        self.guard_strategy_quotes_inner(rules, decision, false)
+    }
+    /// Public-paper selection only. Preserve the full decision when affordable;
+    /// otherwise retain a safe subset in the strategy's existing priority order.
+    /// Every check still includes all old possible fills, even canceled intents.
+    pub fn guard_public_strategy_quotes(
+        &self,
+        rules: &mm2_strategy::Rules,
+        decision: &mut mm2_strategy::Decision,
+    ) -> Result<(), String> {
+        if decision.quotes.len() > mm2_strategy::MAX_QUOTES {
+            return Err("unbounded public strategy decision".into());
+        }
+        self.guard_strategy_quotes_inner(rules, decision, true)
+    }
+    fn guard_strategy_quotes_inner(
+        &self,
+        rules: &mm2_strategy::Rules,
+        decision: &mut mm2_strategy::Decision,
+        select_subset: bool,
+    ) -> Result<(), String> {
         if !self.exact_execution_costs {
             decision.quotes.clear();
             decision.reason = mm2_strategy::Gate::InventoryCost;
@@ -193,8 +214,18 @@ impl MultiMarketPaper {
             return Ok(());
         }
         if !self.quote_risk_permitted(&decision.quotes)? {
-            decision.quotes.clear();
-            decision.reason = mm2_strategy::Gate::LossBudget;
+            let requested = std::mem::take(&mut decision.quotes);
+            if select_subset {
+                for quote in requested {
+                    decision.quotes.push(quote);
+                    if !self.quote_risk_permitted(&decision.quotes)? {
+                        decision.quotes.pop();
+                    }
+                }
+            }
+            if decision.quotes.is_empty() {
+                decision.reason = mm2_strategy::Gate::LossBudget;
+            }
         }
         Ok(())
     }
@@ -892,6 +923,160 @@ pub fn same_state_without_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn profitable_paper_with_two_dollars_remaining() -> MultiMarketPaper {
+        let mut paper = new(&limits()).unwrap();
+        apply(&mut paper, &Operation::ExactAccounting {}).unwrap();
+        for (name, quantity, cost, winner, at) in [
+            ('d', 20_000_000, 4_000_000_000_000, Outcome::Up, 1),
+            ('e', 10_000_000, 8_000_000_000_000, Outcome::Down, 2),
+        ] {
+            let market = mm2_portfolio::Market {
+                id: id(name),
+                start_ms: at - 1,
+                end_ms: at,
+            };
+            paper.portfolio.register_market(market.clone()).unwrap();
+            paper
+                .portfolio
+                .record_execution_outcome_totals(&market.id, [cost, 0], [quantity, 0])
+                .unwrap();
+            paper
+                .portfolio
+                .redeem(
+                    mm2_portfolio::ResolutionReceipt {
+                        id: format!("resolve-{name}"),
+                        market_id: market.id,
+                        winning_outcome: winner,
+                        fee_pico: 0,
+                        at_ms: at,
+                        finality_confirmed: true,
+                        provenance: mm2_portfolio::Provenance::Synthetic,
+                    },
+                    true,
+                )
+                .unwrap();
+        }
+        apply(
+            &mut paper,
+            &Operation::Market {
+                condition_id: id('f'),
+                start_ms: Some(2),
+                end_ms: Some(300_002),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            paper.portfolio_snapshot().realized_pnl_pico,
+            "8000000000000"
+        );
+        assert_eq!(paper.portfolio_snapshot().daily_loss_pico, "8000000000000");
+        paper
+    }
+    fn decision(quotes: Vec<DesiredQuote>) -> mm2_strategy::Decision {
+        mm2_strategy::Decision {
+            quotes,
+            reason: mm2_strategy::Gate::Quote,
+            center_micros: None,
+            half_width_micros: None,
+        }
+    }
+    fn lot(outcome: Outcome, price_micros: u64) -> DesiredQuote {
+        DesiredQuote {
+            slot: format!("{}:lot", if outcome == Outcome::Up { "up" } else { "down" }),
+            outcome,
+            price_micros,
+            quantity_micros: 5_000_000,
+        }
+    }
+    #[test]
+    fn public_selection_keeps_affordable_side_symmetrically_without_replenishing_gross_budget() {
+        let paper = profitable_paper_with_two_dollars_remaining();
+        let rules = mm2_strategy::Rules::default();
+        for cheap in [Outcome::Up, Outcome::Down] {
+            let quotes = vec![
+                lot(
+                    Outcome::Up,
+                    if cheap == Outcome::Up {
+                        300_000
+                    } else {
+                        600_000
+                    },
+                ),
+                lot(
+                    Outcome::Down,
+                    if cheap == Outcome::Down {
+                        300_000
+                    } else {
+                        600_000
+                    },
+                ),
+            ];
+            let mut old = decision(quotes.clone());
+            paper.guard_strategy_quotes(&rules, &mut old).unwrap();
+            assert!(old.quotes.is_empty());
+            let mut selected = decision(quotes);
+            paper
+                .guard_public_strategy_quotes(&rules, &mut selected)
+                .unwrap();
+            assert_eq!(selected.quotes, vec![lot(cheap, 300_000)]);
+            assert_eq!(selected.reason, mm2_strategy::Gate::Quote);
+            assert!(paper.quote_risk_permitted(&selected.quotes).unwrap());
+        }
+        let mut affordable = decision(vec![lot(Outcome::Up, 150_000), lot(Outcome::Down, 150_000)]);
+        let original = affordable.clone();
+        paper
+            .guard_public_strategy_quotes(&rules, &mut affordable)
+            .unwrap();
+        assert_eq!(affordable, original);
+        let mut too_expensive =
+            decision(vec![lot(Outcome::Up, 400_000), lot(Outcome::Down, 600_000)]);
+        paper
+            .guard_public_strategy_quotes(&rules, &mut too_expensive)
+            .unwrap();
+        assert_eq!(too_expensive.reason, mm2_strategy::Gate::LossBudget);
+        assert!(too_expensive.quotes.is_empty()); // Equality remains blocked.
+        assert_eq!(paper.portfolio_snapshot().daily_loss_pico, "8000000000000");
+        assert_eq!(paper.portfolio.policy().max_daily_loss_micros, 10_000_000);
+        assert_eq!(paper.portfolio.policy().max_drawdown_micros, 20_000_000);
+    }
+    #[test]
+    fn selected_quotes_keep_cancel_race_and_retained_order_reservations() {
+        let mut paper = profitable_paper_with_two_dollars_remaining();
+        paper
+            .set_book(
+                0,
+                Outcome::Up,
+                Book {
+                    bid: Some(300_000),
+                    ask: Some(320_000),
+                    bid_levels: vec![],
+                },
+            )
+            .unwrap();
+        let quote = lot(Outcome::Up, 300_000);
+        paper.quote(0, vec![quote.clone()]).unwrap();
+        paper.advance(100).unwrap();
+        let rules = mm2_strategy::Rules::default();
+        let mut retained = decision(vec![quote]);
+        paper
+            .guard_public_strategy_quotes(&rules, &mut retained)
+            .unwrap();
+        assert_eq!(retained.quotes.len(), 1);
+        paper.cancel_all(100).unwrap();
+        let replacement = lot(Outcome::Up, 310_000);
+        let mut pending = decision(vec![replacement.clone()]);
+        paper
+            .guard_public_strategy_quotes(&rules, &mut pending)
+            .unwrap();
+        assert!(pending.quotes.is_empty());
+        paper.advance(1000).unwrap();
+        let mut confirmed = decision(vec![replacement.clone()]);
+        paper
+            .guard_public_strategy_quotes(&rules, &mut confirmed)
+            .unwrap();
+        assert_eq!(confirmed.quotes, vec![replacement]);
+        paper.validate().unwrap();
+    }
     #[test]
     fn recorded_utc_window_replays_without_using_synthetic_future_time() {
         let mut session = new(&limits()).unwrap();
