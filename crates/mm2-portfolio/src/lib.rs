@@ -184,6 +184,10 @@ pub struct Snapshot {
     pub position_count: usize,
     #[serde(default)]
     pub positions_truncated: usize,
+    /// Aggregate over all retained markets, including those omitted by telemetry.
+    /// Older telemetry without this field cannot prove omitted inventory is zero.
+    #[serde(default)]
+    pub held_market_count: Option<usize>,
     pub reservations: Vec<Reservation>,
     pub halted: Option<String>,
 }
@@ -890,6 +894,14 @@ impl Portfolio {
             available_cash_micros: self.available_cash_micros(),
             position_count: self.markets.len(),
             positions_truncated: self.markets.len().saturating_sub(positions.len()),
+            held_market_count: Some(
+                self.markets
+                    .values()
+                    .filter(|position| {
+                        position.up.quantity_micros > 0 || position.down.quantity_micros > 0
+                    })
+                    .count(),
+            ),
             positions,
             reservations: self.reservations.values().cloned().collect(),
             halted: self.halted.clone(),

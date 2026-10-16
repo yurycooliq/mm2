@@ -6,8 +6,12 @@ use alloy::{
     primitives::Signature,
     sol_types::{SolEvent, SolStruct, SolValue},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue};
+use sha2::Sha256;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
 pub const DEPOSIT_FACTORY: Address = literal_address!("0x00000000000Fb5C9ADea0298D729A0CB3823Cc07");
@@ -49,6 +53,9 @@ pub struct RelaySettings {
     pub url: String,
     pub key_env: String,
     pub key_address_env: String,
+    pub builder_key_env: String,
+    pub builder_secret_env: String,
+    pub builder_passphrase_env: String,
     pub deadline_seconds: u64,
     pub log_chunk_blocks: u64,
     pub max_scan_pages: u64,
@@ -59,6 +66,9 @@ impl Default for RelaySettings {
             url: RELAYER_URL.into(),
             key_env: "MM2_POLY_RELAYER_API_KEY".into(),
             key_address_env: "MM2_POLY_RELAYER_API_KEY_ADDRESS".into(),
+            builder_key_env: "MM2_POLY_BUILDER_API_KEY".into(),
+            builder_secret_env: "MM2_POLY_BUILDER_API_SECRET".into(),
+            builder_passphrase_env: "MM2_POLY_BUILDER_API_PASSPHRASE".into(),
             deadline_seconds: 600,
             log_chunk_blocks: 50,
             max_scan_pages: 8,
@@ -76,10 +86,19 @@ impl RelaySettings {
                 && s.bytes()
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
         };
+        let names = [
+            &self.key_env,
+            &self.key_address_env,
+            &self.builder_key_env,
+            &self.builder_secret_env,
+            &self.builder_passphrase_env,
+        ];
         if (!test && self.url != RELAYER_URL)
-            || !env_name(&self.key_env)
-            || !env_name(&self.key_address_env)
-            || self.key_env == self.key_address_env
+            || names.iter().any(|name| !env_name(name))
+            || names
+                .iter()
+                .enumerate()
+                .any(|(i, name)| names[..i].contains(name))
             || !(60..=3600).contains(&self.deadline_seconds)
             || !(10..=5000).contains(&self.log_chunk_blocks)
             || !(1..=32).contains(&self.max_scan_pages)
@@ -148,21 +167,179 @@ struct RelayCall {
     data: String,
 }
 
+// Builder keys authorize the integration, not the controlling signer. The signer is
+// supplied independently by the reviewed account configuration for either scheme.
+enum RelayAuth {
+    Owner(HeaderMap),
+    Builder { headers: HeaderMap, secret: Vec<u8> },
+}
+impl RelayAuth {
+    fn select(owner: Address, values: [Option<String>; 5]) -> Result<Self, String> {
+        let [key, key_owner, builder_key, secret, passphrase] = values;
+        let any_owner = key.is_some() || key_owner.is_some();
+        let any_builder = builder_key.is_some() || secret.is_some() || passphrase.is_some();
+        if any_owner && any_builder {
+            return Err(
+                "ambiguous Relayer credentials: select owner or Builder authentication".into(),
+            );
+        }
+        match (key, key_owner, builder_key, secret, passphrase) {
+            (Some(key), Some(key_owner), None, None, None) => {
+                if address(&key_owner)? != owner {
+                    return Err("Relayer API key owner differs from controlling signer".into());
+                }
+                Self::owner(&key, owner)
+            }
+            (None, None, Some(key), Some(secret), Some(passphrase)) => {
+                Self::builder(&key, &secret, &passphrase)
+            }
+            (None, None, None, None, None) => {
+                Err("owner or Builder Relayer credentials missing".into())
+            }
+            _ => Err(
+                "incomplete Relayer credentials: supply one complete authentication scheme".into(),
+            ),
+        }
+    }
+    fn sensitive(value: &str) -> Result<HeaderValue, String> {
+        let mut header =
+            HeaderValue::from_str(value).map_err(|_| "invalid bounded Relayer credential")?;
+        header.set_sensitive(true);
+        Ok(header)
+    }
+    fn owner(key: &str, owner: Address) -> Result<Self, String> {
+        if key.is_empty()
+            || key.len() > 1024
+            || !key.bytes().all(|b| (33..=126).contains(&b))
+            || owner.is_zero()
+        {
+            return Err("invalid bounded owner Relayer API credentials".into());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("relayer_api_key", Self::sensitive(key)?);
+        headers.insert(
+            "relayer_api_key_address",
+            HeaderValue::from_str(&format!("{owner:#x}"))
+                .map_err(|_| "invalid Relayer API owner header")?,
+        );
+        Ok(Self::Owner(headers))
+    }
+    fn builder(key: &str, secret: &str, passphrase: &str) -> Result<Self, String> {
+        let uuid = polymarket_client_sdk_v2::auth::Uuid::parse_str(key)
+            .map_err(|_| "invalid Builder API key")?;
+        if uuid.is_nil()
+            || key.len() != 36
+            || !(1..=256).contains(&passphrase.len())
+            || !passphrase
+                .bytes()
+                .all(|b| (33..=126).contains(&b) && !b"$'\"\\`".contains(&b))
+        {
+            return Err("invalid bounded Builder API credentials".into());
+        }
+        let unpadded = secret.trim_end_matches('=');
+        if !(16..=512).contains(&unpadded.len())
+            || secret.len() - unpadded.len() > 2
+            || !unpadded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err("invalid Builder secret encoding".into());
+        }
+        let padded = format!("{unpadded}{}", "=".repeat((4 - unpadded.len() % 4) % 4));
+        let decoded = URL_SAFE
+            .decode(&padded)
+            .map_err(|_| "invalid Builder secret encoding")?;
+        if !(16..=256).contains(&decoded.len())
+            || URL_SAFE.encode(&decoded).trim_end_matches('=') != unpadded
+            || (secret.contains('=') && secret != padded)
+        {
+            return Err("invalid canonical Builder secret".into());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("poly_builder_api_key", Self::sensitive(key)?);
+        headers.insert("poly_builder_passphrase", Self::sensitive(passphrase)?);
+        Ok(Self::Builder {
+            headers,
+            secret: decoded,
+        })
+    }
+    /// Polymarket Builder signing SDK signs pathname, excluding the GET query.
+    /// For POST, these are the same serialized bytes sent from the durable intent.
+    fn headers(
+        &self,
+        timestamp: u64,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<HeaderMap, String> {
+        match self {
+            Self::Owner(headers) => Ok(headers.clone()),
+            Self::Builder { headers, secret } => {
+                let mut result = headers.clone();
+                let signature = builder_signature(secret, timestamp, method, path, body)?;
+                result.insert(
+                    "poly_builder_timestamp",
+                    HeaderValue::from_str(&timestamp.to_string())
+                        .map_err(|_| "invalid Relayer authentication clock")?,
+                );
+                result.insert("poly_builder_signature", Self::sensitive(&signature)?);
+                Ok(result)
+            }
+        }
+    }
+}
+fn builder_signature(
+    secret: &[u8],
+    timestamp: u64,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret).map_err(|_| "invalid Builder signing key")?;
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(method.as_bytes());
+    mac.update(path.as_bytes());
+    if let Some(body) = body {
+        mac.update(body.as_bytes());
+    }
+    Ok(URL_SAFE.encode(mac.finalize().into_bytes()))
+}
+
 /// Keys remain in sensitive HTTP headers and never enter prepared objects or errors.
 pub struct RelayTransport {
     settings: RelaySettings,
     owner: Address,
+    auth: RelayAuth,
     http: reqwest::Client,
     cursor: Mutex<Option<(String, u64)>>,
 }
 impl RelayTransport {
-    pub fn from_env(settings: &RelaySettings, timeout_ms: u64) -> Result<Self, String> {
+    pub fn from_env(
+        settings: &RelaySettings,
+        owner: Address,
+        timeout_ms: u64,
+    ) -> Result<Self, String> {
         settings.validate()?;
-        let key = std::env::var(&settings.key_env).map_err(|_| "owner Relayer API key missing")?;
-        let owner = std::env::var(&settings.key_address_env)
-            .map_err(|_| "Relayer API key owner missing")?;
-        Self::new(settings.clone(), &key, address(&owner)?, timeout_ms, false)
+        let read = |name: &str| match std::env::var(name) {
+            Ok(value) if value.is_empty() => Ok(None),
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(_) => Err("invalid Relayer credential encoding".to_string()),
+        };
+        let auth = RelayAuth::select(
+            owner,
+            [
+                read(&settings.key_env)?,
+                read(&settings.key_address_env)?,
+                read(&settings.builder_key_env)?,
+                read(&settings.builder_secret_env)?,
+                read(&settings.builder_passphrase_env)?,
+            ],
+        )?;
+        Self::with_auth(settings.clone(), owner, auth, timeout_ms, false)
     }
+    #[cfg(test)]
     fn new(
         settings: RelaySettings,
         key: &str,
@@ -170,35 +347,33 @@ impl RelayTransport {
         timeout_ms: u64,
         test: bool,
     ) -> Result<Self, String> {
+        let auth = RelayAuth::owner(key, owner)?;
+        Self::with_auth(settings, owner, auth, timeout_ms, test)
+    }
+    fn with_auth(
+        settings: RelaySettings,
+        owner: Address,
+        auth: RelayAuth,
+        timeout_ms: u64,
+        test: bool,
+    ) -> Result<Self, String> {
         settings.validate_url(test)?;
-        if key.is_empty()
-            || key.len() > 1024
-            || !key.bytes().all(|b| (33..=126).contains(&b))
-            || owner.is_zero()
-            || !(100..=30_000).contains(&timeout_ms)
-        {
+        if owner.is_zero() || !(100..=30_000).contains(&timeout_ms) {
             return Err("invalid bounded owner Relayer API credentials".into());
         }
-        let mut headers = HeaderMap::new();
-        let mut key = HeaderValue::from_str(key).map_err(|_| "invalid Relayer API key header")?;
-        key.set_sensitive(true);
-        headers.insert("relayer_api_key", key);
-        headers.insert(
-            "relayer_api_key_address",
-            HeaderValue::from_str(&format!("{owner:#x}"))
-                .map_err(|_| "invalid Relayer API owner header")?,
-        );
         let http = reqwest::Client::builder()
+            .https_only(!test)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .connect_timeout(Duration::from_millis(timeout_ms))
             .timeout(Duration::from_millis(timeout_ms))
-            .default_headers(headers)
             .build()
             .map_err(|_| "cannot create bounded owner relayer transport")?;
         Ok(Self {
             settings,
             owner,
+            auth,
             http,
             cursor: Mutex::new(None),
         })
@@ -206,6 +381,22 @@ impl RelayTransport {
     #[cfg(test)]
     pub(crate) fn test_transport(settings: RelaySettings, owner: Address) -> Result<Self, String> {
         Self::new(settings, "offline-fixture-key", owner, 1000, true)
+    }
+    fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "Relayer authentication clock unavailable")?
+            .as_secs();
+        let headers = self.auth.headers(timestamp, method.as_str(), path, body)?;
+        Ok(self
+            .http
+            .request(method, format!("{}{path}", self.settings.url))
+            .headers(headers))
     }
     async fn response(mut response: reqwest::Response) -> Result<Value, String> {
         if !response.status().is_success()
@@ -233,11 +424,11 @@ impl RelayTransport {
             return Err("Relayer API key owner differs from controlling signer".into());
         }
         let response = self
-            .http
-            .get(format!(
-                "{}/v1/account/transactions/params",
-                self.settings.url
-            ))
+            .request(
+                reqwest::Method::GET,
+                "/v1/account/transactions/params",
+                None,
+            )?
             .query(&[
                 ("address", format!("{owner:#x}")),
                 ("type", "WALLET".into()),
@@ -270,8 +461,7 @@ impl RelayTransport {
         }
         verify_envelope(self.owner, prepared)?;
         let response = self
-            .http
-            .post(format!("{}/submit", self.settings.url))
+            .request(reqwest::Method::POST, "/submit", Some(&prepared.body))?
             .header("content-type", "application/json")
             .body(prepared.body.clone())
             .send()
@@ -291,11 +481,11 @@ impl RelayTransport {
     async fn transaction_hint(&self, id: &str) -> Result<Option<String>, String> {
         validate_request_id(id)?;
         let response = self
-            .http
-            .get(format!(
-                "{}/v1/account/transactions/{id}",
-                self.settings.url
-            ))
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/account/transactions/{id}"),
+                None,
+            )?
             .send()
             .await
             .map_err(|_| "Relayer transaction lookup failed")?;

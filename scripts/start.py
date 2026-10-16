@@ -59,7 +59,9 @@ def preflight_trading(path, mode):
         if signer == funder or not isinstance(relayer, dict):
             raise ValueError("deposit-wallet trading needs a separate controlling signer and explicit relayer")
         defaults = {"url": "https://relayer-v2.polymarket.com", "key_env": "MM2_POLY_RELAYER_API_KEY",
-                    "key_address_env": "MM2_POLY_RELAYER_API_KEY_ADDRESS"}
+                    "key_address_env": "MM2_POLY_RELAYER_API_KEY_ADDRESS",
+                    "builder_key_env": "MM2_POLY_BUILDER_API_KEY", "builder_secret_env": "MM2_POLY_BUILDER_API_SECRET",
+                    "builder_passphrase_env": "MM2_POLY_BUILDER_API_PASSPHRASE"}
         if any(relayer.get(key, value) != value for key, value in defaults.items()):
             raise ValueError("deposit-wallet startup requires the documented official relayer and runtime key names")
         for key, default, minimum, maximum in (("deadline_seconds", 600, 60, 3600),

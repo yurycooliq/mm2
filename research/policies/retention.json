@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "primary_deletion_allowed": false,
+  "disposable_classes": ["diagnostic", "cache", "build"],
+  "dedicated_root_names": ["diagnostics", "secondary-cache", "build-cache", "exports-cache"],
+  "diagnostic_min_age_days": 30,
+  "financial_analytical_expiry": null,
+  "experiment_evidence_expiry": null,
+  "require_exact_preview_hash": true,
+  "require_current_pins_and_leases": true,
+  "receipts_outside_selected_root": true
+}

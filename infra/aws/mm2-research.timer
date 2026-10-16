@@ -1,0 +1,12 @@
+[Unit]
+Description=Bounded mm2 public observer every fifteen minutes
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=30
+Unit=mm2-research.service
+
+[Install]
+WantedBy=timers.target

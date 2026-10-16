@@ -88,6 +88,16 @@ def main():
             assert refusal.returncode != 0
             assert 'explicit live owner authorization is missing' in refusal.stdout + refusal.stderr
         passed('blank funded profiles refuse activation offline before credential loading')
+        credential_fixture = {'private_key': '0' * 63 + '1',
+                              'signer_address': '0xa2300f310b59df6d0dec94576776ce5435bd0b3f', 'nonce': 0}
+        credential_refusal = subprocess.run(
+            ['docker', 'run', '--rm', '--interactive', '--network', 'none', '--read-only',
+             '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--log-driver', 'none',
+             '--label', label + '=' + owner, '--entrypoint', 'mm2-credential-auth', 'mm2-engine:local'],
+            input=json.dumps(credential_fixture).encode(), capture_output=True, timeout=30)
+        assert credential_refusal.returncode == 1
+        assert credential_refusal.stdout == b'' and credential_refusal.stderr.strip() == b'clob_identity_mismatch'
+        passed('packaged GET-only credential utility refuses a foreign fixture wallet offline')
         network = docker('network', 'create', '--label', label + '=' + owner, prefix)
         resources.append(('network', network))
         for suffix in ('engine-data', 'console-data'):

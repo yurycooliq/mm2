@@ -31,6 +31,8 @@ class Config:
     telegram_token: str = field(default="", repr=False)
     telegram_owner: int | None = None
     miniapp_url: str = ""
+    telegram_only: bool = False
+    trusted_proxy_header: bool = False
 
     @classmethod
     def from_env(cls):
@@ -64,6 +66,12 @@ class Config:
         telegram_owner = int(owner_id) if owner_id else None
         if telegram_owner is not None and not 0 < telegram_owner < 2**52:
             raise ValueError("invalid Telegram owner ID")
+        telegram_policy = os.environ.get("MM2_TELEGRAM_ONLY", "false")
+        if telegram_policy not in {"true", "false"}:
+            raise ValueError("MM2_TELEGRAM_ONLY must be true or false")
+        proxy_policy = os.environ.get("MM2_TRUSTED_PROXY_HEADER", "false")
+        if proxy_policy not in {"true", "false"}:
+            raise ValueError("MM2_TRUSTED_PROXY_HEADER must be true or false")
         miniapp = os.environ.get("MM2_MINIAPP_URL", "")
         if miniapp:
             parsed = urlsplit(miniapp)
@@ -74,7 +82,8 @@ class Config:
         return cls(engine, engine_token, owner, state,
                    Path(os.environ.get("MM2_CONSOLE_STATIC_DIR", "/app/dashboard")), allowed,
                    os.environ.get("MM2_CONSOLE_HOST", "0.0.0.0"), int(os.environ.get("MM2_CONSOLE_PORT", "8080")),
-                   token, telegram_owner, miniapp)
+                   token, telegram_owner, miniapp, bool(token and telegram_owner) or telegram_policy == "true",
+                   proxy_policy == "true")
 
     @property
     def secret_values(self):

@@ -1,0 +1,357 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Isolated mm2 public observer and sanitized analytics storage. No funded account secrets, no inbound ports, no automatic trading changes.",
+  "Parameters": {
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id"
+    },
+    "SubnetId": {
+      "Type": "AWS::EC2::Subnet::Id"
+    },
+    "AmiId": {
+      "Type": "AWS::EC2::Image::Id"
+    },
+    "InstanceType": {
+      "Type": "String",
+      "Default": "t3.small",
+      "AllowedValues": [
+        "t3.small",
+        "t3.medium"
+      ]
+    },
+    "TradingRoleName": {
+      "Type": "String",
+      "AllowedPattern": "[A-Za-z0-9+=,.@_-]{1,64}",
+      "Description": "Existing trading EC2 role: only sanitized prefix access is added."
+    }
+  },
+  "Resources": {
+    "Archive": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        }
+      }
+    },
+    "ArchivePolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "Archive"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "Archive",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${Archive.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            },
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:PutObject",
+              "Resource": {
+                "Fn::Sub": "${Archive.Arn}/*"
+              },
+              "Condition": {
+                "Null": {
+                  "s3:if-none-match": "true"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ProducerPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": {
+          "Fn::Sub": "${AWS::StackName}-sanitized-producer"
+        },
+        "Roles": [
+          {
+            "Ref": "TradingRoleName"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:GetObjectVersion"
+              ],
+              "Resource": {
+                "Fn::Sub": "${Archive.Arn}/exports/mm2/*"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": "s3:ListBucket",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "Archive",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "StringLike": {
+                  "s3:prefix": [
+                    "exports/mm2/*"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ResearchRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "TransportAndSanitizedArchives",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ssm:UpdateInstanceInformation",
+                    "ssmmessages:CreateControlChannel",
+                    "ssmmessages:CreateDataChannel",
+                    "ssmmessages:OpenControlChannel",
+                    "ssmmessages:OpenDataChannel"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:GetObjectVersion"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "${Archive.Arn}/exports/mm2/*"
+                    },
+                    {
+                      "Fn::Sub": "${Archive.Arn}/research/*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:PutObject",
+                  "Resource": {
+                    "Fn::Sub": "${Archive.Arn}/research/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:ListBucket",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Archive",
+                      "Arn"
+                    ]
+                  },
+                  "Condition": {
+                    "StringLike": {
+                      "s3:prefix": [
+                        "exports/mm2/*",
+                        "research/*"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ResearchProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "ResearchRole"
+          }
+        ]
+      }
+    },
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "mm2 research: no inbound ports, SSM transport only",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "Host": {
+      "Type": "AWS::EC2::Instance",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "ImageId": {
+          "Ref": "AmiId"
+        },
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "IamInstanceProfile": {
+          "Ref": "ResearchProfile"
+        },
+        "NetworkInterfaces": [
+          {
+            "DeviceIndex": "0",
+            "SubnetId": {
+              "Ref": "SubnetId"
+            },
+            "AssociatePublicIpAddress": true,
+            "GroupSet": [
+              {
+                "Ref": "SecurityGroup"
+              }
+            ]
+          }
+        ],
+        "MetadataOptions": {
+          "HttpEndpoint": "enabled",
+          "HttpTokens": "required",
+          "HttpPutResponseHopLimit": 1
+        },
+        "BlockDeviceMappings": [
+          {
+            "DeviceName": "/dev/sda1",
+            "Ebs": {
+              "VolumeType": "gp3",
+              "VolumeSize": 30,
+              "Encrypted": true,
+              "DeleteOnTermination": false
+            }
+          }
+        ],
+        "CreditSpecification": {
+          "CPUCredits": "standard"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-observer"
+            }
+          },
+          {
+            "Key": "Application",
+            "Value": "mm2-research"
+          }
+        ],
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Join": [
+              "\n",
+              [
+                "#!/bin/bash",
+                "set -eu",
+                "export DEBIAN_FRONTEND=noninteractive",
+                "apt-get update",
+                "apt-get install -y python3-venv",
+                "id mm2research >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/mm2-research --shell /usr/sbin/nologin mm2research",
+                "install -d -m 0755 /opt/mm2-research/releases /etc/mm2-research",
+                "install -d -o mm2research -g mm2research -m 0700 /var/lib/mm2-research/archive /var/lib/mm2-research/exports",
+                "python3 -m venv /opt/mm2-research/venv",
+                "/opt/mm2-research/venv/bin/pip install --disable-pip-version-check boto3==1.43.108",
+                "systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service || systemctl enable --now amazon-ssm-agent"
+              ]
+            ]
+          }
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "InstanceId": {
+      "Value": {
+        "Ref": "Host"
+      }
+    },
+    "BucketName": {
+      "Value": {
+        "Ref": "Archive"
+      }
+    },
+    "Region": {
+      "Value": {
+        "Ref": "AWS::Region"
+      }
+    }
+  }
+}

@@ -271,9 +271,6 @@ async fn run_public(
         let _ = handle.source_status("discovering", None, None);
         let discovery = async {
             tokio::time::timeout(Duration::from_secs(25), async {
-                discovery::geoblock(&client)
-                    .await
-                    .map_err(|reason| format!("IP eligibility check: {reason}"))?;
                 discovery::current_btc(&client, runtime::wall_ms())
                     .await
                     .map_err(|reason| format!("BTC5m discovery: {reason}"))
@@ -287,9 +284,7 @@ async fn run_public(
             Err(reason) if fault.borrow().is_some() => return Err(reason),
             Err(reason) => {
                 let _ = handle.source_status("retrying", Some(reason), Some(retry_seconds * 1000));
-                tracing::warn!(
-                    "current BTC5m metadata or IP eligibility unavailable; source retry scheduled"
-                );
+                tracing::warn!("current BTC5m metadata unavailable; source retry scheduled");
                 if interruptible(
                     async {
                         tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
@@ -340,12 +335,13 @@ async fn run_public(
         // The actor has acknowledged the new identity before any new-market frame is emitted.
         let (feed_shutdown, feed_shutdown_rx) = watch::channel(false);
         let mut owned = OwnedFeeds {
-            task: Some(tokio::spawn(feeds::run_public(
+            task: Some(tokio::spawn(feeds::run_public_with_diagnostics(
                 market.clone(),
                 start,
                 tx.clone(),
                 fault_tx.clone(),
                 feed_shutdown_rx,
+                Some(handle.feed_diagnostics.clone()),
             ))),
             shutdown: feed_shutdown,
         };

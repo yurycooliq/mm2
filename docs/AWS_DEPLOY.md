@@ -1,6 +1,6 @@
 # AWS single-host deployment package
 
-The initial ordinary deployment candidate is **Ireland, `eu-west-1`**. Polymarket's API geoblock reference currently lists Ireland as API-unrestricted (the frontend is close-only) and the closest eligible API region; London `eu-west-2` hosts the matching engine. Direct London co-location is a separate eligibility/KYC acceptance arrangement. Recheck the actual instance's IP/API eligibility, owner/account and supported protocol before any funded resume; a region name is not approval. [Polymarket API geoblock reference](https://docs.polymarket.com/api-reference/geoblock)
+The deployed host is in **Ireland, `eu-west-1`**. Its public Polymarket requests succeed, but on **2026-10-05** the published geoblock endpoint reports static IP `34.251.210.30` as `blocked=true`, `country=IE`. The official API reference and Help Center give inconsistent Ireland restrictions; funded eligibility remains unresolved. London `eu-west-2` is a separate approved co-location/KYC arrangement. See [Polymarket access evidence and prepared support questions](POLYMARKET_ACCESS.md) before changing eligibility handling or funded deployment. A region name or successful public request is not trading approval.
 
 This package prepares one host for `simulation`, `trading` or `both`, with optional `shadow` and offline `demo`. Every process starts paused. The package never sends Resume, creates an AWS resource, contacts a funded account or supplies trading credentials by itself.
 
@@ -68,7 +68,7 @@ Persistent directories are `/srv/mm2/engine` (UID 10001), `/srv/mm2/console` (UI
 Create `/etc/mm2/runtime.env` privately as Linux root with mode **0600**. The bootstrap creates independent random tokens without printing them and preserves an existing file:
 
 ```sh
-sudo python3 scripts/deploy_host.py bootstrap --domain your.exact.public.domain
+sudo python3 -B scripts/deploy_host.py bootstrap --domain your.exact.public.domain
 sudoedit /etc/mm2/runtime.env
 ```
 
@@ -89,15 +89,19 @@ MM2_POLY_RELAYER_API_KEY_ADDRESS=
 MM2_POLYGON_RPC_URL=
 ```
 
-The private signing key, CLOB L2 key/secret/passphrase and `MM2_POLYGON_RPC_URL` are required by configured funded modes. Signature type 3 also requires the separate Relayer API key/address pair. The key controls the EOA signing address; the DepositWallet is a contract and has no exportable private key. Its owner obtains the Relayer API key in Polymarket Settings → API Keys → Relayer API Keys; copy its signer address into the private address value. This existing-account route does not require a Builder account, but actual key eligibility/quota and authenticated access remain deployment checks. No helper creates these credentials. [Polymarket owner authentication and gasless setup](https://docs.polymarket.com/trading/wallets-auth)
+The private signing key, personal CLOB L2 key/secret/passphrase and `MM2_POLYGON_RPC_URL` are required by configured funded modes. Signature type 3 also requires exactly one complete Relayer scheme: owner API key/address or Builder HMAC key/secret/passphrase. Partial or simultaneous schemes are refused. The key controls the EOA signing address; the DepositWallet is a contract and has no exportable private key. Existing owner keys can be obtained in Polymarket Settings → API Keys → Relayer API Keys; their signer address must match the controlling EOA. Builder keys identify the integration and remain separate from the wallet's CLOB credentials. Existing Builder credentials can be imported through the protected helper; a separate explicitly authorized GET-only utility can retrieve existing personal CLOB credentials. Neither helper creates keys, starts trading or restarts the service. Actual eligibility/quota and authenticated access remain deployment checks. See [TELEGRAM_SETUP.md](TELEGRAM_SETUP.md) and [official authentication](https://docs.polymarket.com/trading/wallets-auth).
 
 The RPC endpoint is private runtime material: an HTTPS URL can contain a provider credential in its query/path and must not be logged or placed in a public profile. Never paste keys into chat, CloudFormation, reports or recorded shell commands, and never copy these placeholders as actual tokens. Secret values remain only in the ignored/private runtime file and container runtime. Avoid `docker inspect`, full `docker compose config` and host environment dumps: root/Docker access can inspect process environment. Use `config --quiet` for validation. Telegram needs both token and actual owner ID; empty values keep it disabled. Exact HTTPS origin and Mini App URL are derived from `MM2_DOMAIN`.
+
+The AWS console requires Telegram authentication even while bot credentials are empty: token login and unauthenticated API access return 404. Provision the exact `@mm2b_bot` identity and complete owner ID using the hidden-input helper in [TELEGRAM_SETUP.md](TELEGRAM_SETUP.md). Keep Python bytecode disabled (`-B`) when importing or validating immutable release scripts; the systemd unit also sets `PYTHONDONTWRITEBYTECODE=1`.
+
+Caddy overwrites `X-MM2-Client-IP` with its remote socket IP. AWS alone enables the console's explicit trusted-header flag for rate-limit buckets on the unpublished private backend. This avoids placing all internet clients in the proxy's shared login bucket. Arbitrary `X-Forwarded-For` is ignored; this header never authorizes a user. The boundary assumes DNS only/direct Caddy and the existing isolated service networks; review it before adding a CDN or public backend port.
 
 Import verified images, then select a profile while the previous service is stopped:
 
 ```sh
-sudo python3 scripts/deploy_host.py import --source /PRIVATE_UPLOAD_PATH/RELEASE
-sudo python3 /opt/mm2/releases/COMMIT/scripts/deploy_host.py activate \
+sudo python3 -B scripts/deploy_host.py import --source /PRIVATE_UPLOAD_PATH/RELEASE
+sudo python3 -B /opt/mm2/releases/COMMIT/scripts/deploy_host.py activate \
   --release /opt/mm2/releases/COMMIT --mode simulation
 ```
 

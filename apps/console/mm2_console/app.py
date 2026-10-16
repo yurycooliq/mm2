@@ -7,6 +7,7 @@ from .auth import RateLimiter, Sessions
 from .engine import EngineClient, Reply, redact
 from .observability import execution_summary, health_identity, health_log, history_projection
 from .store import Store
+from .telegram_reports import deposit_value, valuation_context
 
 
 def command_payload(value, limits=False):
@@ -52,6 +53,7 @@ class App:
         self._metrics = {"sampling_interval_ms": 1000, "sample_count": 0, "history_dropped": 0,
                          "logs_dropped": 0, "history_compacted": 0, "overruns": 0, "last_sampling_ms": None, "storage_error": None}
         self._last_log_identity = None
+        self._last_equity_minute = None
         self.stop = threading.Event()
         self._sampler = None
 
@@ -81,6 +83,23 @@ class App:
                     state = None
                     self._snapshot["connected"] = False
                     self._snapshot["error"] = "engine unavailable; displayed state is the last successful sample" if self._snapshot["state"] else "engine unavailable; no state has been sampled"
+            minute = now // 60_000
+            if minute != self._last_equity_minute:
+                # Only this existing sampler touches the minute curve. Telegram
+                # reads SQLite; network notification work never runs here.
+                self._last_equity_minute = minute
+                valuation = state if state is not None else {}
+                try:
+                    recorded = self.store.equity_sample(now, deposit_value(valuation, "real", now),
+                                                       deposit_value(valuation, "paper", now), valuation_context(valuation))
+                except Exception:
+                    # Minute history is secondary even if its database fails.
+                    # Preserve the current snapshot and never serialize details.
+                    recorded = False
+                if not recorded:
+                    with self._lock:
+                        self._metrics["history_dropped"] += 1
+                        self._metrics["storage_error"] = "secondary minute valuation persistence unavailable"
             if state is not None:
                 historical = history_projection(state)
                 if historical is not state:

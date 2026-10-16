@@ -4,6 +4,8 @@ import sqlite3
 import threading
 
 MAX_SAMPLE_BYTES = 65_536
+EQUITY_RETENTION_MS = 7 * 86_400_000
+MAX_EQUITY_POINTS = 10_080
 
 
 class Store:
@@ -23,6 +25,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY, observed_at_ms INTEGER NOT NULL, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY, observed_at_ms INTEGER NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS equity_minutes(
+                minute INTEGER PRIMARY KEY, observed_at_ms INTEGER NOT NULL,
+                real_pico TEXT, paper_pico TEXT, context TEXT NOT NULL);
         """)
         self.db.commit()
 
@@ -61,6 +66,51 @@ class Store:
         with self._lock:
             rows = self.db.execute("SELECT id,observed_at_ms,level,message FROM logs ORDER BY id DESC LIMIT ?", (min(max(limit, 1), 100),)).fetchall()
         return [{"id": row[0], "observed_at_ms": row[1], "level": row[2], "message": row[3]} for row in rows]
+
+    def equity_sample(self, observed_at_ms, real_pico, paper_pico, context):
+        """One compact row per minute, bounded independently of raw UI samples."""
+        if type(observed_at_ms) is not int or not 0 <= observed_at_ms < 253_402_300_800_000:
+            return False
+        if not isinstance(context, str) or not 0 < len(context.encode()) <= 128 or not context.isascii():
+            return False
+        values = []
+        for value in (real_pico, paper_pico):
+            if value is not None and (type(value) is not int or not 0 <= value < 2**128):
+                return False
+            values.append(str(value) if value is not None else None)
+        minute = observed_at_ms // 60_000
+        with self._lock:
+            try:
+                with self.db:
+                    self.db.execute("""INSERT INTO equity_minutes(minute,observed_at_ms,real_pico,paper_pico,context)
+                        VALUES (?,?,?,?,?) ON CONFLICT(minute) DO UPDATE SET
+                        observed_at_ms=excluded.observed_at_ms,real_pico=excluded.real_pico,
+                        paper_pico=excluded.paper_pico,context=excluded.context
+                        WHERE excluded.observed_at_ms > equity_minutes.observed_at_ms""",
+                        (minute, observed_at_ms, *values, context))
+                    self.db.execute("""DELETE FROM equity_minutes WHERE observed_at_ms < ?
+                        OR minute NOT IN (SELECT minute FROM equity_minutes ORDER BY minute DESC LIMIT ?)""",
+                        (observed_at_ms - EQUITY_RETENTION_MS, MAX_EQUITY_POINTS))
+                return True
+            except sqlite3.Error:
+                return False
+
+    def equity_history(self, limit=1440, now_ms=None):
+        """At most 24 hours of minute points, in time order; never extrapolate."""
+        if now_ms is None:
+            import time
+            now_ms = int(time.time() * 1000)
+        if type(now_ms) is not int or not 0 <= now_ms < 253_402_300_800_000:
+            raise ValueError("invalid equity history clock")
+        if type(limit) is not int:
+            raise ValueError("invalid equity history limit")
+        limit = min(max(limit, 1), 1440)
+        with self._lock:
+            rows = self.db.execute("""SELECT observed_at_ms,real_pico,paper_pico,context FROM equity_minutes
+                WHERE observed_at_ms >= ? AND observed_at_ms <= ? ORDER BY minute DESC LIMIT ?""",
+                (now_ms - 86_400_000, now_ms, limit)).fetchall()
+        return [{"observed_at_ms": row[0], "real_pico": row[1], "paper_pico": row[2], "context": row[3]}
+                for row in reversed(rows)]
 
     def get_meta(self, key, default=""):
         with self._lock:

@@ -1,0 +1,31 @@
+let buckets = Resources.*[ Type == "AWS::S3::Bucket" ]
+let hosts = Resources.*[ Type == "AWS::EC2::Instance" ]
+
+rule private_versioned_archive when %buckets !empty {
+  %buckets {
+    DeletionPolicy == "Retain"
+    UpdateReplacePolicy == "Retain"
+    Properties {
+      PublicAccessBlockConfiguration {
+        BlockPublicAcls == true
+        IgnorePublicAcls == true
+        BlockPublicPolicy == true
+        RestrictPublicBuckets == true
+      }
+      VersioningConfiguration.Status == "Enabled"
+      BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == "AES256"
+    }
+  }
+}
+
+rule isolated_encrypted_host when %hosts !empty {
+  %hosts {
+    DeletionPolicy == "Retain"
+    Properties {
+      MetadataOptions.HttpTokens == "required"
+      MetadataOptions.HttpPutResponseHopLimit == 1
+      BlockDeviceMappings[*].Ebs.Encrypted == true
+      CreditSpecification.CPUCredits == "standard"
+    }
+  }
+}

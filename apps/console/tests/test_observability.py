@@ -163,14 +163,17 @@ class ObservabilityTests(unittest.TestCase):
                 if method == "getUpdates":
                     return [{"update_id": 0, "message": {"from": {"id": 42},
                              "chat": {"id": 42, "type": "private"}, "text": "/status"}}]
+                if method == "setMyCommands":
+                    return True
                 self.bot.stop.set()
                 return {"message_id": 1}
         transport = MockTransport()
         bot = self.bot(transport)
         transport.bot = bot
         bot._loop()
-        self.assertEqual([method for method, _ in transport.calls], ["getUpdates", "sendMessage"])
-        text = transport.calls[1][1]["text"]
+        self.assertEqual([method for method, _ in transport.calls], ["setMyCommands", "getUpdates", "sendMessage"])
+        self.assertEqual(transport.calls[0][1]["scope"], {"type": "chat", "chat_id": 42})
+        text = transport.calls[2][1]["text"]
         self.assertIn("REAL funds", text)
         self.assertIn("VIRTUAL funds", text)
         self.assertEqual(len(self.engine.calls), 1)

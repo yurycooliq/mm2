@@ -9,6 +9,8 @@ import time
 from urllib.parse import parse_qsl
 
 COOKIE = "mm2_owner"
+TELEGRAM_MAX_AGE = 300
+TELEGRAM_FUTURE_SKEW = 5
 
 
 class Sessions:
@@ -16,6 +18,7 @@ class Sessions:
         self.ttl, self.maximum, self.clock = ttl, maximum, clock
         self._sessions = OrderedDict()
         self._replays = OrderedDict()
+        self._telegram_bindings = {}
         self._lock = threading.Lock()
 
     def _prune(self):
@@ -24,26 +27,33 @@ class Sessions:
             for key in tuple(mapping):
                 if mapping[key] <= now:
                     del mapping[key]
+                    if mapping is self._sessions:
+                        self._telegram_bindings.pop(key, None)
 
-    def create(self):
+    def create(self, telegram_digest=None):
         with self._lock:
             self._prune()
             if len(self._sessions) >= self.maximum:
-                self._sessions.popitem(last=False)
+                evicted, _ = self._sessions.popitem(last=False)
+                self._telegram_bindings.pop(evicted, None)
             token = secrets.token_urlsafe(32)
             self._sessions[token] = self.clock() + self.ttl
+            if telegram_digest is not None:
+                self._telegram_bindings[token] = telegram_digest
             return token
 
-    def valid(self, token):
+    def valid(self, token, telegram_digest=None):
         if not isinstance(token, str) or len(token) > 128:
             return False
         with self._lock:
             self._prune()
-            return token in self._sessions
+            return token in self._sessions and (telegram_digest is None or
+                hmac.compare_digest(self._telegram_bindings.get(token, ""), telegram_digest))
 
     def revoke(self, token):
         with self._lock:
             self._sessions.pop(token, None)
+            self._telegram_bindings.pop(token, None)
 
     def consume_telegram(self, digest):
         with self._lock:
@@ -52,14 +62,18 @@ class Sessions:
                 raise ValueError("Telegram authentication was already used; reopen the Mini App")
             if len(self._replays) >= 256:
                 raise ValueError("authentication capacity reached")
-            self._replays[digest] = self.clock() + 300
+            # A timestamp can initially be five seconds ahead. Retain its replay
+            # fence through the complete accepted interval, including its boundary.
+            self._replays[digest] = self.clock() + TELEGRAM_MAX_AGE + TELEGRAM_FUTURE_SKEW + 1
 
 
 def validate_telegram(init_data, bot_token, owner_id, now=None):
-    if not bot_token or owner_id is None:
+    if not isinstance(bot_token, str) or not bot_token or type(owner_id) is not int or not 0 < owner_id < 2**52:
         raise ValueError("Telegram authentication is disabled")
     if not isinstance(init_data, str) or not 1 <= len(init_data.encode("utf-8")) <= 8192:
         raise ValueError("invalid Telegram authentication length")
+    if re.search(r"%(?![0-9a-fA-F]{2})", init_data):
+        raise ValueError("invalid Telegram authentication encoding")
     pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True, max_num_fields=20,
                       encoding="utf-8", errors="strict")
     if len({key for key, _ in pairs}) != len(pairs) or any(not re.fullmatch(r"[a-z_]{1,32}", key) for key, _ in pairs):
@@ -77,9 +91,14 @@ def validate_telegram(init_data, bot_token, owner_id, now=None):
     if not re.fullmatch(r"[1-9][0-9]{0,12}", auth_date):
         raise ValueError("invalid Telegram authentication date")
     age = (int(time.time()) if now is None else now) - int(auth_date)
-    if not -5 <= age <= 300:
+    if not -TELEGRAM_FUTURE_SKEW <= age <= TELEGRAM_MAX_AGE:
         raise ValueError("Telegram authentication expired")
-    user = json.loads(fields.get("user", "null"))
+    def unique_object(pairs):
+        if len({key for key, _ in pairs}) != len(pairs):
+            raise ValueError("duplicate Telegram user fields")
+        return dict(pairs)
+    user = json.loads(fields.get("user", "null"), object_pairs_hook=unique_object,
+                      parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite Telegram user")))
     if not isinstance(user, dict) or type(user.get("id")) is not int or user["id"] != owner_id or user.get("is_bot") is True:
         raise ValueError("Telegram user is not the configured owner")
     return digest

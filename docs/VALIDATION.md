@@ -1,6 +1,131 @@
 # Validation evidence
 
-## Current checkpoint: October 5, 2026 — closeout and AWS package
+## Current checkpoint: October 6, 2026 — Builder Relayer and existing CLOB setup
+
+The Relayer now accepts exactly one complete owner key/address pair or Builder
+HMAC triplet. Tests cover the official HMAC vector, all 32 presence combinations,
+controlling EOA binding, sensitive headers, GET pathname signing and exact durable
+POST bytes. Lost, rejected, malformed and redirected responses never cause a retry.
+The separate credential utility signs only CLOB L1 wallet-control authentication
+for Polygon 137 and nonce 0; it performs GET time and GET existing-key derivation.
+There is no key creation, revocation, funded order or transaction fallback.
+
+Review fixed a provisioning race by checking the original environment snapshot
+inside the existing update lock. The parent utility also requires a valid paused
+boot/control identity, uses the local Docker socket with a minimal environment,
+disables Docker logging, and captures private stdin/stdout. The Olympus Builder
+source passed strict process-local validation; no values were printed or copied
+into client files. Credentials have not yet been imported at this checkpoint.
+
+| Check | Confirmed scope |
+| --- | --- |
+| Rust | **235 workspace tests passed**, including five Builder tests, eight CLOB utility tests and two CLI tests. Pinned Rust 1.98.1, locked optimized workspace build, format and workspace/all-targets Clippy `-D warnings` passed. |
+| Operations/private setup | **116 Linux tests passed, no skips**, including safe Builder source parsing, exclusive auth selection, canonical padding, atomic stale-snapshot refusal, masked errors, private worker boundaries and supervisor failure classification. |
+| Containers | **14 checks passed** on the optimized candidate engine and retained console, including the packaged credential binary refusing a foreign fixture wallet with network disabled. Zero live orders. Observed elapsed 25,218 ms, graceful stop 875 ms; these are local measurements, not an SLA. |
+| Actual AWS state | Verified through SSM: `eu-west-1`, retained `0bffb99` release, simulation paused, API and public feeds ready, no funded actor, `live_eligible=false`. Wallet key present; CLOB, owner Relayer, Builder and RPC settings absent. AWS CLI identity and pinned SSH/SSM access renewed and verified. |
+
+New exact-revision image export, selected-host rollout and authenticated existing
+credential acceptance are subsequent checks. This checkpoint does not establish
+venue/account eligibility or funded trading readiness. The current host's prior
+negative geoblock evidence remains unresolved; saving keys cannot override it.
+
+The retained AWS unit reported five restarts after its prior rollout. The masked
+historical lifecycle messages do not establish their cause. Thirty current
+Docker engine metadata reads took 14–21 ms, with none beyond the existing 400 ms
+deadline. New diagnostics distinguish engine metadata timeout and other fixed
+failure classes without exception arguments/output. The deadline, fail-closed
+cleanup and recovery policy are unchanged; historical causality is unconfirmed.
+
+## Previous checkpoint: October 5, 2026 — public feed access, TLS startup and private venue setup
+
+The public source previously stopped before Gamma discovery whenever the
+order-placement geoblock endpoint was negative or unavailable. Public read-only
+discovery now proceeds independently. Current-market identity/rules, HTTPS,
+response bounds, book freshness, connection recovery and every funded SDK gate
+remain enforced. Fresh public books cannot grant permission to submit orders.
+
+The actual eu-west-1 host returned `blocked=true`, country `IE`, while Gamma,
+CLOB V2 REST and the market WebSocket supplied current market data. Both outcome
+WebSocket snapshots were observed at 20 ms exchange age in a stateless probe.
+These are public connectivity observations, not matching latency or trading
+eligibility. The official documents and endpoint disagree; see
+[POLYMARKET_ACCESS.md](POLYMARKET_ACCESS.md) for exact evidence and an unsent
+support/co-location draft.
+
+The first `5bb4762` rollout failed during Rust WebSocket startup: the unified
+dependency graph enabled both Rustls providers, and the implicit provider choice
+panicked. The preceding `55a37ce` release was restored and its paused API verified;
+private settings and durable journals were retained. The engine now explicitly
+installs the pinned AWS-LC provider before constructing Tokio or network workers,
+with certificate and hostname verification unchanged. A regression exercises a
+real default WSS TLS handshake under the dual-provider dependency graph.
+
+The corrected optimized engine image passed a 35-second online public smoke on
+the local Docker host (67 samples). Both fresh Polymarket outcome books and a
+fresh Binance reference were observed together, with one stable paused shadow
+boot, no funded actor and no orders. This is connectivity evidence, not latency
+of authenticated order placement. The acceptance script now fails on absent
+feeds, exits, faults, API loss, restarts, execution/control changes or cleanup
+ownership mismatch, and includes publication lag in observer-time freshness.
+Actual AWS acceptance remains a separate check before switching production.
+
+The owner privately provisioned the wallet key. Server-side public-key derivation
+confirmed the reviewed controlling EOA `0xa2300f310b59df6d0dec94576776ce5435bd0b3f`;
+no key value was returned, no authentication signature or transaction was sent,
+and the selected profile remained simulation. CLOB/Relayer/RPC credentials remain
+absent at this checkpoint. The helper now accepts those existing settings through
+hidden prompts and pinned SSH/SSM stdin without activation or network validation.
+CLOB secret padding is normalized without changing its decoded HMAC bytes.
+
+| Check | Confirmed scope |
+| --- | --- |
+| Rust | **220 workspace tests passed** on pinned Rust 1.98.1; includes read-only discovery, independent funded refusal, dual-provider default WSS startup and production healthcheck regressions. Locked optimized workspace build, format and Clippy workspace/all-targets `-D warnings` passed. |
+| Console | **77 tests passed** in the production Linux container and again during image construction. |
+| Operations/private setup | **97 Linux tests passed, no skips**, including 28 helper tests for hidden inputs, identity, atomic preservation, strict reply schemas, new credential modes and 31/32-byte CLOB padding, plus eight public smoke acceptance tests. |
+| Data/latency | **55 tests passed**, with pyarrow 25.0.0 and websockets 15.0.1. |
+| Strategy parity | **6 TypeScript vectors passed**; the corresponding Rust parity test passed in the workspace run. |
+| Production containers | **13 checks passed** with the corrected optimized engine, including offline funded refusal, isolated console outage, durable command/crash recovery, ownership fence and read-only non-root images; zero live orders. Observed total 57,500 ms and graceful engine stop 1,250 ms are local observations, not an SLA. |
+
+An additional Windows console run under local load had one socket timeout and
+one time-sensitive fixture become stale (75 passed, one error, one failure).
+The unchanged console source then passed all 77 tests in its production Linux
+container and its image build. No production freshness threshold was relaxed.
+Deployment and public-feed acceptance of this new release are checked after
+image construction; the existing simulation remains paused until then.
+
+## Previous checkpoint: October 5, 2026 — Telegram owner Mini App
+
+The current changes implement automatic signed Telegram owner access, neutral 404
+denial, hidden credential provisioning, private-chat reports and bounded fill
+notifications. Production requires Telegram even before credentials exist; a
+rejected Telegram account switch revokes the prior cookie. Masked auth 404 never
+discards an unresolved browser command identity. Funded gates remain unchanged.
+
+| Check | Confirmed scope |
+| --- | --- |
+| Console | **77 tests passed**, including real HTTP owner/non-owner/expired/replay/cookie/Origin boundaries, proxy trust, reports, minute-history retention/restart/gaps and notification cursor/cooldown behavior. |
+| Operations/private setup | **78 tests passed on isolated Linux/Python 3.13, no skips**, including 17 hidden-input/secret transport, identity and atomic storage cases. No real key or Bot API credential was supplied. |
+| Frontend | **16 tests passed**; TypeScript and production Vite build passed. Auth denial and unknown-command identity retention are covered. |
+| Rust | **216 workspace tests passed**, locked optimized workspace build, Rust format and Clippy workspace/all-targets `-D warnings` passed. The only Rust change is an allocation-free aggregate held-market count in the bounded public snapshot; old snapshots deserialize it as unknown. Execution and private ledger types are unchanged. |
+| Rendered frontend | Playwright 1.62.1, synthetic localhost console: desktop 1440x900 and mobile 393x852 owner entry/reload/logout, forged client owner ignored, signed foreign-owner denial, no token fallback and masked-auth retry retaining ID/CAS. No runtime errors or framework overlay. Browser plugin was unavailable; bundled Playwright was used. |
+| Caddy boundary | Actual pinned Caddy and an isolated echo backend: verified fixture TLS and missing/forged/duplicate/malformed client-IP header replacement all passed; no external network or real credentials. |
+
+The deposit curve stores one compact point/minute, up to 10,080 points/seven days;
+the chart reads the latest 24 hours. It estimates cash plus complete positions at
+fresh best bids without depth/fees; missing evidence produces gaps. A retained
+aggregate proves an empty paper account even when older flat markets are omitted.
+Telegram work stays in the separate capped console and adds no engine request.
+Notifications sample execution evidence; restart baselines avoid historical
+floods, and unknown send outcomes are not retried blindly. The engine journal is
+the durable execution record.
+
+The prior simulation release has been verified on AWS eu-west-1 with retained
+EBS state, reboot recovery, DNS and strict public HTTPS at mm2.vstage.site. Its
+Polymarket geoblock probe returned blocked=true. Real owner Telegram embedding,
+message delivery and private funded credentials remain separate acceptance
+checks; fixtures do not establish them. Deployment does not Resume execution.
+
+## Previous checkpoint: October 5, 2026 — closeout and AWS package
 
 This is local verification of the implemented package. No funded venue order,
 real Polygon transaction, actual Telegram recipient or AWS deployment was used.
@@ -188,3 +313,17 @@ Root verified the integrated local UI in the Codex in-app browser. Desktop/mobil
 The [ten-point comparison ledger](DASHBOARD_DESIGN.md) records layout, palette, typography, controls, metrics, tables, copy and intentional differences: illustrative $1,000 values were replaced by observed API values, and required stop/age/recovery information was added. [Desktop](design/desktop-integrated-qa.jpg) and [mobile](design/mobile-integrated-qa.jpg) artifacts contain simulated QA data.
 
 The [checks workflow](https://github.com/yurycooliq/mm2/actions/workflows/checks.yml) reproduces Rust, Python, reference/dashboard and production-container checks on push. External Telegram delivery, Mini App embedding in actual Telegram clients and funded order execution remain unverified.
+
+## Integration review repair, 2026-10-16
+
+Independent source review found that killing the Docker attach client could leave
+an offline patch-validation worker running. Validation now creates a uniquely
+labelled container before starting it, removes only its verified immutable ID in
+every outcome, and confirms absence before issuing a successful receipt. Docker
+logging is disabled. Unknown cleanup fails closed and retains the safe owned
+container name for reconciliation. Pure regressions cover timeout, output quota,
+creation failure, ownership/ID mismatch, daemon failure and removal races. The
+container CI job also exercises real timeout and excessive-output workers with
+no network, credentials, source mounts or Docker socket inside the worker.
+Local verification passed all 18 patch-broker unit tests and both real Docker
+failure cases. Those workers were confirmed absent after cleanup.

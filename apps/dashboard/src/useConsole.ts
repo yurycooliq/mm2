@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError, telegramInitData } from './api';
+import { ownerAccess } from './auth';
+import type { OwnerAccess } from './auth';
 import { safeVersion } from './model';
 import { clearPending, definitiveRejection, matchingReceipt, persistPending, restorePending } from './pending';
 import type { Command, CommandReply, Control, Envelope, Limits, Log, Sample } from './types';
 
 export function useConsole() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [access, setAccess] = useState<OwnerAccess>('not_found');
   const [envelope, setEnvelope] = useState<Envelope | null>(null);
   const [history, setHistory] = useState<Sample[]>([]);
   const [logs, setLogs] = useState<Log[]>([]);
@@ -30,14 +33,8 @@ export function useConsole() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      try { await api.state(); if (!cancelled) setAuthenticated(true); }
-      catch (first) {
-        try {
-          const init = await telegramInitData();
-          if (init) { await api.telegramAuth(init); if (!cancelled) { setAuthenticated(true); return; } }
-        } catch { if (!cancelled) setError('Telegram owner authentication failed. Reopen the Mini App or use the owner token.'); }
-        if (!cancelled) { setAuthenticated(false); if (!(first instanceof ApiError && first.status === 401)) setError('Console unavailable.'); }
-      }
+      const result = await ownerAccess(api, telegramInitData);
+      if (!cancelled) { setAccess(result); setAuthenticated(result === 'authenticated'); }
     })();
     return () => { cancelled = true; };
   }, []);
@@ -56,7 +53,9 @@ export function useConsole() {
         }
       } catch (failure) {
         if (cancelled) return;
-        if (failure instanceof ApiError && failure.status === 401) { setAuthenticated(false); setEnvelope(null); }
+        if (failure instanceof ApiError && (failure.status === 401 || failure.status === 404)) {
+          setAccess(failure.status === 401 ? 'local' : 'not_found'); setAuthenticated(false); setEnvelope(null); setHistory([]); setLogs([]);
+        }
         else setEnvelope(previous => previous ? { ...previous, connected: false, error: 'Console unavailable. Displayed state is stale.' } : null);
       } finally { tick += 1; if (!cancelled) timer = window.setTimeout(poll, 1000); }
     };
@@ -66,12 +65,18 @@ export function useConsole() {
 
   const login = async (token: string) => {
     setBusy(true); setError(null);
-    try { await api.localAuth(token); setAuthenticated(true); }
-    catch (failure) { setError(failure instanceof Error ? failure.message : 'Owner authentication failed'); }
+    try { await api.localAuth(token); setAccess('authenticated'); setAuthenticated(true); }
+    catch (failure) {
+      if (failure instanceof ApiError && failure.status === 404) setAccess('not_found');
+      else setError(failure instanceof Error ? failure.message : 'Owner authentication failed');
+    }
     finally { if (mounted.current) setBusy(false); }
   };
   const logout = async () => {
-    try { await api.logout(); setAuthenticated(false); setEnvelope(null); setHistory([]); setLogs([]); }
+    try {
+      await api.logout(); setAuthenticated(false); setEnvelope(null); setHistory([]); setLogs([]);
+      setAccess(await ownerAccess(api, async () => null));
+    }
     catch { setError('Sign out was not acknowledged. The existing session may remain valid until expiry.'); }
   };
   const send = useCallback(async (payload: Command) => {
@@ -91,7 +96,9 @@ export function useConsole() {
         try { clearPending(localStorage); pendingRef.current = null; setPending(null); }
         catch { setStorageError('Command storage unavailable; controls are blocked.'); }
       } else if (!(failure instanceof ApiError)) setStorageError('Command storage unavailable; controls are blocked.');
-      if (failure instanceof ApiError && failure.status === 401) setAuthenticated(false);
+      if (failure instanceof ApiError && (failure.status === 401 || failure.status === 404)) {
+        setAccess(failure.status === 401 ? 'local' : 'not_found'); setAuthenticated(false); setEnvelope(null); setHistory([]); setLogs([]);
+      }
     } finally { sending.current = false; if (mounted.current) setBusy(false); }
   }, []);
   const command = async (action: Control) => {
@@ -102,6 +109,6 @@ export function useConsole() {
     if (storageError || pendingRef.current || sending.current || !safeVersion(envelope?.state ?? null) || !envelope?.connected) return;
     await send({ id: crypto.randomUUID(), expected_version: envelope!.state!.command_version, limits: values });
   };
-  return { authenticated, envelope, history, logs, error: storageError ?? error, busy, receipt, pending, storageError, login, logout, command, limits,
+  return { authenticated, access, envelope, history, logs, error: storageError ?? error, busy, receipt, pending, storageError, login, logout, command, limits,
     retry: () => authenticated && envelope?.connected && !storageError && pending ? send(pending) : Promise.resolve(), dismissError: () => setError(null) };
 }

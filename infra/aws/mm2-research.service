@@ -1,0 +1,29 @@
+[Unit]
+Description=mm2 isolated public observer and research controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mm2research
+Group=mm2research
+WorkingDirectory=/opt/mm2-research/current
+ExecStart=/opt/mm2-research/venv/bin/python -B -m tools.research.host --config /etc/mm2-research/config.json
+TimeoutStartSec=240
+Nice=10
+CPUQuota=50%
+MemoryMax=768M
+MemorySwapMax=0
+LimitCORE=0
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mm2-research
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

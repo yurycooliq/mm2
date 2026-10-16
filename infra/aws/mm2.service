@@ -12,6 +12,7 @@ ConditionPathExists=/opt/mm2/current/release-manifest.json
 
 [Service]
 Type=simple
+Environment=PYTHONDONTWRITEBYTECODE=1
 Restart=on-failure
 RestartSec=5s
 WorkingDirectory=/opt/mm2/current

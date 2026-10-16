@@ -38,6 +38,11 @@ pub(crate) struct Journal {
     segment_bytes: u64,
     maximum: u64,
     poisoned: bool,
+    research_ledger_id: String,
+    account_identity: String,
+    segment_start_sequence: u64,
+    segment_previous_hash: String,
+    prefix_confirmed: bool,
     #[cfg(test)]
     fail_sync_once: bool,
 }
@@ -162,6 +167,32 @@ impl Journal {
                 ledger = record.ledger;
             }
         }
+        let segment_start_sequence = paths
+            .last()
+            .and_then(|path| path.file_stem())
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("live-"))
+            .and_then(|start| start.parse::<u64>().ok())
+            .unwrap_or(sequence);
+        // Keep the segment's predecessor anchor without rereading any file on publication.
+        let segment_previous_hash = if let Some(path) = paths.last() {
+            let mut first = Vec::new();
+            let mut reader =
+                BufReader::new(File::open(path).map_err(|_| "cannot read live segment anchor")?);
+            Read::by_ref(&mut reader)
+                .take(MAX_RECORD as u64 + 1)
+                .read_until(b'\n', &mut first)
+                .map_err(|_| "cannot read live segment anchor")?;
+            if first.is_empty() {
+                hash.clone()
+            } else {
+                serde_json::from_slice::<Record>(&first)
+                    .map_err(|_| "corrupt live segment anchor")?
+                    .previous_hash
+            }
+        } else {
+            hash.clone()
+        };
         let path = paths
             .last()
             .cloned()
@@ -182,13 +213,20 @@ impl Journal {
             Self {
                 _lock: lock,
                 file,
-                directory,
+                directory: directory.clone(),
                 sequence,
                 hash,
                 bytes,
                 segment_bytes,
                 maximum: settings.journal_max_bytes,
                 poisoned: false,
+                research_ledger_id: hex::encode(Sha256::digest(
+                    format!("mm2-live-ledger-v1:{}", directory.display()).as_bytes(),
+                )),
+                account_identity: identity,
+                segment_start_sequence,
+                segment_previous_hash,
+                prefix_confirmed: false,
                 #[cfg(test)]
                 fail_sync_once: false,
             },
@@ -232,6 +270,8 @@ impl Journal {
                 .map_err(|_| "cannot rotate live journal segment")?;
             sync_directory(&self.directory)?;
             self.segment_bytes = 0;
+            self.segment_start_sequence = self.sequence;
+            self.segment_previous_hash = self.hash.clone();
         }
         self.file
             .write_all(&bytes)
@@ -248,8 +288,26 @@ impl Journal {
         self.bytes += bytes.len() as u64;
         self.segment_bytes += bytes.len() as u64;
         self.hash = hash;
+        self.prefix_confirmed = true;
         self.poisoned = false;
         Ok(())
+    }
+    /// Safe committed-prefix metadata; signed state is never included.
+    pub fn committed_prefix(&self) -> Option<serde_json::Value> {
+        if self.poisoned || !self.prefix_confirmed {
+            return None;
+        }
+        Some(serde_json::json!({
+            "schema_version": 1, "source_kind": "live",
+            "ledger_id": self.research_ledger_id, "account_identity": self.account_identity,
+            "segment": {
+                "name": format!("live-{:016}.jsonl", self.segment_start_sequence),
+                "start_sequence": self.segment_start_sequence,
+                "previous_hash": self.segment_previous_hash,
+            },
+            "byte_offset": self.segment_bytes,
+            "next_sequence": self.sequence, "last_hash": self.hash,
+        }))
     }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -268,6 +326,7 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     let _ = path;
     Ok(())
 }
+
 pub(crate) fn validate_ledger(ledger: &Ledger, settings: &LiveSettings) -> Result<(), String> {
     crate::settlement::validate(ledger, settings)?;
     if ledger.orders.len() > 256
@@ -361,4 +420,33 @@ fn condition_allowed(quote: &crate::LiveQuote, settings: &LiveSettings) -> bool 
             .allowed_market_prefixes
             .iter()
             .any(|prefix| quote.market_slug.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod research_tests {
+    use super::*;
+    #[test]
+    fn live_watermark_never_exposes_failed_sync_or_signed_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = LiveSettings::default();
+        let (mut journal, mut ledger) = Journal::open(dir.path(), &settings).unwrap();
+        assert!(journal.committed_prefix().is_none());
+        ledger.signed_intents.insert(
+            "private".into(),
+            serde_json::json!({"secret":"never-export"}),
+        );
+        journal.commit("startup_paused_recovery", &ledger).unwrap();
+        let prefix = journal.committed_prefix().unwrap();
+        assert!(!prefix.to_string().contains("never-export"));
+        assert_eq!(prefix["next_sequence"], 1);
+        journal.fail_next_sync();
+        assert!(journal.commit("owner_control", &ledger).is_err());
+        assert!(journal.committed_prefix().is_none());
+        assert_eq!(journal.sequence, 1);
+        drop(journal);
+        let (mut journal, ledger) = Journal::open(dir.path(), &settings).unwrap();
+        assert!(journal.committed_prefix().is_none());
+        journal.commit("startup_paused_recovery", &ledger).unwrap();
+        assert_eq!(journal.committed_prefix().unwrap()["next_sequence"], 3);
+    }
 }

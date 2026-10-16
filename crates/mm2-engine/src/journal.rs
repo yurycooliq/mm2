@@ -148,6 +148,8 @@ pub struct JournalMetrics {
     pub max_segments: usize,
     pub max_commands: usize,
     pub max_execution_operations: usize,
+    /// Safe research metadata only. None never authorizes reading a mutable tail.
+    pub committed_prefix: Option<serde_json::Value>,
 }
 
 /// Append-only rotation intents are synced before renaming an acknowledged segment.
@@ -195,6 +197,29 @@ pub struct Journal {
     execution_operations: usize,
     retain_replay_buffer: bool,
     poisoned: bool,
+    research_ledger_id: String,
+    segment_start_sequence: u64,
+    segment_previous_hash: String,
+    prefix_confirmed: bool,
+    #[cfg(test)]
+    fail_sync_once: bool,
+    #[cfg(test)]
+    fail_manifest_sync_once: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_RECOVERY_MANIFEST_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn confirm_recovered_manifest(manifest: &File) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_RECOVERY_MANIFEST_SYNC.with(|failure| failure.replace(false)) {
+        return Err("cannot confirm recovered journal manifest durability".into());
+    }
+    manifest
+        .sync_all()
+        .map_err(|_| "cannot confirm recovered journal manifest durability".into())
 }
 
 fn open_file(path: &Path) -> Result<File, String> {
@@ -324,6 +349,12 @@ impl Journal {
             line.clear();
         }
         drop(reader);
+        if manifest_bytes != 0 {
+            // Complete recovered seals can include bytes from a lost/failed sync. The
+            // manifest descriptor must confirm its rename intents before any archive
+            // recovery. A later sync of a different active-file descriptor cannot do so.
+            confirm_recovered_manifest(&manifest)?;
+        }
         manifest
             .seek(SeekFrom::End(0))
             .map_err(|_| "cannot seek journal manifest")?;
@@ -363,6 +394,18 @@ impl Journal {
             execution_operations: 0,
             retain_replay_buffer,
             poisoned: false,
+            research_ledger_id: hex::encode(Sha256::digest(
+                format!("mm2-engine-ledger-v1:{}", directory.display()).as_bytes(),
+            )),
+            segment_start_sequence: 0,
+            segment_previous_hash: "0".repeat(64),
+            // Startup replay can resolve a complete record with a lost sync acknowledgement.
+            // A subsequent normal commit confirms that prefix without an analytics-only fsync.
+            prefix_confirmed: false,
+            #[cfg(test)]
+            fail_sync_once: false,
+            #[cfg(test)]
+            fail_manifest_sync_once: false,
         };
         for seal in &seals {
             let path = directory.join(segment_name(seal.segment));
@@ -395,6 +438,8 @@ impl Journal {
             }
             journal.archives += 1;
             journal.active_bytes = 0;
+            journal.segment_start_sequence = journal.sequence;
+            journal.segment_previous_hash = journal.previous_hash.clone();
         }
         journal.read_records(&active_path)?;
         if journal.bytes() > journal.options.total_max_bytes {
@@ -595,7 +640,30 @@ impl Journal {
             max_segments: self.options.max_segments,
             max_commands: self.options.max_commands,
             max_execution_operations: self.options.max_execution_operations,
+            committed_prefix: self.committed_prefix(),
         }
+    }
+
+    /// Atomic actor-owned boundary, published only after an existing successful durable append.
+    /// The directory fingerprint is a source locator, not account authentication or a global ID.
+    pub fn committed_prefix(&self) -> Option<serde_json::Value> {
+        if self.poisoned || !self.prefix_confirmed {
+            return None;
+        }
+        Some(serde_json::json!({
+            "schema_version": 1,
+            "source_kind": "engine",
+            "ledger_id": self.research_ledger_id,
+            "segment": {
+                "name": "commands.jsonl", "index": self.archives,
+                "start_sequence": self.segment_start_sequence,
+                "previous_hash": self.segment_previous_hash,
+            },
+            "byte_offset": self.active_bytes,
+            "next_sequence": self.sequence,
+            "last_hash": self.previous_hash,
+            "manifest_bytes": self.manifest_bytes,
+        }))
     }
 
     pub fn bootstrap(&self) -> &Limits {
@@ -726,12 +794,14 @@ impl Journal {
             self.poisoned = true;
             return Err("durable journal rotation failed; reconcile on restart".into());
         }
-        if self
-            .file
-            .write_all(&bytes)
-            .and_then(|()| self.file.sync_all())
-            .is_err()
-        {
+        self.poisoned = true;
+        let written = self.file.write_all(&bytes);
+        #[cfg(test)]
+        if written.is_ok() && self.fail_sync_once {
+            self.fail_sync_once = false;
+            return Err("injected journal fsync failure after complete write".into());
+        }
+        if written.and_then(|()| self.file.sync_all()).is_err() {
             self.poisoned = true;
             return Err(
                 "durable journal write failed; outcome must be reconciled on restart".into(),
@@ -741,6 +811,8 @@ impl Journal {
         self.active_bytes += bytes.len() as u64;
         self.sequence += 1;
         self.previous_hash = hash;
+        self.prefix_confirmed = true;
+        self.poisoned = false;
         Ok(())
     }
 
@@ -752,7 +824,14 @@ impl Journal {
         // until both intent and archived directory entry are durable.
         self.manifest
             .write_all(seal_bytes)
-            .and_then(|()| self.manifest.sync_all())
+            .map_err(|_| "cannot persist segment seal")?;
+        #[cfg(test)]
+        if self.fail_manifest_sync_once {
+            self.fail_manifest_sync_once = false;
+            return Err("injected manifest fsync failure after complete seal write".into());
+        }
+        self.manifest
+            .sync_all()
             .map_err(|_| "cannot persist segment seal")?;
         self.manifest_bytes += seal_bytes.len() as u64;
         let target = self.directory.join(segment_name(self.archives));
@@ -766,6 +845,8 @@ impl Journal {
         sync_directory(&self.directory)?;
         self.archives += 1;
         self.active_bytes = 0;
+        self.segment_start_sequence = self.sequence;
+        self.segment_previous_hash = self.previous_hash.clone();
         Ok(())
     }
 }
@@ -883,6 +964,56 @@ mod tests {
     }
 
     #[test]
+    fn research_prefix_tracks_only_synced_bytes_and_rotated_segment_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+        let initial = journal.committed_prefix().unwrap();
+        assert_eq!(initial["next_sequence"], 1);
+        append_steps(&mut journal, 12);
+        let prefix = journal.committed_prefix().unwrap();
+        assert!(prefix["segment"]["index"].as_u64().unwrap() > 0);
+        assert_eq!(prefix["byte_offset"], journal.active_bytes);
+        assert_eq!(prefix["last_hash"], journal.previous_hash);
+        assert_eq!(
+            prefix["segment"]["start_sequence"],
+            journal.segment_start_sequence
+        );
+        drop(journal);
+        let mut recovered =
+            Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+        assert!(recovered.committed_prefix().is_none());
+        append_steps(&mut recovered, 1);
+        assert!(recovered.committed_prefix().is_some());
+    }
+
+    #[test]
+    fn research_prefix_is_withheld_after_complete_write_with_failed_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), 1_048_576, limits()).unwrap();
+        let prefix = journal.committed_prefix().unwrap();
+        journal.fail_sync_once = true;
+        assert!(
+            journal
+                .commit_execution(vec![serde_json::json!({"kind":"advance","now_ms":7})])
+                .is_err()
+        );
+        assert!(journal.committed_prefix().is_none());
+        assert_eq!(journal.sequence, prefix["next_sequence"].as_u64().unwrap());
+        assert!(
+            std::fs::metadata(dir.path().join("commands.jsonl"))
+                .unwrap()
+                .len()
+                > prefix["byte_offset"].as_u64().unwrap()
+        );
+        assert!(
+            journal
+                .commit_execution(vec![serde_json::json!({"kind":"advance","now_ms":8})])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn rotation_preserves_owner_identity_and_execution_order_across_every_segment() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
@@ -963,6 +1094,64 @@ mod tests {
             assert_eq!(recovered.metrics().archive_segments, 1);
             assert!(dir.path().join(segment_name(0)).exists());
         }
+    }
+
+    #[test]
+    fn complete_seal_with_failed_sync_requires_manifest_confirmation_before_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+        journal.fail_manifest_sync_once = true;
+        let mut committed_operations = 0;
+        let mut failed = false;
+        for step in 0..64 {
+            let operation = vec![serde_json::json!({"kind":"advance","now_ms":step})];
+            if journal.commit_execution(operation).is_err() {
+                failed = true;
+                break;
+            }
+            committed_operations += 1;
+        }
+        assert!(failed);
+        assert!(journal.poisoned);
+        assert!(journal.committed_prefix().is_none());
+        assert_eq!(journal.archives, 0);
+        assert_eq!(journal.manifest_bytes, 0);
+        let sequence = journal.sequence;
+        let active = std::fs::read(dir.path().join("commands.jsonl")).unwrap();
+        let manifest = std::fs::read(dir.path().join("journal-manifest.jsonl")).unwrap();
+        assert!(!manifest.is_empty());
+        drop(journal);
+
+        FAIL_RECOVERY_MANIFEST_SYNC.with(|failure| failure.set(true));
+        let failed_recovery = Journal::open_with_options(dir.path(), small_options(), limits());
+        assert!(
+            matches!(failed_recovery, Err(reason) if reason == "cannot confirm recovered journal manifest durability")
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("commands.jsonl")).unwrap(),
+            active
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("journal-manifest.jsonl")).unwrap(),
+            manifest
+        );
+        assert!(!dir.path().join(segment_name(0)).exists());
+
+        let mut recovered =
+            Journal::open_with_options(dir.path(), small_options(), limits()).unwrap();
+        assert_eq!(recovered.sequence, sequence);
+        assert_eq!(recovered.execution().len(), committed_operations);
+        assert_eq!(recovered.archives, 1);
+        assert!(recovered.committed_prefix().is_none());
+        recovered
+            .commit_execution(vec![serde_json::json!({"kind":"advance","now_ms":100})])
+            .unwrap();
+        let prefix = recovered.committed_prefix().unwrap();
+        assert_eq!(prefix["next_sequence"], sequence + 1);
+        assert_eq!(prefix["manifest_bytes"], manifest.len() as u64);
+        assert_eq!(prefix["segment"]["index"], 1);
+        assert_eq!(recovered.execution().len(), committed_operations + 1);
     }
 
     #[test]

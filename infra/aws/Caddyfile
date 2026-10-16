@@ -15,5 +15,6 @@ http://{$MM2_DOMAIN}:8080 {
 https://{$MM2_DOMAIN}:8443 {
     reverse_proxy console:8080 {
         header_up Host {$MM2_DOMAIN}
+        header_up X-MM2-Client-IP {remote_host}
     }
 }

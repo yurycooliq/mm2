@@ -357,6 +357,9 @@ pub struct LiveSnapshot {
     pub durable_sequence: u64,
     pub journal_bytes: u64,
     pub journal_max_bytes: u64,
+    /// Research readers must obey this committed prefix, never the mutable file's EOF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_committed_prefix: Option<serde_json::Value>,
     pub quotes_coalesced: u64,
     pub prepare_attempts: u64,
     pub prepare_failures: u64,

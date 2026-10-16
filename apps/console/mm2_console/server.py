@@ -1,6 +1,7 @@
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
+import ipaddress
 import json
 import mimetypes
 from pathlib import Path
@@ -83,6 +84,31 @@ class Handler(BaseHTTPRequestHandler):
             return ""
         return cookie[COOKIE].value if COOKIE in cookie else ""
 
+    def _client_key(self):
+        peer = self.client_address[0]
+        if not self.server.app.config.trusted_proxy_header:
+            return peer
+        try:
+            address = ipaddress.ip_address(peer)
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                address = address.ipv4_mapped
+            if not address.is_private or address.is_loopback:
+                return peer
+            values = self.headers.get_all("X-MM2-Client-IP", [])
+            if len(values) != 1 or not 1 <= len(values[0]) <= 45 or "%" in values[0]:
+                return peer
+            client = ipaddress.ip_address(values[0])
+            if isinstance(client, ipaddress.IPv6Address) and client.ipv4_mapped:
+                client = client.ipv4_mapped
+            if client.is_unspecified or client.is_multicast:
+                return peer
+            # AWS alone enables this on an unpublished console behind its isolated
+            # Caddy network. Caddy replaces this header with its socket client IP.
+            # This key separates rate buckets; it never authenticates a user.
+            return str(client)
+        except ValueError:
+            return peer
+
     def _body(self):
         if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
             raise ValueError("one bounded Content-Length is required")
@@ -120,7 +146,8 @@ class Handler(BaseHTTPRequestHandler):
         if len(self.path) > 2048 or sum(len(key) + len(value) for key, value in self.headers.items()) > 16_384:
             self._send(413, {"error": "request_too_large"})
             return
-        if not app.ingress.allow(self.client_address[0]):
+        client_key = self._client_key()
+        if not app.ingress.allow(client_key):
             self._send(429, {"error": "rate_limited"})
             return
         parsed = urlsplit(self.path)
@@ -136,28 +163,47 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": not app.stop.is_set(), "component": "console", "sampling_interval_ms": 1000})
                 return
             if path in {"/api/auth/local", "/api/auth/telegram"} and self.command == "POST":
-                if not app.auth_attempts.allow(self.client_address[0]):
+                if not app.auth_attempts.allow(client_key):
                     self._send(429, {"error": "authentication_rate_limited"})
                     return
                 body = self._body()
                 if path.endswith("local"):
+                    if app.config.telegram_only:
+                        self._send(404, {"error": "not_found"})
+                        return
                     if not isinstance(body, dict) or set(body) != {"token"} or not isinstance(body["token"], str) or len(body["token"]) > 256:
                         raise ValueError("invalid owner authentication")
                     if not hmac.compare_digest(body["token"].encode(), app.config.owner_token.encode()):
                         self._send(401, {"error": "unauthorized", "message": "owner token rejected"})
                         return
                 else:
-                    if not isinstance(body, dict) or set(body) != {"init_data"}:
-                        raise ValueError("invalid Telegram authentication")
-                    digest = validate_telegram(body["init_data"], app.config.telegram_token, app.config.telegram_owner)
-                    app.sessions.consume_telegram(digest)
-                token = app.sessions.create()
+                    existing = self._session()
+                    try:
+                        if not isinstance(body, dict) or set(body) != {"init_data"}:
+                            raise ValueError("invalid Telegram authentication")
+                        digest = validate_telegram(body["init_data"], app.config.telegram_token, app.config.telegram_owner)
+                        if app.sessions.valid(existing, telegram_digest=digest):
+                            token = existing
+                        else:
+                            app.sessions.consume_telegram(digest)
+                            token = app.sessions.create(telegram_digest=digest)
+                    except ValueError:
+                        # A switched Telegram account must not keep an earlier
+                        # owner's cookie usable in a shared browser/WebView.
+                        app.sessions.revoke(existing)
+                        self._send(404, {"error": "not_found"})
+                        return
+                if path.endswith("local"):
+                    token = app.sessions.create()
                 self._send(200, {"authenticated": True}, cookie=self._cookie(token, path.endswith("telegram")))
                 return
             if path.startswith("/api/"):
                 session = self._session()
                 if not app.sessions.valid(session):
-                    self._send(401, {"error": "unauthorized", "message": "owner session required"})
+                    if app.config.telegram_only:
+                        self._send(404, {"error": "not_found"})
+                    else:
+                        self._send(401, {"error": "unauthorized", "message": "owner session required"})
                     return
                 query = parse_qs(parsed.query, max_num_fields=4)
                 limit = int(query.get("limit", ["120"])[0])
