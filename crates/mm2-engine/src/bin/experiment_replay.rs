@@ -40,6 +40,20 @@ struct Plan {
     infrastructure_usd_per_day: String,
     extra_cost_bps: u64,
     max_input_bytes: u64,
+    #[serde(default, skip_serializing_if = "QualityProtocol::is_strict")]
+    quality_protocol: QualityProtocol,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QualityProtocol {
+    #[default]
+    StrictV1,
+    RecoveredNativeV2,
+}
+impl QualityProtocol {
+    fn is_strict(&self) -> bool {
+        *self == Self::StrictV1
+    }
 }
 fn default_embargo() -> usize {
     1
@@ -60,11 +74,52 @@ struct MarketState {
     recoverable_splits: u64,
     completed_snapshot_recoveries: u64,
     discarded_native_events: u64,
+    split_invalid_inputs: u64,
+    completed_quality_recoveries: u64,
+    recovery_started_for_quality: bool,
+    max_recovery_ms: u64,
+    parse_errors: u64,
+    fee_errors: u64,
+    fatal_ingress_errors: u64,
+    recovery_timeouts: u64,
 }
 impl MarketState {
+    fn fatal_invalid_inputs(&self) -> u64 {
+        self.invalid.saturating_sub(self.split_invalid_inputs)
+    }
+    fn unresolved_quality_recoveries(&self) -> u64 {
+        self.split_invalid_inputs
+            .saturating_sub(self.completed_quality_recoveries)
+    }
+    fn quality_eligible(&self, protocol: QualityProtocol) -> bool {
+        let warm = self
+            .first_snap
+            .iter()
+            .all(|t| t.is_some_and(|at| at <= self.market.window_start_ms));
+        let inputs_valid = match protocol {
+            QualityProtocol::StrictV1 => self.invalid == 0,
+            QualityProtocol::RecoveredNativeV2 => {
+                self.fatal_invalid_inputs() == 0 && self.unresolved_quality_recoveries() == 0
+            }
+        };
+        warm && self.gaps == 0 && inputs_valid && self.winner.is_some()
+    }
+    fn recovered_quality_evidence(&self) -> Value {
+        json!({
+            "fatal_invalid_inputs": self.fatal_invalid_inputs(),
+            "parse_errors": self.parse_errors,
+            "fee_policy_errors": self.fee_errors,
+            "fatal_ingress_errors": self.fatal_ingress_errors,
+            "native_recovery_timeouts": self.recovery_timeouts,
+            "split_recoveries_started_before_close": self.split_invalid_inputs,
+            "split_recoveries_verified_before_close": self.completed_quality_recoveries,
+            "unresolved_native_recoveries": self.unresolved_quality_recoveries(),
+        })
+    }
     fn clear_native(&mut self, awaiting_generation: bool) {
         self.frames = feeds::Recovery::new([0; 2]);
         self.native_snapshots = None;
+        self.recovery_started_for_quality = false;
         self.awaiting_generation = awaiting_generation;
         let _ = self.core.apply(FeedEvent::Disconnect {
             source: FeedSource::Clob,
@@ -78,6 +133,7 @@ impl MarketState {
         {
             if wall < self.market.window_end_ms {
                 self.invalid += 1;
+                self.recovery_timeouts += 1;
             }
             // This recorder cannot invent the actor's REST refresh/new socket.
             self.clear_native(true);
@@ -98,13 +154,25 @@ impl MarketState {
                 // when the actor can restore its books without reconnecting.
                 if wall < self.market.window_end_ms {
                     self.invalid += 1;
+                    self.split_invalid_inputs += 1;
                 }
+                self.recovery_started_for_quality = wall < self.market.window_end_ms;
                 self.native_snapshots = Some((mono, [false; 2]));
                 true
             }
             Ok(applied) => {
                 if applied == ingress::Applied::SnapshotRecoveryCompleted {
                     self.completed_snapshot_recoveries += 1;
+                    if self.recovery_started_for_quality
+                        && wall < self.market.window_end_ms
+                        && prior.is_some_and(|(started, _)| {
+                            mono.checked_sub(started)
+                                .is_some_and(|elapsed| elapsed < self.max_recovery_ms)
+                        })
+                    {
+                        self.completed_quality_recoveries += 1;
+                    }
+                    self.recovery_started_for_quality = false;
                 }
                 self.native_snapshots =
                     seen.map(|seen| (prior.expect("existing native recovery").0, seen));
@@ -116,6 +184,7 @@ impl MarketState {
             Err(_) => {
                 if wall < self.market.window_end_ms {
                     self.invalid += 1;
+                    self.fatal_ingress_errors += 1;
                 }
                 self.clear_native(true);
                 false
@@ -640,6 +709,14 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                         recoverable_splits: 0,
                         completed_snapshot_recoveries: 0,
                         discarded_native_events: 0,
+                        split_invalid_inputs: 0,
+                        completed_quality_recoveries: 0,
+                        recovery_started_for_quality: false,
+                        max_recovery_ms: plan.limits.max_feed_age_ms,
+                        parse_errors: 0,
+                        fee_errors: 0,
+                        fatal_ingress_errors: 0,
+                        recovery_timeouts: 0,
                     },
                 );
             }
@@ -666,6 +743,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                     };
                     if state.fee.is_none() && record.wall_ms < state.market.window_end_ms {
                         state.invalid += 1;
+                        state.fee_errors += 1;
                     }
                 }
             }
@@ -694,6 +772,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                                 .filter(|s| record.wall_ms < s.market.window_end_ms)
                             {
                                 state.gaps += 1;
+                                state.parse_errors += 1;
                                 let _ = state.core.apply(FeedEvent::Disconnect {
                                     source: FeedSource::Binance,
                                     reason: "invalid_reference".into(),
@@ -750,6 +829,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                             Err(_) => {
                                 if record.wall_ms < state.market.window_end_ms {
                                     state.invalid += 1;
+                                    state.parse_errors += 1;
                                 }
                                 state.clear_native(true);
                             }
@@ -891,7 +971,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                 .first_snap
                 .iter()
                 .all(|t| t.is_some_and(|at| at <= state.market.window_start_ms));
-            let quality = warm && state.gaps == 0 && state.invalid == 0 && state.winner.is_some();
+            let quality = state.quality_eligible(plan.quality_protocol);
             if index < plan.training_windows
                 || index >= plan.training_windows + plan.embargo_windows
             {
@@ -941,7 +1021,11 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                     }
                 }
             }
-            per_market.push(json!({"slug":state.market.slug,"partition":part,"quality_eligible":quality,"preopen_snapshots":warm,"gaps":state.gaps,"invalid_inputs":state.invalid,"recoverable_split_deltas":state.recoverable_splits,"completed_native_snapshot_recoveries":state.completed_snapshot_recoveries,"native_events_discarded_by_production_filter":state.discarded_native_events,"awaiting_observed_source_generation":state.awaiting_generation,"final_outcome_observed":state.winner.is_some(),"model_gross_pnl_pico":pnl.map(|v|v.to_string()),"assumed_extra_cost_pico":costs.to_string(),"model_net_pnl_pico":net.map(|v|v.to_string())}));
+            let mut market_report = json!({"slug":state.market.slug,"partition":part,"quality_eligible":quality,"preopen_snapshots":warm,"gaps":state.gaps,"invalid_inputs":state.invalid,"recoverable_split_deltas":state.recoverable_splits,"completed_native_snapshot_recoveries":state.completed_snapshot_recoveries,"native_events_discarded_by_production_filter":state.discarded_native_events,"awaiting_observed_source_generation":state.awaiting_generation,"final_outcome_observed":state.winner.is_some(),"model_gross_pnl_pico":pnl.map(|v|v.to_string()),"assumed_extra_cost_pico":costs.to_string(),"model_net_pnl_pico":net.map(|v|v.to_string())});
+            if plan.quality_protocol == QualityProtocol::RecoveredNativeV2 {
+                market_report["recovered_native_quality"] = state.recovered_quality_evidence();
+            }
+            per_market.push(market_report);
         }
         let holdout_eligible = eligible
             && end_complete
@@ -997,6 +1081,26 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
     }
     let selection = select_training(&rows, &plan.latency_per_leg_ms);
     let report = json!({"schema":1,"network":"none","orders_submitted":0,"plan_sha256":format!("{:x}",sha2::Sha256::digest(bytes)),"declared_plan_time_precedes_capture":plan.frozen_at_wall_ms<=header_wall,"tape_receipt":receipt,"capture_final_complete_flag":end_complete,"capture_gaps":all_gaps,"clock_steps":clock_steps,"eligible_window_candidates":windows.len(),"training_windows_required":plan.training_windows,"embargo_windows":plan.embargo_windows,"execution_model_revision":"native_public_print_causal_v3_shared_native_ingress_v1","holdout_windows_required":plan.min_holdout_windows,"holdout_start_wall_ms":split,"training_only_selection":selection,"rows":rows,"limitations":["Synthetic execution on observed public input, never real PnL or promised ROI.","No documented CLOB sequence proves capture completeness; raw receive ordering belongs to this host.","Fixed per-leg latency stresses are assumptions, not measured order round trips.","Conservative native L2 queue approximation uses prints at their reported price, no full sweep proof.","Equal timestamps retain original captured frame order, independent candidates have separate queues and finite capital.","Infrastructure and extra execution costs are explicit plan assumptions; rebates zero; actual gas unknown.","Whole first partial and last incomplete market windows excluded from scored totals; their trades still consume capital, full-run losses and unknown terminal cost remain visible.","No capital reset at training/holdout boundary; realized settled market PnL is attributed by market start.","Native frame filtering and split-snapshot admission share production code; this tape lacks REST bootstrap responses/cutoffs, engine-triggered refresh receipts and actor cross-frame batching. Replay waits for an observed generation after genuine faults/timeouts rather than inventing recovery.","Replay tick scheduler and raw-frame chunking approximate actor scheduling; exact production parity remains unproven.","Declared freeze timestamp alone does not prove plan immutability; require externally retained pre-capture plan hash and launch binding."]});
+    let report = if plan.quality_protocol == QualityProtocol::RecoveredNativeV2 {
+        let mut recovered_report = report;
+        recovered_report["quality_protocol"] = json!("recovered_native_v2");
+        recovered_report["quality_protocol_definition"] = json!({
+            "legacy_raw_invalid_counts_preserved": true,
+            "recoverable_split_is_not_itself_a_fatal_input": true,
+            "both_native_full_snapshots_required": true,
+            "completion_strictly_before_market_close": true,
+            "completion_age_strictly_below_configured_max_feed_age": true,
+            "all_genuine_capture_gaps_still_reject": true,
+            "timeout_fault_or_unresolved_recovery_still_rejects": true,
+            "requires_new_preregistered_capture_and_plan": true,
+        });
+        recovered_report["limitations"].as_array_mut().expect("report limitations").push(json!(
+            "Recovered-native v2 changes evidence classification only. Both valid native snapshots must actually restore books in time; quote, cancellation, fill and risk semantics are unchanged. It does not authorize rescoring sealed old evidence for selection."
+        ));
+        recovered_report
+    } else {
+        report
+    };
     Ok(report)
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1025,6 +1129,189 @@ use sha2::Digest;
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn quality_snapshot(
+        condition: &str,
+        outcome: domain::Outcome,
+        wall: u64,
+        mono: u64,
+    ) -> FeedEvent {
+        FeedEvent::Snapshot {
+            condition_id: condition.into(),
+            outcome,
+            exchange_ms: wall,
+            observed_mono_ms: mono,
+            bids: vec![domain::Level {
+                price_micro: 490_000,
+                quantity_micro: 10_000_000,
+            }],
+            asks: vec![domain::Level {
+                price_micro: 510_000,
+                quantity_micro: 10_000_000,
+            }],
+        }
+    }
+    fn quality_state() -> MarketState {
+        let market = Market {
+            slug: "synthetic-quality-test".into(),
+            condition_id: format!("0x{}", "a".repeat(64)),
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: 1000,
+            window_end_ms: 301000,
+            tick_micro: 10000,
+        };
+        let limits = Limits {
+            initial_collateral_usd: "1000".into(),
+            max_imbalance_shares: "10".into(),
+            lot_shares: "5".into(),
+            half_width: "0.01".into(),
+            max_feed_age_ms: 1000,
+        };
+        let mut core = Core::new(limits.core().unwrap()).unwrap();
+        core.set_market(market.clone()).unwrap();
+        core.control(Action::Resume).unwrap();
+        core.apply(FeedEvent::Reference {
+            exchange_ms: 999,
+            observed_mono_ms: 1,
+            price_micro: 80_000_000_000,
+        })
+        .unwrap();
+        let mut state = MarketState {
+            market,
+            core,
+            fee: None,
+            first_snap: [None, None],
+            gaps: 0,
+            invalid: 0,
+            winner: Some(mm2_core::Outcome::Up),
+            outcome_observed_at: Some(301001),
+            frames: feeds::Recovery::new([0; 2]),
+            native_snapshots: None,
+            source_generation: Some(0),
+            awaiting_generation: false,
+            recoverable_splits: 0,
+            completed_snapshot_recoveries: 0,
+            discarded_native_events: 0,
+            split_invalid_inputs: 0,
+            completed_quality_recoveries: 0,
+            recovery_started_for_quality: false,
+            max_recovery_ms: 1000,
+            parse_errors: 0,
+            fee_errors: 0,
+            fatal_ingress_errors: 0,
+            recovery_timeouts: 0,
+        };
+        for outcome in [domain::Outcome::Up, domain::Outcome::Down] {
+            let event = quality_snapshot(&state.market.condition_id, outcome, 999, 1);
+            assert!(state.apply_public(event, 999, 1));
+        }
+        state
+    }
+    fn quality_split(state: &MarketState, wall: u64, mono: u64) -> FeedEvent {
+        FeedEvent::Delta {
+            condition_id: state.market.condition_id.clone(),
+            exchange_ms: wall,
+            observed_mono_ms: mono,
+            changes: vec![domain::Change {
+                outcome: domain::Outcome::Up,
+                side: domain::BookSide::Bid,
+                level: domain::Level {
+                    price_micro: 520_000,
+                    quantity_micro: 5_000_000,
+                },
+            }],
+        }
+    }
+    fn complete_quality_recovery(state: &mut MarketState, wall: u64, mono: u64) {
+        for (offset, outcome) in [domain::Outcome::Up, domain::Outcome::Down]
+            .into_iter()
+            .enumerate()
+        {
+            let event = quality_snapshot(
+                &state.market.condition_id,
+                outcome,
+                wall + offset as u64,
+                mono + offset as u64,
+            );
+            assert!(state.apply_public(event, wall + offset as u64, mono + offset as u64));
+        }
+    }
+    #[test]
+    fn recovered_quality_requires_both_actual_valid_snapshots_and_preserves_strict_counts() {
+        let mut state = quality_state();
+        assert!(state.quality_eligible(QualityProtocol::StrictV1));
+        assert!(state.quality_eligible(QualityProtocol::RecoveredNativeV2));
+        assert!(state.apply_public(quality_split(&state, 1001, 3), 1001, 3));
+        assert!(!state.quality_eligible(QualityProtocol::RecoveredNativeV2));
+        assert!(!state.core.evaluate(1001, 3).stop_reasons.is_empty());
+        let event = quality_snapshot(&state.market.condition_id, domain::Outcome::Up, 1002, 4);
+        assert!(state.apply_public(event, 1002, 4));
+        assert!(!state.quality_eligible(QualityProtocol::RecoveredNativeV2));
+        assert!(!state.core.evaluate(1002, 4).stop_reasons.is_empty());
+        let event = quality_snapshot(&state.market.condition_id, domain::Outcome::Down, 1003, 5);
+        assert!(state.apply_public(event, 1003, 5));
+        assert!(state.core.evaluate(1003, 5).stop_reasons.is_empty());
+        assert_eq!(state.invalid, 1);
+        assert_eq!(state.recoverable_splits, 1);
+        assert_eq!(state.completed_snapshot_recoveries, 1);
+        assert_eq!(state.fatal_invalid_inputs(), 0);
+        assert_eq!(state.unresolved_quality_recoveries(), 0);
+        assert!(!state.quality_eligible(QualityProtocol::StrictV1));
+        assert!(state.quality_eligible(QualityProtocol::RecoveredNativeV2));
+        state.gaps = 1;
+        assert!(!state.quality_eligible(QualityProtocol::RecoveredNativeV2));
+    }
+    #[test]
+    fn recovery_timeout_exact_age_and_after_close_never_receive_quality_credit() {
+        let mut expired = quality_state();
+        assert!(expired.apply_public(quality_split(&expired, 1001, 3), 1001, 3));
+        expired.expire_native(2001, 1003, 1000);
+        assert_eq!(expired.recovery_timeouts, 1);
+        assert_eq!(expired.fatal_invalid_inputs(), 1);
+        assert_eq!(expired.unresolved_quality_recoveries(), 1);
+        assert!(expired.awaiting_generation);
+        assert!(!expired.quality_eligible(QualityProtocol::RecoveredNativeV2));
+        let mut exact = quality_state();
+        assert!(exact.apply_public(quality_split(&exact, 1001, 3), 1001, 3));
+        // No timeout tick between records: equality to max_age still rejects.
+        complete_quality_recovery(&mut exact, 2000, 1002);
+        assert_eq!(exact.completed_snapshot_recoveries, 1);
+        assert_eq!(exact.completed_quality_recoveries, 0);
+        assert!(!exact.quality_eligible(QualityProtocol::RecoveredNativeV2));
+        let mut closed = quality_state();
+        assert!(closed.apply_public(quality_split(&closed, 300999, 3), 300999, 3));
+        complete_quality_recovery(&mut closed, 301000, 4);
+        assert_eq!(closed.completed_snapshot_recoveries, 1);
+        assert_eq!(closed.completed_quality_recoveries, 0);
+        assert!(!closed.quality_eligible(QualityProtocol::RecoveredNativeV2));
+    }
+    #[test]
+    fn malformed_snapshot_and_generation_reset_cannot_forgive_an_old_recovery() {
+        let mut invalid = quality_state();
+        assert!(invalid.apply_public(quality_split(&invalid, 1001, 3), 1001, 3));
+        let mut bad = quality_snapshot(&invalid.market.condition_id, domain::Outcome::Up, 1002, 4);
+        if let FeedEvent::Snapshot { bids, .. } = &mut bad {
+            bids[0].price_micro = 520_000;
+        }
+        assert!(!invalid.apply_public(bad, 1002, 4));
+        assert_eq!(invalid.fatal_ingress_errors, 1);
+        assert!(!invalid.quality_eligible(QualityProtocol::RecoveredNativeV2));
+        for gap in [false, true] {
+            let mut reset = quality_state();
+            assert!(reset.apply_public(quality_split(&reset, 1001, 3), 1001, 3));
+            reset.gaps = u64::from(gap);
+            reset.clear_native(false);
+            reset.source_generation = Some(1);
+            complete_quality_recovery(&mut reset, 1100, 100);
+            assert!(reset.apply_public(quality_split(&reset, 1102, 102), 1102, 102));
+            complete_quality_recovery(&mut reset, 1103, 103);
+            assert_eq!(reset.completed_quality_recoveries, 1);
+            assert_eq!(reset.split_invalid_inputs, 2);
+            assert_eq!(reset.unresolved_quality_recoveries(), 1);
+            assert!(!reset.quality_eligible(QualityProtocol::RecoveredNativeV2));
+            assert_eq!(reset.gaps, u64::from(gap));
+        }
+    }
     #[test]
     fn holdout_fault_cannot_replace_training_winner_and_negative_training_never_selects() {
         let rows = vec![
@@ -1186,9 +1473,19 @@ mod tests {
             infrastructure_usd_per_day: "1".into(),
             extra_cost_bps: 1,
             max_input_bytes: 4_000_000,
+            quality_protocol: QualityProtocol::StrictV1,
         };
         // Serialize the real schema with empty rules, as the frozen CLI plan does.
         let mut raw = serde_json::to_value(plan).unwrap();
+        assert!(
+            raw.get("quality_protocol").is_none(),
+            "strict_v1 preserves old plan serialization"
+        );
+        let decoded: Plan = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(decoded.quality_protocol, QualityProtocol::StrictV1);
+        raw["quality_protocol"] = json!("unrecognized_quality_protocol");
+        assert!(serde_json::from_value::<Plan>(raw.clone()).is_err());
+        raw.as_object_mut().unwrap().remove("quality_protocol");
         for c in raw["candidates"].as_array_mut().unwrap() {
             c["rules"] = json!({});
         }

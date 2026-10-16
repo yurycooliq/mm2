@@ -26,6 +26,13 @@ advances the source generation and takes the bounded reconnect backoff. These
 diagnostics explain future failures; they cannot reconstruct a missing cause
 from an older tape's generic disconnect reason.
 
+Subscription, heartbeat, native Pong and graceful-close writes have a five-second
+deadline. A timed-out connection is discarded before the next generation;
+partially written messages are never retried on that connection. Missed heartbeat
+ticks are skipped rather than replayed in a burst. These bounds prevent a stuck
+write from indefinitely blocking reads and shutdown; they do not prove that an
+observed remote disconnect has been eliminated.
+
 Replay is offline. Every candidate/latency combination owns a separate native
 emulator and finite portfolio. Capital, old positions, gross losses and drawdown
 survive rollovers and the training/holdout boundary. Queue position belongs to
@@ -49,6 +56,28 @@ outcomes, later holdout markets, costs and minimum activity. Selection uses only
 training information available before holdout starts. A failed winner on holdout
 cannot be replaced using holdout knowledge. A declared timestamp in the plan is
 not independent proof that the plan was frozen; retain the launch binding too.
+
+## Quality protocols
+
+An omitted `quality_protocol` keeps `strict_v1`: every historical invalid input,
+including a recoverable split delta, rejects the window. Its reports and sealed
+plans retain their original meaning.
+
+A new preregistered plan may explicitly select `recovered_native_v2`. It retains
+all raw invalid and split counts, but distinguishes fatal parse/fee/ingress faults
+from recovery completed by both actually observed valid native full snapshots.
+Both books must restore quoting strictly before market close and strictly within
+the configured maximum feed age. One snapshot, an invalid snapshot, completion
+at the age limit, a timeout or completion after close cannot qualify. A later
+healthy generation cannot erase a previous unresolved recovery. Every genuine
+capture gap still rejects the experiment. Execution, cancellation, queue and risk
+semantics are unchanged; production ingestion parity remains unproven.
+
+Short cycles may preregister two complete training markets, one embargo market
+and two complete holdout markets. The existing minimum of two filled markets in
+each scored partition still applies. This reduces collection time, not the
+evidence required to claim repeatable income. Insufficient activity, outcomes or
+quality remains inconclusive, with no automatic promotion.
 
 ## Experimental policy
 

@@ -1,5 +1,23 @@
 # Validation evidence
 
+## October 16, 2026 - bounded capture writes and explicit recovered-input quality
+
+Formatting, all-target Clippy with warnings denied and **376 Rust tests** pass,
+with zero ignored tests. The complete accepted run is `rust-validation-1.log` in
+`output/r18-stream-recovery-20261016`. Two real in-memory WebSocket regressions
+cover stalled sends/close and successful application heartbeat/native Ping/Pong
+ordering. Three quality regressions cover actual two-book restoration, timeout,
+exact-age/after-close completion, malformed snapshots and historical recovery
+deficits surviving a generation reset.
+
+The default strict protocol and all sealed historical evidence retain their
+meaning. Opt-in `recovered_native_v2` separates fatal faults from verified native
+recovery without changing execution decisions or forgiving actual capture gaps.
+Exact-image acceptance, whole-report strict compatibility and fresh bounded
+public collection have separate receipts. No disconnect cause, clean economic
+holdout, repeatable income or funded readiness is established by these tests.
+See [public experiments](PUBLIC_EXPERIMENTS.md).
+
 ## October 16, 2026 - paired paper policy and accelerated common-input experiments
 
 Formatting, all-target Clippy with warnings denied and **371 Rust tests** pass,

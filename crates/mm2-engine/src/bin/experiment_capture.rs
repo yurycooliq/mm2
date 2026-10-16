@@ -5,10 +5,12 @@ use mm2_engine::{discovery, domain::Market, feeds, paper_resolution};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{
@@ -17,6 +19,8 @@ use tokio_tungstenite::{
         protocol::WebSocketConfig,
     },
 };
+
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Fixed categories only. Never format a nested transport error, URL, header,
 // peer close reason, or payload into secondary diagnostics.
@@ -65,6 +69,15 @@ fn error_class(error: &WebSocketError) -> ErrorClass {
         WebSocketError::HttpFormat(_) => ErrorClass::named("http_format"),
         WebSocketError::Url(_) => ErrorClass::named("url"),
         _ => ErrorClass::named("other_websocket_error"),
+    }
+}
+async fn write_bounded(
+    write: impl Future<Output = Result<(), WebSocketError>>,
+) -> Result<(), ErrorClass> {
+    match tokio::time::timeout(SOCKET_WRITE_TIMEOUT, write).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error_class(&error)),
+        Err(_) => Err(ErrorClass::named("write_timeout")),
     }
 }
 fn millis(duration: Duration) -> u64 {
@@ -226,31 +239,31 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
             Ok(Ok((mut ws, _))) => 'connected: {
                 if let Some(m) = &market {
                     let subscription = json!({"assets_ids":[m.up_token,m.down_token],"type":"market","custom_feature_enabled":true});
-                    if let Err(error) = ws
-                        .send(Message::Text(subscription.to_string().into()))
-                        .await
+                    if let Err(class) =
+                        write_bounded(ws.send(Message::Text(subscription.to_string().into()))).await
                     {
                         break 'connected trace.reason(
                             "subscription_send",
-                            error_class(&error),
+                            class,
                             generation,
                             None,
                         );
                     }
                 }
                 let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 heartbeat.tick().await;
                 loop {
                     if c.lock().unwrap().stopped() || wall() >= until {
-                        let _ = ws.close(None).await;
+                        let _ = write_bounded(ws.close(None)).await;
                         return Ok(());
                     }
                     tokio::select! {
                         _=tokio::time::sleep(Duration::from_millis(250))=>{},
                         scheduled=heartbeat.tick()=>{
                             trace.max_heartbeat_late_ms=trace.max_heartbeat_late_ms.max(millis(tokio::time::Instant::now().saturating_duration_since(scheduled)));
-                            if market.is_some() && let Err(error)=ws.send(Message::Text("PING".into())).await {
-                                break trace.reason("heartbeat_send",error_class(&error),generation,None);
+                            if market.is_some() && let Err(class)=write_bounded(ws.send(Message::Text("PING".into()))).await {
+                                break trace.reason("heartbeat_send",class,generation,None);
                             }
                         },
                         message=ws.next()=>{match message {
@@ -260,8 +273,8 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
                                 trace.max_record_write_ms=trace.max_record_write_ms.max(millis(received.elapsed()));
                             },
                             Some(Ok(Message::Ping(payload)))=>{
-                                if let Err(error)=ws.send(Message::Pong(payload)).await {
-                                    break trace.reason("pong_send",error_class(&error),generation,None);
+                                if let Err(class)=write_bounded(ws.send(Message::Pong(payload))).await {
+                                    break trace.reason("pong_send",class,generation,None);
                                 }
                             },
                             Some(Ok(Message::Close(frame)))=>break trace.reason("peer_close",ErrorClass::named("peer_close"),generation,frame.map(|frame|u16::from(frame.code))),
@@ -488,6 +501,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_websocket_send_and_close_are_bounded_before_discarding_connection() {
+        // A real WebSocket over a tiny in-memory transport. The peer never
+        // reads, so both application writes and close flushes must time out.
+        for closing in [false, true] {
+            let (io, mut peer) = tokio::io::duplex(1);
+            let mut ws = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+            let started = tokio::time::Instant::now();
+            let class = if closing {
+                write_bounded(ws.close(None)).await.unwrap_err()
+            } else {
+                write_bounded(ws.send(Message::Text("x".repeat(4096).into())))
+                    .await
+                    .unwrap_err()
+            };
+            assert_eq!(class.name, "write_timeout");
+            assert_eq!(started.elapsed(), SOCKET_WRITE_TIMEOUT);
+            // A timed-out partially written connection must be discarded,
+            // never reused for a later subscription or heartbeat.
+            drop(ws);
+            let mut retained = Vec::new();
+            peer.read_to_end(&mut retained).await.unwrap();
+            assert_eq!(retained.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_control_writes_preserve_native_text_and_ping_pong_order() {
+        let (client_io, peer_io) = tokio::io::duplex(1024);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer_io, Role::Server, None).await;
+        let capture_side = async {
+            write_bounded(client.send(Message::Text("PING".into())))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                Message::Text("before".into())
+            );
+            let Message::Ping(payload) = client.next().await.unwrap().unwrap() else {
+                panic!("expected native control Ping");
+            };
+            write_bounded(client.send(Message::Pong(payload)))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                Message::Text("after".into())
+            );
+            write_bounded(client.close(None)).await.unwrap();
+        };
+        let public_peer = async {
+            assert_eq!(
+                peer.next().await.unwrap().unwrap(),
+                Message::Text("PING".into())
+            );
+            for message in [
+                Message::Text("before".into()),
+                Message::Ping(vec![7, 9].into()),
+                Message::Text("after".into()),
+            ] {
+                peer.send(message).await.unwrap();
+            }
+            assert_eq!(
+                peer.next().await.unwrap().unwrap(),
+                Message::Pong(vec![7, 9].into())
+            );
+            assert!(matches!(
+                peer.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(capture_side, public_peer);
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn subscription_failure_records_one_gap_then_advances_generation_with_backoff() {
         let dir = tempfile::tempdir().unwrap();
