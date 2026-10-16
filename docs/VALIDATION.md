@@ -1092,3 +1092,21 @@ Root verified the integrated local UI in the Codex in-app browser. Desktop/mobil
 The [ten-point comparison ledger](DASHBOARD_DESIGN.md) records layout, palette, typography, controls, metrics, tables, copy and intentional differences: illustrative $1,000 values were replaced by observed API values, and required stop/age/recovery information was added. [Desktop](design/desktop-integrated-qa.jpg) and [mobile](design/mobile-integrated-qa.jpg) artifacts contain simulated QA data.
 
 The [checks workflow](https://github.com/yurycooliq/mm2/actions/workflows/checks.yml) reproduces Rust, Python, reference/dashboard and production-container checks on push. External Telegram delivery, Mini App embedding in actual Telegram clients and funded order execution remain unverified.
+
+## October 16, 2026: transport diagnostic controlled validation
+
+The explicit `transport-diagnostic-v1` capture profile adds bounded close-reason
+evidence, one deadline-clipped flush of the peer Close acknowledgement and scalar
+receive/writer/heartbeat measurements. Default and `no-initial-dump-v1` behavior
+and report fields are preserved. Six new controlled tests cover profile
+isolation, safe UTF8 reason retention, actual duplex Ping/Pong/Close wire behavior
+with a retained Gap, stalled acknowledgement deadlines, task cancellation during
+an acknowledgement with the retained Gap and incomplete hash-chain footer, and
+metric boundaries.
+Format, all-target Clippy with warnings denied and 401 Rust tests passed in the
+full final validation attempt. Exact revision, image, release-binary and CLI
+receipts remain required before public use. One previous attempt timed out in
+the unchanged owner-control readiness fixture; its original failure is retained.
+The same test passed separately and in the full repeat without source or timeout
+changes; the actual timeout trigger remains unknown. These local checks establish
+neither the remote 1013 cause nor a valid economic holdout.

@@ -13,6 +13,14 @@ explicit accounting uncertainty check; observation granularity is reported.
 The source and public snapshot sampling rule must be frozen before capture;
 actual external valuation times cannot be chosen using strategy PnL.
 
+When this optional observer is enabled, it also retains at most 16 already
+validated raw Market identities: the record hash/sequence and receipt clocks,
+source outcome/token pairs, canonical metadata hash and validated market fields.
+Each boundary snapshot references only identities already observed at that point;
+the final dictionary alone does not prove earlier observation. These are public
+metadata witnesses, not authenticated settlement, fee or balance evidence.
+The observer remains separate from execution, valuation, quality and selection.
+
 The public-paper experiment loop evaluates several complete policies on one
 recorded input stream. It does not wait for a new day after each code edit and
 does not reconstruct a new strategy by deleting losing fills from an old ledger.
@@ -194,3 +202,35 @@ synthetic fills do not establish positive expected return or stable income.
 Infrastructure/extra-cost inputs are explicit assumptions; actual execution,
 gas, capacity, adverse periods and funded eligibility require separate evidence.
 There is no automatic funded promotion in these tools.
+
+## Opt-in transport diagnosis
+
+`experiment_capture ... --capture-profile=transport-diagnostic-v1` keeps the
+same two market asset IDs, `custom_feature_enabled:true`, `initial_dump:false`
+and 60-second prewarm as `no-initial-dump-v1`, with a distinct tape source
+`native_public_ws_capture_transport_diagnostic_v1`. The existing default and
+`no-initial-dump-v1` profiles keep their previous output and transport behavior.
+The diagnostic profile retains a peer Close reason as at most 123 UTF8-safe
+bytes encoded as hex, a SHA256 of those retained bytes, original length and an
+explicit truncation flag. It renders no raw peer reason. An observed Close is
+synchronously retained as a Gap before awaiting the acknowledgement, with its
+original observation time and acknowledgement state `pending_or_unknown`.
+It then flushes tungstenite's already queued acknowledgement once, bounded by
+the original socket deadline and existing five-second write timeout. A completed
+acknowledgement appears separately in stdout, bound to the retained Gap reason
+hash. Cancellation during the flush cannot erase the recorded Close or count
+the Gap or next generation twice. Acknowledging Close cannot explain or repair
+the cause of the first 1013.
+
+Bounded scalar session counters record received payload bytes, peak text frames
+in aligned one-second buckets, completed read wait, time between completed read
+attempts, writer-lock wait, append duration, and application/native heartbeat
+counts and flush timing. Cancelled read attempts can contribute to the interval
+between completed attempts; it is not proof that the socket was never polled.
+Text `PONG` has no correlation ID, so its elapsed time after the last `PING` is an
+unmatched observation rather than authenticated network RTT. These measurements
+remain in each original Gap and diagnostic session stdout. All native text stays
+in the raw chain; no financial parsing, recovery waiver or strategy change is
+added. A new source binding, frozen diagnostic question and finite owner-approved
+capture budget are required before a public test. Passing local protocol tests
+does not establish a remote 1013 fix or a valid economic holdout.

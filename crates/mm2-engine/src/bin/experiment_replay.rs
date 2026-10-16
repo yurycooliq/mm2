@@ -59,6 +59,7 @@ fn default_embargo() -> usize {
     1
 }
 const MAX_INGRESS_WITNESSES: usize = 32;
+const MAX_REPLAY_MARKETS: usize = 16;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +72,7 @@ struct ComparisonCheckpoints {
     request_sha256: String,
     prior_step: Option<(u64, u64)>,
     captured: Vec<Value>,
+    market_identity_witnesses: BTreeMap<String, Value>,
 }
 impl ComparisonCheckpoints {
     fn parse(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
@@ -91,7 +93,57 @@ impl ComparisonCheckpoints {
             request_sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
             prior_step: None,
             captured: Vec::with_capacity(2),
+            market_identity_witnesses: BTreeMap::new(),
         })
+    }
+    fn observe_market_identity(
+        &mut self,
+        market: &tape::MarketWire,
+        metadata: &Value,
+        sequence: u64,
+        record_hash: &str,
+        wall: u64,
+        mono: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // The ordinary replay admission already validates this metadata. This
+        // optional observer independently preserves its exact bounded pairs.
+        let validated = mm2_engine::discovery::parse_market(metadata, market.window_start_ms)?;
+        let validated_wire = serde_json::to_value(tape::MarketWire::from(&validated))?;
+        if validated_wire != serde_json::to_value(market)? {
+            return Err("comparison market metadata identity mismatch".into());
+        }
+        if self.market_identity_witnesses.len() >= MAX_REPLAY_MARKETS
+            || self.market_identity_witnesses.contains_key(&market.slug)
+        {
+            return Err("comparison market identity witness budget or duplicate".into());
+        }
+        let source_pair = |key: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+            let value = metadata.get(key).ok_or("missing source identity pair")?;
+            let pair: Vec<String> = match value {
+                Value::String(text) => serde_json::from_str(text)?,
+                Value::Array(_) => serde_json::from_value(value.clone())?,
+                _ => return Err("invalid source identity pair".into()),
+            };
+            if pair.len() != 2 {
+                return Err("source identity pair must contain exactly two entries".into());
+            }
+            Ok(pair)
+        };
+        let outcomes = source_pair("outcomes")?;
+        let tokens = source_pair("clobTokenIds")?;
+        if outcomes != ["Up", "Down"]
+            || tokens != [market.up_token.clone(), market.down_token.clone()]
+        {
+            return Err("source identity pairs conflict with validated market".into());
+        }
+        self.market_identity_witnesses.insert(
+            market.slug.clone(),
+            json!({"record_sequence":sequence,"record_hash":record_hash,"observed_wall_ms":wall,"observed_mono_ms":mono,
+                "input_kind":"market","source_metadata_sha256":tape::hash(metadata),
+                "source_outcomes":outcomes,"source_clob_token_ids":tokens,"validated_market":validated_wire,
+                "scope":"VALIDATED_PUBLIC_METADATA_IDENTITY_NOT_CHAIN_SETTLEMENT_FEE_OR_BALANCE_PROOF"}),
+        );
+        Ok(())
     }
     fn before_step(
         &mut self,
@@ -107,6 +159,7 @@ impl ComparisonCheckpoints {
                 let snapshot = state.core.snapshot();
                 json!({"slug":state.market.slug,"condition_id":state.market.condition_id,"up_token":state.market.up_token,"down_token":state.market.down_token,
                     "window_start_ms":state.market.window_start_ms,"window_end_ms":state.market.window_end_ms,
+                    "market_identity_witness_reference":self.market_identity_witnesses.get(&state.market.slug).map(|w|json!({"record_sequence":w["record_sequence"],"record_hash":w["record_hash"],"observed_wall_ms":w["observed_wall_ms"],"observed_mono_ms":w["observed_mono_ms"]})),
                     "accepted_first_snapshot_wall_ms":state.first_snap,"gaps":state.gaps,"invalid_inputs":state.invalid,
                     "awaiting_observed_source_generation":state.awaiting_generation,"source_generation":state.source_generation,
                     "native_snapshot_recovery":state.native_snapshots,
@@ -157,7 +210,10 @@ impl ComparisonCheckpoints {
             "public_api_boundary_uncertainty_ms":2000,"boundary_event_attribution":"UNKNOWN_WITHIN_PLUS_OR_MINUS_2000MS",
             "clock_steps_in_full_capture":clock_steps,"atomic_chain_cutoff":"UNKNOWN_API_VALUATION_LABEL_ONLY",
             "valuation_or_NAV_computed":false,"advance_reset_resolve_or_orders_added":false,
-            "pending_effects_delivered_for_snapshot":false,"snapshots":self.captured}),
+            "pending_effects_delivered_for_snapshot":false,"snapshots":self.captured,
+            "market_identity_witnesses":self.market_identity_witnesses,
+            "market_identity_witness_limit":MAX_REPLAY_MARKETS,
+            "market_identity_witness_scope":"Only prior validated raw Market records; snapshot references never advance or mutate inputs. No financial or authenticated chain proof."}),
         )
     }
 }
@@ -1013,7 +1069,7 @@ fn evaluate_options(
                 header_wall = started_wall_ms;
             }
             tape::Input::Market { market, metadata } => {
-                if states.len() >= 16
+                if states.len() >= MAX_REPLAY_MARKETS
                     || states.contains_key(&market.slug)
                     || states
                         .values()
@@ -1026,6 +1082,18 @@ fn evaluate_options(
                     != serde_json::to_value(&market).unwrap()
                 {
                     return Err("market metadata mismatch".into());
+                }
+                if let Some(checkpoints) = checkpoints.as_mut() {
+                    checkpoints
+                        .observe_market_identity(
+                            &market,
+                            &metadata,
+                            record.sequence,
+                            &record.hash,
+                            record.wall_ms,
+                            record.mono_ms,
+                        )
+                        .map_err(|error| error.to_string())?;
                 }
                 let mut core = Core::new(plan.limits.core()?)?;
                 core.set_market(m.clone())?;
@@ -1558,6 +1626,70 @@ mod tests {
         let mut checkpoints = ComparisonCheckpoints::parse(bytes).unwrap();
         checkpoints.before_step(20, 3, "raw_record", &[], &BTreeMap::new());
         assert!(checkpoints.report(0, 20, 0).is_err());
+    }
+    #[test]
+    fn comparison_identity_witness_rejects_conflicting_metadata_without_mutation() {
+        let start = 1_790_712_600_000;
+        let metadata = json!({"slug":"btc-updown-5m-1790712600","active":true,"closed":false,"acceptingOrders":true,
+            "eventStartTime":"2026-09-29T20:10:00Z","endDate":"2026-09-29T20:15:00Z","conditionId":format!("0x{}","a".repeat(64)),
+            "clobTokenIds":["1","2"],"outcomes":["Up","Down"],"orderPriceMinTickSize":0.01,
+            "cryptoMarketConfig":{"asset":"btc","duration":"5m","twapEnabled":true,"twapLookbackSeconds":60}});
+        let market = mm2_engine::discovery::parse_market(&metadata, start).unwrap();
+        let wire = tape::MarketWire::from(&market);
+        let mut observer =
+            ComparisonCheckpoints::parse(br#"{"schema":1,"wall_ms":[10,20]}"#).unwrap();
+        let hash = "c".repeat(64);
+        for (key, value) in [
+            ("outcomes", json!(["Down", "Up"])),
+            ("clobTokenIds", json!(["2", "1"])),
+            ("conditionId", json!(format!("0x{}", "b".repeat(64)))),
+        ] {
+            let mut bad = metadata.clone();
+            bad[key] = value;
+            assert!(
+                observer
+                    .observe_market_identity(&wire, &bad, 1, &hash, start - 2000, 0)
+                    .is_err()
+            );
+            assert!(observer.market_identity_witnesses.is_empty());
+            assert!(observer.captured.is_empty());
+        }
+        observer
+            .observe_market_identity(&wire, &metadata, 1, &hash, start - 2000, 0)
+            .unwrap();
+        let before = serde_json::to_value(&observer.market_identity_witnesses).unwrap();
+        assert!(
+            observer
+                .observe_market_identity(&wire, &metadata, 2, &hash, start - 1000, 1)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&observer.market_identity_witnesses).unwrap(),
+            before
+        );
+        // The observer follows the existing hard16-market admission bound and
+        // rejects overflow instead of silently losing an identity witness.
+        for index in 1..MAX_REPLAY_MARKETS {
+            observer
+                .market_identity_witnesses
+                .insert(format!("synthetic-{index}"), json!({}));
+        }
+        let mut other_metadata = metadata.clone();
+        other_metadata["conditionId"] = json!(format!("0x{}", "b".repeat(64)));
+        other_metadata["slug"] = json!("btc-updown-5m-1790712900");
+        other_metadata["eventStartTime"] = json!("2026-09-29T20:15:00Z");
+        other_metadata["endDate"] = json!("2026-09-29T20:20:00Z");
+        let mut other_wire = wire.clone();
+        other_wire.condition_id = format!("0x{}", "b".repeat(64));
+        other_wire.slug = "btc-updown-5m-1790712900".into();
+        other_wire.window_start_ms += 300000;
+        other_wire.window_end_ms += 300000;
+        assert!(
+            observer
+                .observe_market_identity(&other_wire, &other_metadata, 3, &hash, start - 500, 2)
+                .is_err()
+        );
+        assert_eq!(observer.market_identity_witnesses.len(), MAX_REPLAY_MARKETS);
     }
     #[test]
     fn comparison_reads_keep_partial_fill_cancel_in_flight_reservations_and_pending_events() {
@@ -2342,6 +2474,36 @@ mod tests {
             evaluate_options(&path, &plan_bytes, false, Some(&requests)).unwrap();
         let samples = &checkpoint_report["comparison_checkpoints"]["snapshots"];
         assert_eq!(samples.as_array().unwrap().len(), 2);
+        let source_record: tape::Record = serde_json::from_str(
+            &std::io::BufRead::lines(std::io::BufReader::new(File::open(&path).unwrap()))
+                .nth(1)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let identity =
+            &checkpoint_report["comparison_checkpoints"]["market_identity_witnesses"][&market.slug];
+        assert_eq!(identity["record_sequence"], source_record.sequence);
+        assert_eq!(identity["record_hash"], source_record.hash);
+        assert_eq!(identity["observed_wall_ms"], origin);
+        assert_eq!(identity["observed_mono_ms"], 0);
+        assert_eq!(identity["source_outcomes"], json!(["Up", "Down"]));
+        assert_eq!(identity["source_clob_token_ids"], json!(["1", "2"]));
+        if let tape::Input::Market { metadata, .. } = &source_record.input {
+            assert_eq!(identity["source_metadata_sha256"], tape::hash(metadata));
+        } else {
+            panic!("second controlled fixture record must be the actual market metadata");
+        }
+        assert_eq!(
+            identity["validated_market"],
+            serde_json::to_value(tape::MarketWire::from(&market)).unwrap()
+        );
+        assert!(identity["observed_wall_ms"].as_u64().unwrap() < market.window_start_ms);
+        let synthetic_public_redeem = json!({"timestamp":(market.window_end_ms+1000)/1000,"outcome_index":1,"outcome":"Down","token_id":""});
+        assert!(
+            identity["observed_wall_ms"].as_u64().unwrap()
+                < synthetic_public_redeem["timestamp"].as_u64().unwrap() * 1000
+        );
         for (index, boundary) in [origin + 5001, origin + 15001].into_iter().enumerate() {
             let sample = &samples[index];
             assert_eq!(sample["requested_wall_ms"], boundary);
@@ -2349,6 +2511,12 @@ mod tests {
             assert_eq!(sample["next_timeline_step"]["kind"], "raw_record");
             assert_eq!(sample["ledgers"].as_array().unwrap().len(), 4);
             assert_eq!(sample["mark_valuation"], "UNKNOWN_NOT_COMPUTED");
+            assert_eq!(
+                sample["native_input_states_before_boundary_step"][0]["market_identity_witness_reference"]
+                    ["record_hash"],
+                identity["record_hash"]
+            );
+            assert!(sample["native_input_states_before_boundary_step"][0]["market_identity_witness_reference"]["observed_wall_ms"].as_u64().unwrap() < boundary);
             for row in sample["ledgers"].as_array().unwrap() {
                 assert_eq!(row["portfolio"]["initial_cash_pico"], "1000000000000000");
                 assert!(row.get("pending_execution_events").is_some());

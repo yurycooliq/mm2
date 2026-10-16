@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use mm2_engine::experiments as tape;
 use mm2_engine::{discovery, domain::Market, feeds, paper_resolution};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -16,7 +17,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Error as WebSocketError, Message,
         error::{CapacityError, ProtocolError},
-        protocol::WebSocketConfig,
+        protocol::{CloseFrame, WebSocketConfig},
     },
 };
 
@@ -27,6 +28,7 @@ const STABLE_SESSION: Duration = Duration::from_secs(30);
 enum CaptureProfile {
     Default,
     NoInitialDumpV1,
+    TransportDiagnosticV1,
 }
 impl CaptureProfile {
     fn parse(arguments: &[String]) -> Result<Self, &'static str> {
@@ -35,8 +37,11 @@ impl CaptureProfile {
             6 if arguments[5] == "--capture-profile=no-initial-dump-v1" => {
                 Ok(Self::NoInitialDumpV1)
             }
+            6 if arguments[5] == "--capture-profile=transport-diagnostic-v1" => {
+                Ok(Self::TransportDiagnosticV1)
+            }
             _ => Err(
-                "usage: experiment_capture NEW_TAPE.jsonl SECONDS MAX_BYTES MAX_FRAMES [--capture-profile=no-initial-dump-v1]",
+                "usage: experiment_capture NEW_TAPE.jsonl SECONDS MAX_BYTES MAX_FRAMES [--capture-profile=no-initial-dump-v1|--capture-profile=transport-diagnostic-v1]",
             ),
         }
     }
@@ -44,23 +49,25 @@ impl CaptureProfile {
         match self {
             Self::Default => "default",
             Self::NoInitialDumpV1 => "no-initial-dump-v1",
+            Self::TransportDiagnosticV1 => "transport-diagnostic-v1",
         }
     }
     fn source(self) -> &'static str {
         match self {
             Self::Default => "native_public_ws_capture",
             Self::NoInitialDumpV1 => "native_public_ws_capture_no_initial_dump_v1",
+            Self::TransportDiagnosticV1 => "native_public_ws_capture_transport_diagnostic_v1",
         }
     }
     fn prewarm_ms(self) -> u64 {
         match self {
             Self::Default => 20_000,
-            Self::NoInitialDumpV1 => 60_000,
+            Self::NoInitialDumpV1 | Self::TransportDiagnosticV1 => 60_000,
         }
     }
     fn subscription(self, market: &Market) -> Value {
         let mut request = json!({"assets_ids":[market.up_token,market.down_token],"type":"market","custom_feature_enabled":true});
-        if self == Self::NoInitialDumpV1 {
+        if self != Self::Default {
             // The documented initial dump is independent of subsequent full
             // books. Preserve every received frame and let strict native
             // recovery decide whether real books ever initialize the market.
@@ -103,7 +110,8 @@ impl RetryBackoff {
 }
 
 // Fixed categories only. Never format a nested transport error, URL, header,
-// peer close reason, or payload into secondary diagnostics.
+// peer close reason, or payload into secondary diagnostics. The explicit
+// diagnostic profile separately retains bounded close-reason bytes as hex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ErrorClass {
     name: &'static str,
@@ -163,6 +171,298 @@ async fn write_bounded(
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
+fn micros(duration: Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+// RFC6455 limits a Close control payload to125bytes, including its2byte code.
+// Retain bytes, not a rendered peer string: it may contain terminal controls,
+// separators or misleading diagnostic text. Never interpolate it directly.
+const MAX_CLOSE_REASON_BYTES: usize = 123;
+struct PeerCloseEvidence {
+    reason_hex: String,
+    retained_reason_sha256: String,
+    retained_reason_bytes: usize,
+    original_reason_bytes: usize,
+    observed_wall_ms: u64,
+    flush_result: &'static str,
+    flush_started_session_ms: u64,
+    flush_finished_session_ms: u64,
+    flush_us: u64,
+}
+impl PeerCloseEvidence {
+    fn new(frame: Option<&CloseFrame>, observed_wall_ms: u64) -> Self {
+        let reason = frame.map_or("", |frame| frame.reason.as_str());
+        let mut end = reason.len().min(MAX_CLOSE_REASON_BYTES);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        let retained = &reason.as_bytes()[..end];
+        Self {
+            reason_hex: hex::encode(retained),
+            retained_reason_sha256: format!("{:x}", Sha256::digest(retained)),
+            retained_reason_bytes: end,
+            original_reason_bytes: reason.len(),
+            observed_wall_ms,
+            flush_result: "not_attempted",
+            flush_started_session_ms: 0,
+            flush_finished_session_ms: 0,
+            flush_us: 0,
+        }
+    }
+}
+
+struct TransportTrace {
+    started: tokio::time::Instant,
+    message_payload_bytes: u64,
+    text_frames: u64,
+    bucket_second: u64,
+    bucket_text_frames: u64,
+    peak_text_frames_in_1s_bucket: u64,
+    completed_read_wait_us_max: u64,
+    between_completed_read_attempts_us_max: u64,
+    last_read_completed: Option<tokio::time::Instant>,
+    record_lock_wait_us_max: u64,
+    record_append_us_max: u64,
+    record_busy_us_total: u64,
+    application_ping_attempts: u64,
+    application_pings_flushed: u64,
+    application_ping_flush_us_max: u64,
+    application_pongs_received: u64,
+    last_application_ping: Option<tokio::time::Instant>,
+    last_application_pong: Option<tokio::time::Instant>,
+    last_pong_since_last_ping_ms: Option<u64>,
+    native_pings_received: u64,
+    native_pongs_flushed: u64,
+    native_pong_flush_us_max: u64,
+    close: Option<PeerCloseEvidence>,
+    retained_gap_reason_sha256: Option<String>,
+}
+impl TransportTrace {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            message_payload_bytes: 0,
+            text_frames: 0,
+            bucket_second: 0,
+            bucket_text_frames: 0,
+            peak_text_frames_in_1s_bucket: 0,
+            completed_read_wait_us_max: 0,
+            between_completed_read_attempts_us_max: 0,
+            last_read_completed: None,
+            record_lock_wait_us_max: 0,
+            record_append_us_max: 0,
+            record_busy_us_total: 0,
+            application_ping_attempts: 0,
+            application_pings_flushed: 0,
+            application_ping_flush_us_max: 0,
+            application_pongs_received: 0,
+            last_application_ping: None,
+            last_application_pong: None,
+            last_pong_since_last_ping_ms: None,
+            native_pings_received: 0,
+            native_pongs_flushed: 0,
+            native_pong_flush_us_max: 0,
+            close: None,
+            retained_gap_reason_sha256: None,
+        }
+    }
+    fn observe_read(
+        &mut self,
+        message: Option<&Message>,
+        started: tokio::time::Instant,
+        completed: tokio::time::Instant,
+    ) {
+        self.completed_read_wait_us_max = self
+            .completed_read_wait_us_max
+            .max(micros(completed.saturating_duration_since(started)));
+        if let Some(previous) = self.last_read_completed {
+            self.between_completed_read_attempts_us_max = self
+                .between_completed_read_attempts_us_max
+                .max(micros(started.saturating_duration_since(previous)));
+        }
+        self.last_read_completed = Some(completed);
+        let Some(message) = message else { return };
+        self.message_payload_bytes = self
+            .message_payload_bytes
+            .saturating_add(message.len().try_into().unwrap_or(u64::MAX));
+        if let Message::Text(text) = message {
+            self.text_frames = self.text_frames.saturating_add(1);
+            // These are aligned, nonoverlapping1second buckets, not an exact
+            // rolling window. No per-frame history or financial parsing.
+            let second = completed.saturating_duration_since(self.started).as_secs();
+            if second != self.bucket_second {
+                self.bucket_second = second;
+                self.bucket_text_frames = 0;
+            }
+            self.bucket_text_frames = self.bucket_text_frames.saturating_add(1);
+            self.peak_text_frames_in_1s_bucket = self
+                .peak_text_frames_in_1s_bucket
+                .max(self.bucket_text_frames);
+            if text.as_str() == "PONG" {
+                self.application_pongs_received = self.application_pongs_received.saturating_add(1);
+                self.last_application_pong = Some(completed);
+                // PONG contains no correlation ID. This elapsed observation
+                // is not proof of remote RTT or acknowledgement identity.
+                self.last_pong_since_last_ping_ms = self
+                    .last_application_ping
+                    .map(|sent| millis(completed.saturating_duration_since(sent)));
+            }
+        } else if matches!(message, Message::Ping(_)) {
+            self.native_pings_received = self.native_pings_received.saturating_add(1);
+        }
+    }
+    fn summary(&self) -> Value {
+        let now = tokio::time::Instant::now();
+        let mut value = json!({
+            "transport_diag_v":1,
+            "message_payload_bytes":self.message_payload_bytes,
+            "diagnostic_text_frames":self.text_frames,
+            "peak_text_frames_in_1s_bucket":self.peak_text_frames_in_1s_bucket,
+            "completed_read_wait_us_max":self.completed_read_wait_us_max,
+            "between_completed_read_attempts_us_max":self.between_completed_read_attempts_us_max,
+            "record_lock_wait_us_max":self.record_lock_wait_us_max,
+            "record_append_us_max":self.record_append_us_max,
+            "record_busy_us_total":self.record_busy_us_total,
+            "application_ping_attempts":self.application_ping_attempts,
+            "application_pings_flushed":self.application_pings_flushed,
+            "application_ping_flush_us_max":self.application_ping_flush_us_max,
+            "application_pongs_received":self.application_pongs_received,
+            "last_application_ping_age_ms":self.last_application_ping.map(|at|millis(now.saturating_duration_since(at))),
+            "last_application_pong_age_ms":self.last_application_pong.map(|at|millis(now.saturating_duration_since(at))),
+            "last_pong_since_last_ping_ms":self.last_pong_since_last_ping_ms,
+            "native_pings_received":self.native_pings_received,
+            "native_pongs_flushed":self.native_pongs_flushed,
+            "native_pong_flush_us_max":self.native_pong_flush_us_max,
+        });
+        if let Some(close) = &self.close {
+            value["peer_reason_hex"] = json!(close.reason_hex);
+            value["peer_reason_retained_sha256"] = json!(close.retained_reason_sha256);
+            value["peer_reason_retained_bytes"] = json!(close.retained_reason_bytes);
+            value["peer_reason_original_bytes"] = json!(close.original_reason_bytes);
+            value["peer_reason_truncated"] =
+                json!(close.retained_reason_bytes != close.original_reason_bytes);
+            value["peer_close_observed_wall_ms"] = json!(close.observed_wall_ms);
+            value["peer_close_flush_result"] = json!(close.flush_result);
+            value["peer_close_flush_started_session_ms"] = json!(close.flush_started_session_ms);
+            value["peer_close_flush_finished_session_ms"] = json!(close.flush_finished_session_ms);
+            value["peer_close_flush_us"] = json!(close.flush_us);
+        }
+        if let Some(hash) = &self.retained_gap_reason_sha256 {
+            value["retained_gap_reason_sha256"] = json!(hash);
+        }
+        value
+    }
+    fn reason_suffix(&self) -> String {
+        self.summary()
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                let value = if value.is_null() {
+                    "none".into()
+                } else {
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned)
+                };
+                format!("{key}={value}")
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+}
+
+async fn flush_peer_close<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    frame: Option<&CloseFrame>,
+    trace: &mut TransportTrace,
+    deadline: tokio::time::Instant,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let started = tokio::time::Instant::now();
+    let session_started = trace.started;
+    let evidence = trace
+        .close
+        .get_or_insert_with(|| PeerCloseEvidence::new(frame, wall()));
+    evidence.flush_started_session_ms = millis(started.saturating_duration_since(session_started));
+    // read() already queued the exact close ACK. Flush it once; do not send a
+    // second close, reconnect, extend the original bound or clear the Gap.
+    evidence.flush_result = if started >= deadline {
+        "deadline_before_flush"
+    } else {
+        match tokio::time::timeout_at(deadline.min(started + SOCKET_WRITE_TIMEOUT), ws.flush())
+            .await
+        {
+            Ok(Ok(())) => "ok",
+            Ok(Err(error)) => error_class(&error).name,
+            Err(_) if tokio::time::Instant::now() >= deadline => "deadline_during_flush",
+            Err(_) => "write_timeout",
+        }
+    };
+    let finished = tokio::time::Instant::now();
+    evidence.flush_finished_session_ms =
+        millis(finished.saturating_duration_since(session_started));
+    evidence.flush_us = micros(finished.saturating_duration_since(started));
+}
+
+struct PeerCloseGap<'a> {
+    capture: &'a Shared,
+    feed: &'a str,
+    slug: Option<&'a str>,
+    generation: &'a mut u64,
+    reason: String,
+    delay: Duration,
+}
+async fn retain_and_flush_peer_close<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    frame: Option<&CloseFrame>,
+    trace: &mut TransportTrace,
+    deadline: tokio::time::Instant,
+    gap: PeerCloseGap<'_>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let closed_generation = *gap.generation;
+    let mut evidence = PeerCloseEvidence::new(frame, wall());
+    evidence.flush_result = "pending_or_unknown";
+    trace.close = Some(evidence);
+    let reason = format!(
+        "{};retry_delay_ms={};{}",
+        gap.reason,
+        millis(gap.delay),
+        trace.reason_suffix()
+    );
+    let reason_sha256 = format!("{:x}", Sha256::digest(reason.as_bytes()));
+    // There must be no await before retaining an already observed failure.
+    // Capture main aborts receivers at its deadline; a blocked close ACK must
+    // not turn that real failure into an apparently gap-free final tape.
+    let recorded = emit(
+        gap.capture,
+        tape::Input::Gap {
+            feed: gap.feed.into(),
+            market_slug: gap.slug.map(str::to_owned),
+            reason,
+        },
+    );
+    *gap.generation += 1;
+    trace.retained_gap_reason_sha256 = Some(reason_sha256);
+    println!(
+        "{}",
+        json!({"event":"capture_peer_close_observed","feed":gap.feed,"market_slug":gap.slug,
+        "generation":closed_generation,"gap_recorded":recorded,"retry_delay_ms":millis(gap.delay),
+        "measurements":trace.summary(),"remote_root_cause":"UNKNOWN","orders_submitted":0})
+    );
+    flush_peer_close(ws, frame, trace, deadline).await;
+    // If aborted during flush, the retained Gap and first stdout witness keep
+    // pending_or_unknown. A completed ACK result is separate, hash-bound evidence.
+    println!(
+        "{}",
+        json!({"event":"capture_peer_close_ack_result","feed":gap.feed,"market_slug":gap.slug,
+        "generation":closed_generation,"measurements":trace.summary(),"remote_root_cause":"UNKNOWN","orders_submitted":0})
+    );
+}
 struct SocketTrace {
     started: Instant,
     connected_at: Option<Instant>,
@@ -170,6 +470,7 @@ struct SocketTrace {
     text_frames: u64,
     max_record_write_ms: u64,
     max_heartbeat_late_ms: u64,
+    transport: Option<TransportTrace>,
 }
 impl SocketTrace {
     fn new() -> Self {
@@ -180,6 +481,22 @@ impl SocketTrace {
             text_frames: 0,
             max_record_write_ms: 0,
             max_heartbeat_late_ms: 0,
+            transport: None,
+        }
+    }
+    fn for_profile(profile: CaptureProfile) -> Self {
+        let mut trace = Self::new();
+        if profile == CaptureProfile::TransportDiagnosticV1 {
+            trace.transport = Some(TransportTrace::new());
+        }
+        trace
+    }
+    fn diagnostic_output(&self, feed: &str, slug: Option<&str>, generation: u64, end: &str) {
+        if let Some(transport) = &self.transport {
+            println!(
+                "{}",
+                json!({"event":"capture_transport_session_diagnostic","feed":feed,"market_slug":slug,"generation":generation,"end_category":end,"measurements":transport.summary(),"remote_root_cause":"UNKNOWN","orders_submitted":0})
+            );
         }
     }
     fn stable(&self) -> bool {
@@ -270,6 +587,27 @@ fn emit_frame(c: &Shared, input: tape::Input, deadline: tokio::time::Instant) ->
     }
     capture.emit(input)
 }
+fn emit_frame_observed(
+    c: &Shared,
+    input: tape::Input,
+    deadline: tokio::time::Instant,
+    trace: &mut TransportTrace,
+) -> bool {
+    let waiting = tokio::time::Instant::now();
+    let mut capture = c.lock().unwrap();
+    let acquired = tokio::time::Instant::now();
+    trace.record_lock_wait_us_max = trace
+        .record_lock_wait_us_max
+        .max(micros(acquired.saturating_duration_since(waiting)));
+    if acquired >= deadline {
+        return false;
+    }
+    let result = capture.emit(input);
+    let elapsed = micros(tokio::time::Instant::now().saturating_duration_since(acquired));
+    trace.record_append_us_max = trace.record_append_us_max.max(elapsed);
+    trace.record_busy_us_total = trace.record_busy_us_total.saturating_add(elapsed);
+    result
+}
 async fn get(client: &reqwest::Client, url: &str) -> Result<Value, String> {
     let mut r = client
         .get(url)
@@ -353,8 +691,9 @@ async fn socket(c: Shared, market: Option<Market>, profile: CaptureProfile) -> R
         let config = WebSocketConfig::default()
             .max_message_size(Some(feeds::MAX_MESSAGE_BYTES))
             .max_frame_size(Some(feeds::MAX_MESSAGE_BYTES));
-        let mut trace = SocketTrace::new();
+        let mut trace = SocketTrace::for_profile(profile);
         let mut close_code = None;
+        let mut already_recorded_gap_delay = None;
         let result = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(deadline) => return Ok(()),
@@ -371,6 +710,12 @@ async fn socket(c: Shared, market: Option<Market>, profile: CaptureProfile) -> R
                     || tokio::time::Instant::now() >= deadline
                 {
                     let _ = write_bounded(ws.close(None)).await;
+                    trace.diagnostic_output(
+                        feed,
+                        slug.as_deref(),
+                        generation,
+                        "local_stop_after_connect",
+                    );
                     return Ok(());
                 }
                 if let Some(m) = &market {
@@ -395,35 +740,83 @@ async fn socket(c: Shared, market: Option<Market>, profile: CaptureProfile) -> R
                         || tokio::time::Instant::now() >= deadline
                     {
                         let _ = write_bounded(ws.close(None)).await;
+                        trace.diagnostic_output(feed, slug.as_deref(), generation, "local_stop");
                         return Ok(());
                     }
                     tokio::select! {
                         biased;
                         _=tokio::time::sleep_until(deadline)=>{
                             let _=write_bounded(ws.close(None)).await;
+                            trace.diagnostic_output(feed,slug.as_deref(),generation,"socket_deadline");
                             return Ok(());
                         },
                         scheduled=heartbeat.tick()=>{
                             trace.max_heartbeat_late_ms=trace.max_heartbeat_late_ms.max(millis(tokio::time::Instant::now().saturating_duration_since(scheduled)));
-                            if market.is_some() && let Err(class)=write_bounded(ws.send(Message::Text("PING".into()))).await {
-                                break trace.reason("heartbeat_send",class,generation,None);
+                            if market.is_some() {
+                                let observed=trace.transport.as_ref().map(|_|tokio::time::Instant::now());
+                                if let Some(transport)=&mut trace.transport {
+                                    transport.application_ping_attempts=transport.application_ping_attempts.saturating_add(1);
+                                }
+                                let result=write_bounded(ws.send(Message::Text("PING".into()))).await;
+                                if let (Some(transport),Some(started))=(&mut trace.transport,observed) {
+                                    let completed=tokio::time::Instant::now();
+                                    transport.application_ping_flush_us_max=transport.application_ping_flush_us_max.max(micros(completed.saturating_duration_since(started)));
+                                    if result.is_ok() {
+                                        transport.application_pings_flushed=transport.application_pings_flushed.saturating_add(1);
+                                        transport.last_application_ping=Some(completed);
+                                    }
+                                }
+                                if let Err(class)=result {break trace.reason("heartbeat_send",class,generation,None);}
                             }
                         },
-                        message=ws.next()=>{match message {
+                        received=async {
+                            let started=(profile==CaptureProfile::TransportDiagnosticV1).then(tokio::time::Instant::now);
+                            let message=ws.next().await;
+                            let timing=started.map(|started|(started,tokio::time::Instant::now()));
+                            (message,timing)
+                        }=>{
+                            let (message,timing)=received;
+                            if let (Some(transport),Some((started,completed)))=(&mut trace.transport,timing) {
+                                transport.observe_read(message.as_ref().and_then(|value|value.as_ref().ok()),started,completed);
+                            }
+                            match message {
                             Some(Ok(Message::Text(text)))=>{
-                                if c.lock().unwrap().stopped() || wall() >= until || tokio::time::Instant::now() >= deadline {return Ok(());}
+                                if c.lock().unwrap().stopped() || wall() >= until || tokio::time::Instant::now() >= deadline {
+                                    trace.diagnostic_output(feed,slug.as_deref(),generation,"text_after_cutoff");return Ok(());
+                                }
                                 let received=Instant::now();trace.last_text=Some(received);trace.text_frames+=1;
-                                if !emit_frame(&c,tape::Input::Frame{feed:feed.into(),market_slug:slug.clone(),generation,text:text.to_string()},deadline){return Ok(());}
+                                let input=tape::Input::Frame{feed:feed.into(),market_slug:slug.clone(),generation,text:text.to_string()};
+                                let retained=if let Some(transport)=&mut trace.transport {
+                                    emit_frame_observed(&c,input,deadline,transport)
+                                } else {emit_frame(&c,input,deadline)};
+                                if !retained {
+                                    trace.diagnostic_output(feed,slug.as_deref(),generation,"record_admission_stopped");return Ok(());
+                                }
                                 trace.max_record_write_ms=trace.max_record_write_ms.max(millis(received.elapsed()));
                             },
                             Some(Ok(Message::Ping(payload)))=>{
-                                if let Err(class)=write_bounded(ws.send(Message::Pong(payload))).await {
+                                let observed=trace.transport.as_ref().map(|_|tokio::time::Instant::now());
+                                let result=write_bounded(ws.send(Message::Pong(payload))).await;
+                                if let (Some(transport),Some(started))=(&mut trace.transport,observed) {
+                                    transport.native_pong_flush_us_max=transport.native_pong_flush_us_max.max(micros(started.elapsed()));
+                                    if result.is_ok() {transport.native_pongs_flushed=transport.native_pongs_flushed.saturating_add(1);}
+                                }
+                                if let Err(class)=result {
                                     break trace.reason("pong_send",class,generation,None);
                                 }
                             },
                             Some(Ok(Message::Close(frame)))=>{
-                                close_code=frame.map(|frame|u16::from(frame.code));
-                                break trace.reason("peer_close",ErrorClass::named("peer_close"),generation,close_code);
+                                close_code=frame.as_ref().map(|frame|u16::from(frame.code));
+                                let reason=trace.reason("peer_close",ErrorClass::named("peer_close"),generation,close_code);
+                                let stable=trace.stable();
+                                if let Some(transport)=&mut trace.transport {
+                                    let jitter_ms=(uuid::Uuid::new_v4().as_u128()%1001) as u64;
+                                    let delay=backoff.next_delay(close_code,stable,jitter_ms);
+                                    already_recorded_gap_delay=Some(delay);
+                                    retain_and_flush_peer_close(&mut ws,frame.as_ref(),transport,deadline,
+                                        PeerCloseGap{capture:&c,feed,slug:slug.as_deref(),generation:&mut generation,reason:reason.clone(),delay}).await;
+                                }
+                                break reason;
                             },
                             Some(Err(error))=>break trace.reason("read",error_class(&error),generation,None),
                             None=>break trace.reason("read",ErrorClass::named("stream_ended"),generation,None),
@@ -441,9 +834,20 @@ async fn socket(c: Shared, market: Option<Market>, profile: CaptureProfile) -> R
                 None,
             ),
         };
+        if let Some(delay) = already_recorded_gap_delay {
+            if !wait_retry(&c, delay, deadline).await {
+                return Ok(());
+            }
+            continue;
+        }
         let jitter_ms = (uuid::Uuid::new_v4().as_u128() % 1001) as u64;
         let delay = backoff.next_delay(close_code, trace.stable(), jitter_ms);
-        let reason = format!("{reason};retry_delay_ms={}", millis(delay));
+        let mut reason = format!("{reason};retry_delay_ms={}", millis(delay));
+        if let Some(transport) = &trace.transport {
+            reason.push(';');
+            reason.push_str(&transport.reason_suffix());
+            trace.diagnostic_output(feed, slug.as_deref(), generation, "transport_gap");
+        }
         // Subscription-send failures also consume a generation and back off;
         // a following frame can never masquerade as the failed connection.
         if !gap_and_retry(
@@ -727,6 +1131,290 @@ mod tests {
             vec![0, 300_000]
         );
         assert_eq!(profile.wanted_starts(u64::MAX).len(), 1);
+    }
+
+    #[test]
+    fn transport_diagnostic_profile_is_separate_and_keeps_old_profiles_unobserved() {
+        let mut arguments = ["capture", "new.jsonl", "35", "65536", "1000"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        arguments.push("--capture-profile=transport-diagnostic-v1".into());
+        let diagnostic = CaptureProfile::parse(&arguments).unwrap();
+        assert_eq!(diagnostic, CaptureProfile::TransportDiagnosticV1);
+        assert_eq!(
+            diagnostic.proof(),
+            json!({"capture_profile":"transport-diagnostic-v1","source":"native_public_ws_capture_transport_diagnostic_v1","clob_initial_dump":false,"prewarm_ms":60_000})
+        );
+        assert_eq!(
+            diagnostic.subscription(&profile_market()),
+            CaptureProfile::NoInitialDumpV1.subscription(&profile_market())
+        );
+        assert_ne!(
+            diagnostic.source(),
+            CaptureProfile::NoInitialDumpV1.source()
+        );
+        for old in [CaptureProfile::Default, CaptureProfile::NoInitialDumpV1] {
+            assert!(SocketTrace::for_profile(old).transport.is_none());
+        }
+        arguments.push("--capture-profile=no-initial-dump-v1".into());
+        assert!(CaptureProfile::parse(&arguments).is_err());
+    }
+
+    #[test]
+    fn close_reason_evidence_is_bounded_utf8_hex_and_never_rendered_as_peer_text() {
+        let reason = format!("{}é\n;forged_gap=true", "x".repeat(122));
+        let frame = CloseFrame {
+            code: 1013.into(),
+            reason: reason.clone().into(),
+        };
+        let evidence = PeerCloseEvidence::new(Some(&frame), 17);
+        let retained = hex::decode(&evidence.reason_hex).unwrap();
+        assert_eq!(retained, vec![b'x'; 122]);
+        assert!(std::str::from_utf8(&retained).is_ok());
+        assert_eq!(evidence.retained_reason_bytes, 122);
+        assert_eq!(evidence.original_reason_bytes, reason.len());
+        assert_eq!(
+            evidence.retained_reason_sha256,
+            format!("{:x}", Sha256::digest(&retained))
+        );
+        let mut transport = TransportTrace::new();
+        transport.close = Some(evidence);
+        let suffix = transport.reason_suffix();
+        assert!(suffix.is_ascii());
+        assert!(!suffix.contains("forged_gap"));
+        assert!(!suffix.contains('\n'));
+        assert!(suffix.contains("peer_reason_truncated=true"));
+        assert!(suffix.len() < 2048);
+        let none = PeerCloseEvidence::new(None, 0);
+        assert!(none.reason_hex.is_empty());
+        assert_eq!(none.retained_reason_bytes, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_wire_preserves_one_pong_and_flushes_exact_peer_close_ack_and_gap() {
+        let (client_io, peer_io) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer_io, Role::Server, None).await;
+        let mut trace = TransportTrace::new();
+        let native = Message::Text("{\"untouched\":true}".into());
+        let ping = Message::Ping(vec![7, 9, 0, 255].into());
+        let close = CloseFrame {
+            code: 1013.into(),
+            reason: "retry later\n;untrusted=true".into(),
+        };
+        peer.send(native.clone()).await.unwrap();
+        peer.send(ping.clone()).await.unwrap();
+        peer.send(Message::Close(Some(close.clone())))
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let received = client.next().await.unwrap().unwrap();
+        assert_eq!(received, native);
+        trace.observe_read(Some(&received), started, tokio::time::Instant::now());
+        let received = client.next().await.unwrap().unwrap();
+        assert_eq!(received, ping);
+        trace.observe_read(Some(&received), started, tokio::time::Instant::now());
+        let Message::Ping(payload) = received else {
+            unreachable!()
+        };
+        write_bounded(client.send(Message::Pong(payload)))
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.next().await.unwrap().unwrap(),
+            Message::Pong(vec![7, 9, 0, 255].into())
+        );
+        let Message::Close(received_close) = client.next().await.unwrap().unwrap() else {
+            panic!("peer close expected");
+        };
+        assert_eq!(received_close, Some(close.clone()));
+        // Returning Close queues the ACK but does not flush it. This fails if
+        // there was a duplicate manual/automatic Pong before the close ACK.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), peer.next())
+                .await
+                .is_err()
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let (_dir, capture) = retry_capture();
+        let mut generation = 3;
+        retain_and_flush_peer_close(
+            &mut client,
+            received_close.as_ref(),
+            &mut trace,
+            deadline,
+            PeerCloseGap {
+                capture: &capture,
+                feed: "clob",
+                slug: Some("controlled"),
+                generation: &mut generation,
+                reason: "socket_peer_close;class=peer_close;generation=3;close_code=1013".into(),
+                delay: Duration::ZERO,
+            },
+        )
+        .await;
+        assert_eq!(
+            peer.next().await.unwrap().unwrap(),
+            Message::Close(Some(close.clone()))
+        );
+        let evidence = trace.close.as_ref().unwrap();
+        assert_eq!(evidence.flush_result, "ok");
+        assert_eq!(
+            hex::decode(&evidence.reason_hex).unwrap(),
+            close.reason.as_bytes()
+        );
+        let reason = trace.reason_suffix();
+        assert!(!reason.contains("untrusted=true"));
+        assert!(trace.retained_gap_reason_sha256.is_some());
+        assert_eq!(generation, 4);
+        assert_eq!(capture.lock().unwrap().gaps, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aborting_stalled_peer_close_ack_preserves_already_observed_gap_in_final_chain() {
+        let (client_io, peer_io) = tokio::io::duplex(1);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer_io, Role::Server, None).await;
+        let frame = CloseFrame {
+            code: 1013.into(),
+            reason: "overload\n;peer_claim=true".into(),
+        };
+        let (sent, received) = tokio::join!(peer.send(Message::Close(Some(frame))), client.next());
+        sent.unwrap();
+        let Message::Close(frame) = received.unwrap().unwrap() else {
+            panic!("peer close expected")
+        };
+        let (dir, capture) = retry_capture();
+        let owned_capture = capture.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut generation = 7;
+            let mut trace = TransportTrace::new();
+            retain_and_flush_peer_close(
+                &mut client,
+                frame.as_ref(),
+                &mut trace,
+                deadline,
+                PeerCloseGap {
+                    capture: &owned_capture,
+                    feed: "clob",
+                    slug: Some("controlled"),
+                    generation: &mut generation,
+                    reason: "socket_peer_close;class=peer_close;generation=7;close_code=1013"
+                        .into(),
+                    delay: Duration::from_millis(5007),
+                },
+            )
+            .await;
+            generation
+        });
+        while capture.lock().unwrap().gaps == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The peer stops reading, so the real tiny transport leaves ACK flush
+        // pending. Use the same abort_all boundary as capture main, then seal
+        // the final tape. The observed1013 must already be in its hash chain.
+        tasks.abort_all();
+        assert!(tasks.join_next().await.unwrap().unwrap_err().is_cancelled());
+        tokio::time::advance(Duration::from_millis(40)).await;
+        {
+            let mut state = capture.lock().unwrap();
+            assert_eq!(state.gaps, 1);
+            let elapsed = millis(state.start.elapsed());
+            state
+                .writer
+                .append(
+                    wall(),
+                    elapsed,
+                    tape::Input::End {
+                        reason: "deadline".into(),
+                        frames: 0,
+                        gaps: 1,
+                        complete: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            state.writer.finish().unwrap();
+        }
+        let mut gaps = Vec::new();
+        tape::visit(&dir.path().join("retry.jsonl"), 65_536, |record| {
+            if let tape::Input::Gap { reason, .. } = record.input {
+                gaps.push(reason);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].contains("generation=7;close_code=1013;retry_delay_ms=5007;"));
+        assert!(gaps[0].contains("peer_close_flush_result=pending_or_unknown"));
+        assert!(
+            gaps[0].contains("peer_reason_hex=6f7665726c6f61640a3b706565725f636c61696d3d74727565")
+        );
+        assert!(!gaps[0].contains("peer_claim=true"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_peer_close_ack_never_outlives_deadline_or_polls_after_it() {
+        for remaining in [Duration::ZERO, Duration::from_millis(40)] {
+            // Read the server close concurrently because only one wire byte
+            // fits. Then stop reading ACK bytes so its flush must time out.
+            let (client_io, peer_io) = tokio::io::duplex(1);
+            let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let mut peer = WebSocketStream::from_raw_socket(peer_io, Role::Server, None).await;
+            let frame = CloseFrame {
+                code: 1013.into(),
+                reason: "busy".into(),
+            };
+            let (sent, received) =
+                tokio::join!(peer.send(Message::Close(Some(frame))), client.next());
+            sent.unwrap();
+            let Message::Close(frame) = received.unwrap().unwrap() else {
+                panic!("peer close expected")
+            };
+            let mut trace = TransportTrace::new();
+            let started = tokio::time::Instant::now();
+            flush_peer_close(&mut client, frame.as_ref(), &mut trace, started + remaining).await;
+            assert_eq!(started.elapsed(), remaining);
+            let evidence = trace.close.as_ref().unwrap();
+            assert_eq!(
+                evidence.flush_result,
+                if remaining.is_zero() {
+                    "deadline_before_flush"
+                } else {
+                    "deadline_during_flush"
+                }
+            );
+            assert_eq!(evidence.flush_us, micros(remaining));
+            drop(client);
+            let mut bytes = Vec::new();
+            peer.get_mut().read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes.len(), usize::from(!remaining.is_zero()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_burst_and_pong_observations_keep_fixed_bucket_and_unmatched_semantics() {
+        let mut trace = TransportTrace::new();
+        let started = tokio::time::Instant::now();
+        for _ in 0..3 {
+            trace.observe_read(Some(&Message::Text("x".into())), started, started);
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let now = tokio::time::Instant::now();
+        trace.last_application_ping = Some(now);
+        trace.observe_read(Some(&Message::Text("PONG".into())), now, now);
+        trace.observe_read(Some(&Message::Text("yy".into())), now, now);
+        let summary = trace.summary();
+        assert_eq!(summary["peak_text_frames_in_1s_bucket"], 3);
+        assert_eq!(summary["diagnostic_text_frames"], 5);
+        assert_eq!(summary["message_payload_bytes"], 9);
+        assert_eq!(summary["application_pongs_received"], 1);
+        assert_eq!(summary["last_pong_since_last_ping_ms"], 0);
+        assert_eq!(summary["application_pings_flushed"], 0);
+        assert_eq!(summary["between_completed_read_attempts_us_max"], 1_000_000);
     }
 
     #[tokio::test]
@@ -1226,6 +1914,7 @@ mod tests {
             text_frames: u64::MAX,
             max_record_write_ms: u64::MAX,
             max_heartbeat_late_ms: u64::MAX,
+            transport: None,
         };
         let reason = trace.reason(
             "peer_close",
