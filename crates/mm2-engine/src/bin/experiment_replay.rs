@@ -4,7 +4,7 @@ use mm2_engine::experiments as tape;
 use mm2_engine::{
     config::Limits,
     domain::{self, Action, Core, FeedEvent, FeedSource, Market, StopReason},
-    feeds,
+    feeds, ingress,
     paper_guard::ReferenceGuard,
     simulation::{self, MultiMarketPaper, Operation},
 };
@@ -53,6 +53,75 @@ struct MarketState {
     invalid: u64,
     winner: Option<mm2_core::Outcome>,
     outcome_observed_at: Option<u64>,
+    frames: feeds::Recovery,
+    native_snapshots: Option<(u64, [bool; 2])>,
+    source_generation: Option<u64>,
+    awaiting_generation: bool,
+    recoverable_splits: u64,
+    completed_snapshot_recoveries: u64,
+    discarded_native_events: u64,
+}
+impl MarketState {
+    fn clear_native(&mut self, awaiting_generation: bool) {
+        self.frames = feeds::Recovery::new([0; 2]);
+        self.native_snapshots = None;
+        self.awaiting_generation = awaiting_generation;
+        let _ = self.core.apply(FeedEvent::Disconnect {
+            source: FeedSource::Clob,
+            reason: "recorded native source recovery".into(),
+        });
+    }
+    fn expire_native(&mut self, wall: u64, mono: u64, max_age: u64) {
+        if self
+            .native_snapshots
+            .is_some_and(|(started, _)| mono.saturating_sub(started) >= max_age)
+        {
+            if wall < self.market.window_end_ms {
+                self.invalid += 1;
+            }
+            // This recorder cannot invent the actor's REST refresh/new socket.
+            self.clear_native(true);
+        }
+    }
+    fn apply_public(&mut self, event: FeedEvent, wall: u64, mono: u64) -> bool {
+        let prior = self.native_snapshots;
+        let mut seen = prior.map(|(_, seen)| seen);
+        let snapshot = if let FeedEvent::Snapshot { outcome, .. } = &event {
+            Some(usize::from(*outcome == domain::Outcome::Down))
+        } else {
+            None
+        };
+        match ingress::apply_with_native_snapshots(&mut self.core, event, &mut seen) {
+            Ok(ingress::Applied::SnapshotRecoveryStarted) => {
+                self.recoverable_splits += 1;
+                // Preserve the existing strict experiment quality gate even
+                // when the actor can restore its books without reconnecting.
+                if wall < self.market.window_end_ms {
+                    self.invalid += 1;
+                }
+                self.native_snapshots = Some((mono, [false; 2]));
+                true
+            }
+            Ok(applied) => {
+                if applied == ingress::Applied::SnapshotRecoveryCompleted {
+                    self.completed_snapshot_recoveries += 1;
+                }
+                self.native_snapshots =
+                    seen.map(|seen| (prior.expect("existing native recovery").0, seen));
+                if let Some(index) = snapshot {
+                    self.first_snap[index].get_or_insert(wall);
+                }
+                true
+            }
+            Err(_) => {
+                if wall < self.market.window_end_ms {
+                    self.invalid += 1;
+                }
+                self.clear_native(true);
+                false
+            }
+        }
+    }
 }
 struct Run {
     candidate: Candidate,
@@ -161,6 +230,8 @@ impl Run {
         if wall >= state.market.window_end_ms
             || self.paper.portfolio_halt().is_some()
             || !self.errors.is_empty()
+            || state.native_snapshots.is_some()
+            || state.awaiting_generation
         {
             self.apply(Operation::CancelAll { now_ms: mono });
             return;
@@ -535,6 +606,9 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
         }
         while next_tick < record.mono_ms {
             let wall = previous_wall + next_tick.saturating_sub(previous_mono);
+            for state in states.values_mut() {
+                state.expire_native(wall, next_tick, plan.limits.max_feed_age_ms);
+            }
             for run in &mut runs {
                 run.tick(wall, next_tick, &mut states, plan.decision_interval_ms);
             }
@@ -577,6 +651,13 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                         invalid: 0,
                         winner: None,
                         outcome_observed_at: None,
+                        frames: feeds::Recovery::new([0; 2]),
+                        native_snapshots: None,
+                        source_generation: None,
+                        awaiting_generation: false,
+                        recoverable_splits: 0,
+                        completed_snapshot_recoveries: 0,
+                        discarded_native_events: 0,
                     },
                 );
             }
@@ -610,7 +691,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                 feed,
                 market_slug,
                 text,
-                ..
+                generation,
             } => {
                 if feed == "binance" {
                     match feeds::parse_binance(&text, record.mono_ms) {
@@ -620,11 +701,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                                 .filter(|s| record.wall_ms < s.market.window_end_ms)
                             {
                                 for e in &events {
-                                    if state.core.apply(e.clone()).is_err()
-                                        && record.wall_ms < state.market.window_end_ms
-                                    {
-                                        state.invalid += 1;
-                                    }
+                                    state.apply_public(e.clone(), record.wall_ms, record.mono_ms);
                                 }
                             }
                         }
@@ -645,38 +722,55 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                 } else if feed == "clob" {
                     let slug = market_slug.ok_or("missing CLOB market identity")?;
                     let state = states.get_mut(&slug).ok_or("frame before metadata")?;
-                    match feeds::parse_clob(&text, &state.market, record.mono_ms) {
-                        Ok(events) => {
-                            for event in events {
-                                if let FeedEvent::Snapshot { outcome, .. } = &event {
-                                    state.first_snap
-                                        [usize::from(*outcome == domain::Outcome::Down)]
-                                    .get_or_insert(record.wall_ms);
-                                }
-                                for run in &mut runs {
-                                    run.trade(
-                                        record.wall_ms,
-                                        record.mono_ms,
-                                        &slug,
-                                        &event,
-                                        plan.limits.max_feed_age_ms,
+                    if state.source_generation != Some(generation) {
+                        if state.source_generation.is_some() {
+                            state.clear_native(false);
+                        }
+                        state.source_generation = Some(generation);
+                        state.awaiting_generation = false;
+                    }
+                    if !state.awaiting_generation {
+                        match feeds::parse_clob(&text, &state.market, record.mono_ms) {
+                            Ok(parsed) => {
+                                let count = parsed.len();
+                                let events = state.frames.filter(parsed);
+                                state.discarded_native_events += (count - events.len()) as u64;
+                                // The actor consumes at most sixteen admitted events per turn.
+                                // Cross-frame queue coalescing remains unobserved on this tape.
+                                'frame: for batch in events.chunks(16) {
+                                    let valid = ingress::valid_prefix(
+                                        &state.core,
+                                        batch,
+                                        state.native_snapshots.map(|(_, seen)| seen),
                                     );
+                                    for event in &batch[..valid] {
+                                        for run in &mut runs {
+                                            run.trade(
+                                                record.wall_ms,
+                                                record.mono_ms,
+                                                &slug,
+                                                event,
+                                                plan.limits.max_feed_age_ms,
+                                            );
+                                        }
+                                    }
+                                    for event in batch {
+                                        if !state.apply_public(
+                                            event.clone(),
+                                            record.wall_ms,
+                                            record.mono_ms,
+                                        ) {
+                                            break 'frame;
+                                        }
+                                    }
                                 }
-                                if state.core.apply(event).is_err()
-                                    && record.wall_ms < state.market.window_end_ms
-                                {
+                            }
+                            Err(_) => {
+                                if record.wall_ms < state.market.window_end_ms {
                                     state.invalid += 1;
                                 }
+                                state.clear_native(true);
                             }
-                        }
-                        Err(_) => {
-                            if record.wall_ms < state.market.window_end_ms {
-                                state.invalid += 1;
-                            }
-                            let _ = state.core.apply(FeedEvent::Disconnect {
-                                source: FeedSource::Clob,
-                                reason: "invalid_frame".into(),
-                            });
                         }
                     }
                 } else {
@@ -695,15 +789,18 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                         if feed == "fee" {
                             state.fee = None;
                         }
-                        let source = if feed == "binance" {
-                            FeedSource::Binance
+                        if feed == "binance" {
+                            state.apply_public(
+                                FeedEvent::Disconnect {
+                                    source: FeedSource::Binance,
+                                    reason: "recorded_capture_gap".into(),
+                                },
+                                record.wall_ms,
+                                record.mono_ms,
+                            );
                         } else {
-                            FeedSource::Clob
-                        };
-                        let _ = state.core.apply(FeedEvent::Disconnect {
-                            source,
-                            reason: "recorded_capture_gap".into(),
-                        });
+                            state.clear_native(feed == "clob" || feed == "collector");
+                        }
                     }
                 }
             }
@@ -862,7 +959,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                     }
                 }
             }
-            per_market.push(json!({"slug":state.market.slug,"partition":part,"quality_eligible":quality,"preopen_snapshots":warm,"gaps":state.gaps,"invalid_inputs":state.invalid,"final_outcome_observed":state.winner.is_some(),"model_gross_pnl_pico":pnl.map(|v|v.to_string()),"assumed_extra_cost_pico":costs.to_string(),"model_net_pnl_pico":net.map(|v|v.to_string())}));
+            per_market.push(json!({"slug":state.market.slug,"partition":part,"quality_eligible":quality,"preopen_snapshots":warm,"gaps":state.gaps,"invalid_inputs":state.invalid,"recoverable_split_deltas":state.recoverable_splits,"completed_native_snapshot_recoveries":state.completed_snapshot_recoveries,"native_events_discarded_by_production_filter":state.discarded_native_events,"awaiting_observed_source_generation":state.awaiting_generation,"final_outcome_observed":state.winner.is_some(),"model_gross_pnl_pico":pnl.map(|v|v.to_string()),"assumed_extra_cost_pico":costs.to_string(),"model_net_pnl_pico":net.map(|v|v.to_string())}));
         }
         let holdout_eligible = eligible
             && end_complete
@@ -917,7 +1014,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
         rows.push(json!({"candidate":run.candidate.name,"latency_per_leg_ms":run.latency,"training_settled_windows":train_count,"holdout_settled_windows":holdout_count,"training_filled_markets":training_filled_markets,"holdout_filled_markets":holdout_filled_markets,"training_net_pnl_pico":if train_count>0{Some(train.to_string())}else{None},"holdout_net_pnl_pico":if holdout_count>0{Some(holdout.to_string())}else{None},"training_selection_eligible":training_quality && plan.frozen_at_wall_ms<=header_wall && train_count==plan.training_windows && training_filled_markets>=2 && train>0 && !run.error_times.iter().any(|at|split.is_some_and(|cutoff|*at<cutoff)) && !clock_step_times.iter().any(|at|split.is_some_and(|cutoff|*at<cutoff)),"effective_rules":run.candidate.rules,"skipped_delayed_prints":run.skipped_delayed_prints,"holdout_eligible":holdout_eligible,"status":if holdout_eligible{"APPROXIMATE_PUBLIC_INPUT_MODEL"}else{"INCOMPLETE_NOT_ELIGIBLE"},"full_run_settled_gross_pnl_pico":full_settled_gross.to_string(),"full_run_net_pnl_pico":if unknown_spent==0{Some((full_settled_gross-full_assumed_cost).to_string())}else{None},"unknown_terminal_spent_pico":unknown_spent.to_string(),"excluded_window_settled_gross_pnl_pico":(full_settled_gross-scored_gross).to_string(),"assumed_full_run_cost_pico":full_assumed_cost.to_string(),"fill_events":run.fill_events,"partial_fill_events":run.partial_fill_events,"filled_quantity_micros":p.positions.iter().map(|p|p.execution_up_micros+p.execution_down_micros).sum::<u64>(),"max_daily_gross_loss_pico":run.max_daily_gross_loss.to_string(),"max_drawdown_pico":run.max_drawdown.to_string(),"errors":run.errors,"quote_rejections":run.orders_rejected,"gates":run.gates,"portfolio":p,"markets":per_market}));
     }
     let selection = select_training(&rows, &plan.latency_per_leg_ms);
-    let report = json!({"schema":1,"network":"none","orders_submitted":0,"plan_sha256":format!("{:x}",sha2::Sha256::digest(bytes)),"declared_plan_time_precedes_capture":plan.frozen_at_wall_ms<=header_wall,"tape_receipt":receipt,"capture_final_complete_flag":end_complete,"capture_gaps":all_gaps,"clock_steps":clock_steps,"eligible_window_candidates":windows.len(),"training_windows_required":plan.training_windows,"embargo_windows":plan.embargo_windows,"execution_model_revision":"native_public_print_causal_v3_all_candidates","holdout_windows_required":plan.min_holdout_windows,"holdout_start_wall_ms":split,"training_only_selection":selection,"rows":rows,"limitations":["Synthetic execution on observed public input, never real PnL or promised ROI.","No documented CLOB sequence proves capture completeness; raw receive ordering belongs to this host.","Fixed per-leg latency stresses are assumptions, not measured order round trips.","Conservative native L2 queue approximation uses prints at their reported price, no full sweep proof.","Equal timestamps retain original captured frame order, independent candidates have separate queues and finite capital.","Infrastructure and extra execution costs are explicit plan assumptions; rebates zero; actual gas unknown.","Whole first partial and last incomplete market windows excluded from scored totals; their trades still consume capital, full-run losses and unknown terminal cost remain visible.","No capital reset at training/holdout boundary; realized settled market PnL is attributed by market start.","Replay tick scheduler approximates runtime scheduling; production parity requires separate controlled comparison.","Declared freeze timestamp alone does not prove plan immutability; require externally retained pre-capture plan hash and launch binding."]});
+    let report = json!({"schema":1,"network":"none","orders_submitted":0,"plan_sha256":format!("{:x}",sha2::Sha256::digest(bytes)),"declared_plan_time_precedes_capture":plan.frozen_at_wall_ms<=header_wall,"tape_receipt":receipt,"capture_final_complete_flag":end_complete,"capture_gaps":all_gaps,"clock_steps":clock_steps,"eligible_window_candidates":windows.len(),"training_windows_required":plan.training_windows,"embargo_windows":plan.embargo_windows,"execution_model_revision":"native_public_print_causal_v3_shared_native_ingress_v1","holdout_windows_required":plan.min_holdout_windows,"holdout_start_wall_ms":split,"training_only_selection":selection,"rows":rows,"limitations":["Synthetic execution on observed public input, never real PnL or promised ROI.","No documented CLOB sequence proves capture completeness; raw receive ordering belongs to this host.","Fixed per-leg latency stresses are assumptions, not measured order round trips.","Conservative native L2 queue approximation uses prints at their reported price, no full sweep proof.","Equal timestamps retain original captured frame order, independent candidates have separate queues and finite capital.","Infrastructure and extra execution costs are explicit plan assumptions; rebates zero; actual gas unknown.","Whole first partial and last incomplete market windows excluded from scored totals; their trades still consume capital, full-run losses and unknown terminal cost remain visible.","No capital reset at training/holdout boundary; realized settled market PnL is attributed by market start.","Native frame filtering and split-snapshot admission share production code; this tape lacks REST bootstrap responses/cutoffs, engine-triggered refresh receipts and actor cross-frame batching. Replay waits for an observed generation after genuine faults/timeouts rather than inventing recovery.","Replay tick scheduler and raw-frame chunking approximate actor scheduling; exact production parity remains unproven.","Declared freeze timestamp alone does not prove plan immutability; require externally retained pre-capture plan hash and launch binding."]});
     Ok(report)
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {

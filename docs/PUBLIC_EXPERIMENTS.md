@@ -26,6 +26,16 @@ unchanged orders; replacements and pending cancellations retain their normal
 execution constraints. Latency scenarios are assumptions rather than measured
 venue order round trips.
 
+The actor and replay share native-frame watermark filtering, split-delta
+snapshot recovery and valid-prefix checks before consuming trade witnesses.
+Replay reports discarded events and recovery counts. The tape does not retain
+production REST bootstrap responses/cutoffs, engine-triggered refresh receipts,
+the actor's fatal repeated-refresh latch or actor batching across raw frames.
+After a genuine fault or recovery timeout,
+replay waits for an actually observed source generation rather than inventing
+successful recovery. Exact production scheduling and ingestion parity remain
+unproven; a shared parser alone does not establish them.
+
 Freeze candidate parameters and retain their exact plan hash before collection.
 The plan declares complete chronological training markets, an embargo for final
 outcomes, later holdout markets, costs and minimum activity. Selection uses only

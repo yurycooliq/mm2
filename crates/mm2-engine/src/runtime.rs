@@ -45,36 +45,9 @@ fn valid_feed_prefix(core: &Core, batch: &[FeedEvent]) -> usize {
 fn valid_feed_prefix_with_recovery(
     core: &Core,
     batch: &[FeedEvent],
-    mut native_snapshots: Option<[bool; 2]>,
+    native_snapshots: Option<[bool; 2]>,
 ) -> usize {
-    let mut checked = core.clone();
-    for (index, event) in batch.iter().enumerate() {
-        if native_snapshots.is_some() && matches!(event, FeedEvent::Delta { .. }) {
-            continue;
-        }
-        if let Err(error) = checked.apply(event.clone()) {
-            if matches!(event, FeedEvent::Delta { .. })
-                && error == "crossed or oversized batch result"
-            {
-                native_snapshots = Some([false; 2]);
-                continue;
-            }
-            return index;
-        }
-        match event {
-            FeedEvent::Snapshot { outcome, .. } => {
-                if let Some(seen) = &mut native_snapshots {
-                    seen[usize::from(*outcome == crate::domain::Outcome::Down)] = true;
-                    if seen.iter().all(|seen| *seen) {
-                        native_snapshots = None;
-                    }
-                }
-            }
-            FeedEvent::Disconnect { .. } => native_snapshots = None,
-            _ => {}
-        }
-    }
-    batch.len()
+    crate::ingress::valid_prefix(core, batch, native_snapshots)
 }
 pub fn mode_name(mode: Mode) -> &'static str {
     match mode {
@@ -1473,69 +1446,57 @@ impl Actor {
     }
     fn apply_feed_event(&mut self, event: FeedEvent) -> bool {
         self.feed_events = self.feed_events.saturating_add(1);
-        let delta = matches!(&event, FeedEvent::Delta { .. });
-        if delta && self.native_snapshot_recovery.is_some() {
-            // A split price update must not initialize a cleared book. Wait for
-            // independently validated full native snapshots; trades still flow.
-            return true;
-        }
-        let snapshot_outcome = match &event {
-            FeedEvent::Snapshot { outcome, .. } => {
-                Some(usize::from(*outcome == crate::domain::Outcome::Down))
+        if self.source == "public" {
+            let clock_context = self.core.feed_clock_context(&event);
+            let previous = self.native_snapshot_recovery;
+            let mut seen = previous.map(|(_, seen)| seen);
+            let applied =
+                crate::ingress::apply_with_native_snapshots(&mut self.core, event, &mut seen);
+            let applied = match applied {
+                Ok(applied) => applied,
+                Err(error) => {
+                    if error == "CLOB receive clock regressed"
+                        || error == "CLOB exchange clock regressed"
+                    {
+                        tracing::warn!(validation_detail = crate::feeds::input_failure_detail(&error),
+                            clock_context = ?clock_context, "public clock validation failed");
+                    }
+                    self.refresh_after_validation_failure(&error);
+                    return false;
+                }
+            };
+            match applied {
+                crate::ingress::Applied::DeltaSkippedAwaitingSnapshots => return true,
+                crate::ingress::Applied::SnapshotRecoveryStarted => {
+                    // Same FIFO generation: queued snapshots/trades remain valid.
+                    self.native_snapshot_recovery = Some((Instant::now(), [false; 2]));
+                    self.simulation_books = [(0, 0); 2];
+                    self.simulation_depth = [Vec::new(), Vec::new()];
+                    tracing::warn!(
+                        validation_detail = "crossed_or_oversized_delta",
+                        "public book waiting for native snapshots"
+                    );
+                    self.source_status = json!({"phase":"resynchronizing","message":"waiting for validated full native books","validation_detail":"crossed_or_oversized_delta","at_ms":wall_ms()});
+                    self.evaluate();
+                    self.drive_live();
+                    self.publish();
+                    return true;
+                }
+                crate::ingress::Applied::SnapshotRecoveryCompleted => {
+                    self.native_snapshot_recovery = None;
+                    tracing::info!(
+                        "native book snapshots restored; freshness admission still required"
+                    );
+                    self.source_status = json!({"phase":"streaming","message":"validated native books restored; freshness admission still required","at_ms":wall_ms()});
+                }
+                crate::ingress::Applied::Event => {
+                    self.native_snapshot_recovery =
+                        seen.map(|seen| (previous.expect("existing snapshot recovery").0, seen));
+                }
             }
-            FeedEvent::Disconnect { .. } => {
-                self.native_snapshot_recovery = None;
-                None
-            }
-            _ => None,
-        };
-        let clock_context = self.core.feed_clock_context(&event);
-        if let Err(error) = self.core.apply(event)
-            && self.source == "public"
-        {
-            if error == "CLOB receive clock regressed" || error == "CLOB exchange clock regressed" {
-                tracing::warn!(
-                    validation_detail = crate::feeds::input_failure_detail(&error),
-                    clock_context = ?clock_context,
-                    "public clock validation failed"
-                );
-            }
-            if delta && error == "crossed or oversized batch result" {
-                // Public updates can add a new best price before removing the
-                // opposite old price in a separate frame. Never trade that
-                // intermediate book, or infer an atomic cross-frame ordering.
-                self.native_snapshot_recovery = Some((Instant::now(), [false; 2]));
-                // This is the same FIFO source generation. A processing-time
-                // barrier would discard already queued recovery snapshots and
-                // trade witnesses, although they arrived after the split delta.
-                self.simulation_books = [(0, 0); 2];
-                self.simulation_depth = [Vec::new(), Vec::new()];
-                tracing::warn!(
-                    validation_detail = "crossed_or_oversized_delta",
-                    "public book waiting for native snapshots"
-                );
-                self.source_status = json!({"phase":"resynchronizing","message":"waiting for validated full native books","validation_detail":"crossed_or_oversized_delta","at_ms":wall_ms()});
-                self.evaluate();
-                self.drive_live();
-                self.publish();
-                // Keep the rest of this bounded batch: it may already contain
-                // both native snapshots. Admission remains blocked until then.
-                return true;
-            }
-            self.refresh_after_validation_failure(&error);
-            return false;
-        }
-        if let (Some(outcome), Some((_, seen))) =
-            (snapshot_outcome, &mut self.native_snapshot_recovery)
-        {
-            seen[outcome] = true;
-            if seen.iter().all(|seen| *seen) {
-                self.native_snapshot_recovery = None;
-                tracing::info!(
-                    "native book snapshots restored; freshness admission still required"
-                );
-                self.source_status = json!({"phase":"streaming","message":"validated native books restored; freshness admission still required","at_ms":wall_ms()});
-            }
+        } else {
+            // Preserve demo's historical behavior; public recovery is opt-in by source.
+            let _ = self.core.apply(event);
         }
         self.evaluate();
         self.drive_live();
