@@ -417,6 +417,19 @@ fn levels(input: Vec<Level>) -> Result<BTreeMap<u64, u64>, String> {
     result.retain(|_, q| *q > 0);
     Ok(result)
 }
+
+/// Only well-formed obsolete full snapshots may be suppressed by public ingress.
+/// Malformed books must still reach the strict validator and cut their suffix.
+pub(crate) fn snapshot_shape_valid(bids: &[Level], asks: &[Level]) -> bool {
+    let (Ok(bids), Ok(asks)) = (levels(bids.to_vec()), levels(asks.to_vec())) else {
+        return false;
+    };
+    match (bids.last_key_value(), asks.first_key_value()) {
+        (Some((bid, _)), Some((ask, _))) => bid < ask,
+        _ => true,
+    }
+}
+
 impl Core {
     pub fn new(config: CoreConfig) -> Result<Self, String> {
         valid_config(&config)?;
