@@ -60,6 +60,108 @@ fn default_embargo() -> usize {
 }
 const MAX_INGRESS_WITNESSES: usize = 32;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRequest {
+    schema: u32,
+    wall_ms: [u64; 2],
+}
+struct ComparisonCheckpoints {
+    requested: [u64; 2],
+    request_sha256: String,
+    prior_step: Option<(u64, u64)>,
+    captured: Vec<Value>,
+}
+impl ComparisonCheckpoints {
+    fn parse(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        if bytes.len() > 4096 {
+            return Err("comparison checkpoint request exceeds 4KiB".into());
+        }
+        let request: CheckpointRequest = serde_json::from_slice(bytes)?;
+        if request.schema != 1
+            || request.wall_ms[0] == 0
+            || request.wall_ms[0] >= request.wall_ms[1]
+        {
+            return Err(
+                "comparison checkpoints require exactly two sorted nonzero wall times".into(),
+            );
+        }
+        Ok(Self {
+            requested: request.wall_ms,
+            request_sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
+            prior_step: None,
+            captured: Vec::with_capacity(2),
+        })
+    }
+    fn before_step(
+        &mut self,
+        wall: u64,
+        mono: u64,
+        kind: &str,
+        runs: &[Run],
+        states: &BTreeMap<String, MarketState>,
+    ) {
+        while self.captured.len() < 2 && self.requested[self.captured.len()] <= wall {
+            let boundary = self.requested[self.captured.len()];
+            let input_states: Vec<_> = states.values().map(|state| {
+                let snapshot = state.core.snapshot();
+                json!({"slug":state.market.slug,"condition_id":state.market.condition_id,"up_token":state.market.up_token,"down_token":state.market.down_token,
+                    "window_start_ms":state.market.window_start_ms,"window_end_ms":state.market.window_end_ms,
+                    "accepted_first_snapshot_wall_ms":state.first_snap,"gaps":state.gaps,"invalid_inputs":state.invalid,
+                    "awaiting_observed_source_generation":state.awaiting_generation,"source_generation":state.source_generation,
+                    "native_snapshot_recovery":state.native_snapshots,
+                    "up_book":book_summary(&snapshot.up_book),"down_book":book_summary(&snapshot.down_book),
+                    "reference":snapshot.reference.map(|r|json!({"price_micro":r.price_micro,"exchange_ms":r.exchange_ms,"observed_mono_ms":r.observed_mono_ms})),
+                    "final_outcome_observed_at_ms":state.outcome_observed_at,
+                    "fee_policy_valid_at_boundary":state.fee.as_ref().is_some_and(|f|f.permits(&state.market.condition_id,&state.market.up_token,&state.market.down_token,boundary))})
+            }).collect();
+            let ledgers: Vec<_> = runs.iter().map(|run| {
+                // Exactly two optional reads per ledger. Never advance the
+                // emulator or deliver pending effects just to take a sample.
+                let execution = run.paper.snapshot();
+                json!({"candidate":run.candidate.name,"latency_per_leg_ms":run.latency,
+                    "current_market_slug":run.current,"emulator_now_mono_ms":execution.now_ms,
+                    "pending_execution_events":execution.pending_events,"execution_fault":execution.fault,
+                    "execution_snapshot":execution,
+                    "portfolio":run.paper.portfolio_snapshot(),"errors":run.errors,
+                    "fill_events_so_far":run.fill_events,"partial_fill_events_so_far":run.partial_fill_events})
+            }).collect();
+            self.captured.push(json!({"requested_wall_ms":boundary,"prior_timeline_step":self.prior_step.map(|(wall,mono)|json!({"wall_ms":wall,"mono_ms":mono})),
+                "next_timeline_step":{"wall_ms":wall,"mono_ms":mono,"kind":kind},
+                "boundary_to_next_step_ms":wall-boundary,
+                "prior_to_next_step_ms":self.prior_step.and_then(|(prior,_)|wall.checked_sub(prior)),
+                "native_input_states_before_boundary_step":input_states,"ledgers":ledgers,
+                "mark_valuation":"UNKNOWN_NOT_COMPUTED","atomic_chain_cutoff":"UNKNOWN_API_VALUATION_LABEL_ONLY"}));
+        }
+        self.prior_step = Some((wall, mono));
+    }
+    fn report(
+        self,
+        header_wall: u64,
+        capture_end: u64,
+        clock_steps: u64,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        if self.requested[0] <= header_wall
+            || self.requested[1] >= capture_end
+            || self.captured.len() != 2
+        {
+            return Err(
+                "comparison checkpoints must lie strictly inside complete tape time coverage"
+                    .into(),
+            );
+        }
+        Ok(
+            json!({"schema":1,"request_sha256":self.request_sha256,"requested_wall_ms":self.requested,
+            "tape_time_bounds":{"header_wall_ms":header_wall,"capture_end_wall_ms":capture_end},
+            "semantics":"READ_ONLY_PRE_FIRST_EXISTING_TIMELINE_STEP_WALL_GE_BOUNDARY_INTERVAL_V0_INCLUSIVE_V1_EXCLUSIVE",
+            "public_api_boundary_uncertainty_ms":2000,"boundary_event_attribution":"UNKNOWN_WITHIN_PLUS_OR_MINUS_2000MS",
+            "clock_steps_in_full_capture":clock_steps,"atomic_chain_cutoff":"UNKNOWN_API_VALUATION_LABEL_ONLY",
+            "valuation_or_NAV_computed":false,"advance_reset_resolve_or_orders_added":false,
+            "pending_effects_delivered_for_snapshot":false,"snapshots":self.captured}),
+        )
+    }
+}
+
 #[derive(Serialize)]
 struct FaultOrigin {
     record_sequence: u64,
@@ -773,6 +875,17 @@ fn evaluate_mode(
     bytes: &[u8],
     diagnostic_ingress: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    evaluate_options(tape_path, bytes, diagnostic_ingress, None)
+}
+fn evaluate_options(
+    tape_path: &Path,
+    bytes: &[u8],
+    diagnostic_ingress: bool,
+    checkpoint_bytes: Option<&[u8]>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut checkpoints = checkpoint_bytes
+        .map(ComparisonCheckpoints::parse)
+        .transpose()?;
     if bytes.len() > 65536 {
         return Err("plan exceeds 64KiB".into());
     }
@@ -877,6 +990,9 @@ fn evaluate_mode(
         }
         while next_tick < record.mono_ms {
             let wall = previous_wall + next_tick.saturating_sub(previous_mono);
+            if let Some(checkpoints) = checkpoints.as_mut() {
+                checkpoints.before_step(wall, next_tick, "scheduled_tick", &runs, &states);
+            }
             for state in states.values_mut() {
                 state.expire_native(wall, next_tick, plan.limits.max_feed_age_ms);
             }
@@ -884,6 +1000,9 @@ fn evaluate_mode(
                 run.tick(wall, next_tick, &mut states, plan.decision_interval_ms);
             }
             next_tick += plan.decision_interval_ms;
+        }
+        if let Some(checkpoints) = checkpoints.as_mut() {
+            checkpoints.before_step(record.wall_ms, record.mono_ms, "raw_record", &runs, &states);
         }
         previous_wall = record.wall_ms;
         previous_mono = record.mono_ms;
@@ -1369,17 +1488,27 @@ fn evaluate_mode(
     } else {
         report
     };
+    let mut report = report;
+    if let Some(checkpoints) = checkpoints {
+        report["comparison_checkpoints"] =
+            checkpoints.report(header_wall, capture_end, clock_steps)?;
+    }
     Ok(report)
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     let diagnostic_ingress = args.len() == 5 && args[4] == "--diagnostic-ingress";
-    if args.len() != 4 && !diagnostic_ingress {
-        return Err("usage: experiment_replay TAPE.jsonl FROZEN_PLAN.json NEW_REPORT.json [--diagnostic-ingress]".into());
+    let comparison = args.len() == 6 && args[4] == "--comparison-checkpoints";
+    if args.len() != 4 && !diagnostic_ingress && !comparison {
+        return Err("usage: experiment_replay TAPE.jsonl FROZEN_PLAN.json NEW_REPORT.json [--diagnostic-ingress | --comparison-checkpoints REQUEST.json]".into());
     }
     let mut bytes = Vec::new();
     File::open(&args[2])?.take(65537).read_to_end(&mut bytes)?;
-    let report = if diagnostic_ingress {
+    let report = if comparison {
+        let mut request = Vec::new();
+        File::open(&args[5])?.take(4097).read_to_end(&mut request)?;
+        evaluate_options(Path::new(&args[1]), &bytes, false, Some(&request))?
+    } else if diagnostic_ingress {
         evaluate_mode(Path::new(&args[1]), &bytes, true)?
     } else {
         evaluate(Path::new(&args[1]), &bytes)?
@@ -1402,6 +1531,156 @@ use sha2::Digest;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn comparison_checkpoint_request_is_exact_bounded_and_strictly_inside_coverage() {
+        for bytes in [
+            br#"{"schema":1,"wall_ms":[1,2],"extra":0}"#.as_slice(),
+            br#"{"schema":1,"wall_ms":[1]}"#.as_slice(),
+            br#"{"schema":1,"wall_ms":[1,2,3]}"#.as_slice(),
+            br#"{"schema":1,"wall_ms":[2,1]}"#.as_slice(),
+            br#"{"schema":1,"wall_ms":[1,1]}"#.as_slice(),
+            br#"{"schema":1,"wall_ms":[0,1]}"#.as_slice(),
+            br#"{"schema":2,"wall_ms":[1,2]}"#.as_slice(),
+        ] {
+            assert!(ComparisonCheckpoints::parse(bytes).is_err());
+        }
+        assert!(ComparisonCheckpoints::parse(&vec![b' '; 4097]).is_err());
+        let bytes = br#"{"schema":1,"wall_ms":[10,20]}"#;
+        let mut checkpoints = ComparisonCheckpoints::parse(bytes).unwrap();
+        checkpoints.before_step(9, 1, "raw_record", &[], &BTreeMap::new());
+        assert!(checkpoints.captured.is_empty());
+        checkpoints.before_step(10, 2, "scheduled_tick", &[], &BTreeMap::new());
+        assert_eq!(checkpoints.captured.len(), 1);
+        assert_eq!(checkpoints.captured[0]["prior_timeline_step"]["wall_ms"], 9);
+        assert_eq!(checkpoints.captured[0]["next_timeline_step"]["wall_ms"], 10);
+        checkpoints.before_step(20, 3, "raw_record", &[], &BTreeMap::new());
+        assert!(checkpoints.report(0, 21, 0).is_ok());
+        let mut checkpoints = ComparisonCheckpoints::parse(bytes).unwrap();
+        checkpoints.before_step(20, 3, "raw_record", &[], &BTreeMap::new());
+        assert!(checkpoints.report(0, 20, 0).is_err());
+    }
+    #[test]
+    fn comparison_reads_keep_partial_fill_cancel_in_flight_reservations_and_pending_events() {
+        let limits = Limits {
+            initial_collateral_usd: "1000".into(),
+            max_imbalance_shares: "10".into(),
+            lot_shares: "5".into(),
+            half_width: "0.01".into(),
+            max_feed_age_ms: 1000,
+        };
+        let mut paper = simulation::new_with_latency(
+            &limits,
+            LatencyConfig {
+                post_ms: 50,
+                cancel_ms: 50,
+                ack_ms: 50,
+                fill_ms: 50,
+                timeout_ms: 1000,
+            },
+        )
+        .unwrap();
+        let ops = [
+            Operation::Market {
+                condition_id: format!("0x{}", "a".repeat(64)),
+                start_ms: Some(10000),
+                end_ms: Some(310000),
+            },
+            Operation::Book {
+                now_ms: 0,
+                outcome: "up".into(),
+                bid: 490000,
+                ask: 510000,
+                ahead_micros: 0,
+            },
+            Operation::Quotes {
+                now_ms: 0,
+                quotes: vec![simulation::Quote {
+                    slot: "up".into(),
+                    outcome: "up".into(),
+                    price_micros: 490000,
+                    quantity_micros: 5_000_000,
+                }],
+            },
+            Operation::Advance { now_ms: 100 },
+            Operation::Trade {
+                now_ms: 101,
+                outcome: "up".into(),
+                worst_price_micros: 490000,
+                quantity_micros: 2_000_000,
+            },
+            Operation::Advance { now_ms: 200 },
+            Operation::CancelAll { now_ms: 201 },
+        ];
+        for op in ops {
+            simulation::apply(&mut paper, &op).unwrap();
+        }
+        assert!(paper.snapshot().pending_events > 0);
+        assert!(paper.snapshot().account.reserved_micros_ceil > 0);
+        let portfolio_reserved = paper.portfolio_snapshot().reserved_pico;
+        assert_eq!(
+            paper.portfolio_snapshot().positions[0].execution_up_micros,
+            2_000_000
+        );
+        let run = Run {
+            candidate: Candidate {
+                name: "controlled".into(),
+                rules: Default::default(),
+                policy: None,
+            },
+            latency: 50,
+            paper,
+            current: Some("controlled".into()),
+            guard: ReferenceGuard::default(),
+            inventory_since: None,
+            gates: BTreeMap::new(),
+            errors: Vec::new(),
+            orders_rejected: 0,
+            fill_events: 1,
+            partial_fill_events: 1,
+            max_daily_gross_loss: 0,
+            max_drawdown: 0,
+            error_times: Vec::new(),
+            now_wall: 10201,
+            skipped_delayed_prints: 0,
+        };
+        let before = serde_json::to_value(&run.paper).unwrap();
+        let mut checkpoints =
+            ComparisonCheckpoints::parse(br#"{"schema":1,"wall_ms":[10202,10203]}"#).unwrap();
+        checkpoints.before_step(
+            10201,
+            201,
+            "raw_record",
+            std::slice::from_ref(&run),
+            &BTreeMap::new(),
+        );
+        checkpoints.before_step(
+            10203,
+            203,
+            "scheduled_tick",
+            std::slice::from_ref(&run),
+            &BTreeMap::new(),
+        );
+        assert_eq!(serde_json::to_value(&run.paper).unwrap(), before);
+        for checkpoint in &checkpoints.captured {
+            let ledger = &checkpoint["ledgers"][0];
+            assert!(ledger["pending_execution_events"].as_u64().unwrap() > 0);
+            assert_eq!(ledger["portfolio"]["reserved_pico"], portfolio_reserved);
+            assert!(
+                ledger["execution_snapshot"]["account"]["reserved_micros_ceil"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                ledger["execution_snapshot"],
+                serde_json::to_value(run.paper.snapshot()).unwrap()
+            );
+            assert_eq!(
+                ledger["portfolio"]["positions"][0]["execution_up_micros"],
+                2_000_000
+            );
+        }
+    }
     fn quality_snapshot(
         condition: &str,
         outcome: domain::Outcome,
@@ -2057,6 +2336,35 @@ mod tests {
         }
         let plan_bytes = serde_json::to_vec(&raw).unwrap();
         let report = evaluate(&path, &plan_bytes).unwrap();
+        let requests =
+            serde_json::to_vec(&json!({"schema":1,"wall_ms":[origin+5001,origin+15001]})).unwrap();
+        let mut checkpoint_report =
+            evaluate_options(&path, &plan_bytes, false, Some(&requests)).unwrap();
+        let samples = &checkpoint_report["comparison_checkpoints"]["snapshots"];
+        assert_eq!(samples.as_array().unwrap().len(), 2);
+        for (index, boundary) in [origin + 5001, origin + 15001].into_iter().enumerate() {
+            let sample = &samples[index];
+            assert_eq!(sample["requested_wall_ms"], boundary);
+            assert_eq!(sample["next_timeline_step"]["wall_ms"], boundary);
+            assert_eq!(sample["next_timeline_step"]["kind"], "raw_record");
+            assert_eq!(sample["ledgers"].as_array().unwrap().len(), 4);
+            assert_eq!(sample["mark_valuation"], "UNKNOWN_NOT_COMPUTED");
+            for row in sample["ledgers"].as_array().unwrap() {
+                assert_eq!(row["portfolio"]["initial_cash_pico"], "1000000000000000");
+                assert!(row.get("pending_execution_events").is_some());
+                assert!(row["portfolio"].get("reservations").is_some());
+                assert!(row["portfolio"].get("positions").is_some());
+            }
+        }
+        checkpoint_report
+            .as_object_mut()
+            .unwrap()
+            .remove("comparison_checkpoints");
+        assert_eq!(
+            serde_json::to_vec(&checkpoint_report).unwrap(),
+            serde_json::to_vec(&report).unwrap(),
+            "optional checkpoint reads must preserve all other report bytes and every financial/execution result"
+        );
         let mut diagnostic_report = evaluate_mode(&path, &plan_bytes, true).unwrap();
         assert_eq!(
             diagnostic_report["ingress_diagnostics"]["mode"],

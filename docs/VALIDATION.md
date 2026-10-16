@@ -1,5 +1,26 @@
 # Validation evidence
 
+## October 16, 2026 - prospective capture profile and comparison boundaries
+
+Formatting, all-target Clippy, **390 workspace tests and four local-proof
+tests** pass with zero ignored tests in `research-validation-2.log` under
+`output/r19-flow-valid-20261016`. The first attempt failed a new checkpoint test
+that incorrectly treated portfolio reservations as active emulator reservations.
+The corrected test checks the active account's retained reservation and the
+unchanged portfolio separately; it also compares the entire serialized paper
+state before and after observation.
+
+Three capture regressions check explicit/default CLI identity, exact 60-second
+prewarm and actual duplex subscription wire with `initial_dump:false`, followed
+by unchanged native frame retention. Two checkpoint regressions check bounded
+requests and partial fills/cancel-in-flight reservations. The existing full tape
+fixture also proves that optional boundary reads leave all other report bytes
+and execution/financial values unchanged.
+
+These are controlled source tests. The capture profile remains an unproved
+prospective input hypothesis; remote 1013 prevention, fresh economic quality,
+same-period public-wallet accounting and stable income require separate receipts.
+
 ## October 16, 2026 - finite local input recovery proof
 
 Formatting and all-target Clippy pass. **385 workspace tests and four local-proof

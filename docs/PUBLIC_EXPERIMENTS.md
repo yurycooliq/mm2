@@ -1,5 +1,18 @@
 # Public input experiments
 
+Optional comparison observations use `experiment_replay TAPE PLAN NEW_REPORT
+--comparison-checkpoints REQUEST.json`. The bounded request is exactly
+`{"schema":1,"wall_ms":[v0,v1]}` with two sorted times strictly inside the tape.
+Each read occurs before the first existing replay operation at or after its
+boundary. It adds no emulator advance, order, cancellation, reset or settlement.
+The separate `comparison_checkpoints` object retains portfolio state and the
+complete bounded active execution snapshot, including pending effects and
+reservations. No NAV or atomic public-chain cutoff is inferred. Public snapshot
+valuation labels and events within two seconds of either boundary require an
+explicit accounting uncertainty check; observation granularity is reported.
+The source and public snapshot sampling rule must be frozen before capture;
+actual external valuation times cannot be chosen using strategy PnL.
+
 The public-paper experiment loop evaluates several complete policies on one
 recorded input stream. It does not wait for a new day after each code edit and
 does not reconstruct a new strategy by deleting losing fills from an old ledger.
@@ -18,6 +31,30 @@ the next market is prewarmed. Original receive order, exchange timestamps,
 wall/monotonic receipt clocks, reconnect gaps and input hashes remain explicit.
 The collector has finite duration, frame, line, market and byte limits. A valid
 hash chain proves retained-file integrity, not complete delivery by the venue.
+
+The optional capture profile is explicit:
+
+```text
+experiment_capture NEW_TAPE.jsonl 2100 4294967296 4000000 --capture-profile=no-initial-dump-v1
+```
+
+`no-initial-dump-v1` sends the documented `initial_dump:false` subscription and
+prewarms the next market sixty seconds before opening. Its chained header source
+is `native_public_ws_capture_no_initial_dump_v1`; launch and terminal stdout also
+identify the profile. Unknown or repeated profile arguments fail before capture.
+The five-argument default retains its original subscription, header source and
+twenty-second prewarm. No tape schema or replay quality rule changes.
+
+The [official WebSocket schema](https://docs.polymarket.com/asyncapi.json) defines
+the initial-dump option separately from full books published after trades. This
+profile tests whether avoiding the subscription dump prevents the observed
+initial-snapshot/older-delta conflict. Every subsequent received native frame,
+including full books, keeps its original order, text and source generation. No
+book is fabricated, no delta is used as initialization and no fault is forgiven.
+Both actual valid native books and all existing freshness/open-window checks
+remain necessary. A quiet market can lack the required books and stay ineligible.
+The profile has not established the cause of remote 1013 closes or eliminated
+them; all close/gap evidence and finite retry bounds remain in effect.
 
 Collector failure records distinguish fixed transport/capacity/close categories,
 numeric close codes, generation, session age and processing/heartbeat delays.

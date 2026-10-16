@@ -23,6 +23,66 @@ use tokio_tungstenite::{
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STABLE_SESSION: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureProfile {
+    Default,
+    NoInitialDumpV1,
+}
+impl CaptureProfile {
+    fn parse(arguments: &[String]) -> Result<Self, &'static str> {
+        match arguments.len() {
+            5 => Ok(Self::Default),
+            6 if arguments[5] == "--capture-profile=no-initial-dump-v1" => {
+                Ok(Self::NoInitialDumpV1)
+            }
+            _ => Err(
+                "usage: experiment_capture NEW_TAPE.jsonl SECONDS MAX_BYTES MAX_FRAMES [--capture-profile=no-initial-dump-v1]",
+            ),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::NoInitialDumpV1 => "no-initial-dump-v1",
+        }
+    }
+    fn source(self) -> &'static str {
+        match self {
+            Self::Default => "native_public_ws_capture",
+            Self::NoInitialDumpV1 => "native_public_ws_capture_no_initial_dump_v1",
+        }
+    }
+    fn prewarm_ms(self) -> u64 {
+        match self {
+            Self::Default => 20_000,
+            Self::NoInitialDumpV1 => 60_000,
+        }
+    }
+    fn subscription(self, market: &Market) -> Value {
+        let mut request = json!({"assets_ids":[market.up_token,market.down_token],"type":"market","custom_feature_enabled":true});
+        if self == Self::NoInitialDumpV1 {
+            // The documented initial dump is independent of subsequent full
+            // books. Preserve every received frame and let strict native
+            // recovery decide whether real books ever initialize the market.
+            request["initial_dump"] = json!(false);
+        }
+        request
+    }
+    fn wanted_starts(self, now: u64) -> Vec<u64> {
+        let current = now / 300_000 * 300_000;
+        let mut wanted = vec![current];
+        if 300_000 - now % 300_000 <= self.prewarm_ms()
+            && let Some(next) = current.checked_add(300_000)
+        {
+            wanted.push(next);
+        }
+        wanted
+    }
+    fn proof(self) -> Value {
+        json!({"capture_profile":self.name(),"source":self.source(),"clob_initial_dump":self == Self::Default,"prewarm_ms":self.prewarm_ms()})
+    }
+}
+
 #[derive(Default)]
 struct RetryBackoff {
     retry_later_streak: u8,
@@ -272,7 +332,7 @@ fn socket_deadline(c: &Shared, until_wall_ms: u64) -> tokio::time::Instant {
         .min(Duration::from_millis(until_wall_ms.saturating_sub(wall())));
     (tokio::time::Instant::now() + remaining).min(tokio::time::Instant::from_std(capture_deadline))
 }
-async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
+async fn socket(c: Shared, market: Option<Market>, profile: CaptureProfile) -> Result<(), String> {
     let feed = if market.is_some() { "clob" } else { "binance" };
     let slug = market.as_ref().map(|m| m.slug.clone());
     let mut generation = 0;
@@ -314,7 +374,7 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
                     return Ok(());
                 }
                 if let Some(m) = &market {
-                    let subscription = json!({"assets_ids":[m.up_token,m.down_token],"type":"market","custom_feature_enabled":true});
+                    let subscription = profile.subscription(m);
                     if let Err(class) =
                         write_bounded(ws.send(Message::Text(subscription.to_string().into()))).await
                     {
@@ -446,9 +506,7 @@ async fn fees(c: Shared, client: reqwest::Client, market: Market) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     mm2_engine::tls::initialize()?;
     let a: Vec<_> = std::env::args().collect();
-    if a.len() != 5 {
-        return Err("usage: experiment_capture NEW_TAPE.jsonl SECONDS MAX_BYTES MAX_FRAMES".into());
-    }
+    let profile = CaptureProfile::parse(&a)?;
     let seconds: u64 = a[2].parse()?;
     let max_bytes: u64 = a[3].parse()?;
     let max_frames: u64 = a[4].parse()?;
@@ -465,7 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         0,
         tape::Input::Header {
             schema: 1,
-            source: "native_public_ws_capture".into(),
+            source: profile.source().into(),
             started_wall_ms: wall(),
             max_bytes,
             max_frames,
@@ -483,7 +541,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     let client = discovery::client()?;
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(socket(c.clone(), None));
+    if profile != CaptureProfile::Default {
+        println!(
+            "{}",
+            json!({"event":"capture_profile_selected","profile":profile.proof(),"network":"public_read_only","orders_submitted":0})
+        );
+    }
+    tasks.spawn(socket(c.clone(), None, profile));
     let mut markets = BTreeMap::<u64, Market>::new();
     let mut resolved = BTreeSet::new();
     let mut last_outcome = Instant::now() - Duration::from_secs(31);
@@ -492,12 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         let now = wall();
-        let current = now / 300000 * 300000;
-        let mut wanted = vec![current];
-        if current + 300000 - now <= 20000 {
-            wanted.push(current + 300000);
-        }
-        for start_ms in wanted {
+        for start_ms in profile.wanted_starts(now) {
             if markets.contains_key(&start_ms) {
                 continue;
             }
@@ -521,7 +580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     );
                     markets.insert(start_ms, m.clone());
-                    tasks.spawn(socket(c.clone(), Some(m.clone())));
+                    tasks.spawn(socket(c.clone(), Some(m.clone()), profile));
                     let cc = c.clone();
                     let http = client.clone();
                     tasks.spawn(async move {
@@ -594,10 +653,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         true,
     )?;
     c.writer.finish()?;
-    println!(
-        "{}",
-        json!({"tape":a[1],"frames":frames,"gaps":gaps,"stop_reason":reason,"network":"public_read_only","orders_submitted":0,"capture_completeness":"unproven_no_clob_sequence","score":"requires_replay_quality_and_final_outcomes"})
-    );
+    let mut result = json!({"tape":a[1],"frames":frames,"gaps":gaps,"stop_reason":reason,"network":"public_read_only","orders_submitted":0,"capture_completeness":"unproven_no_clob_sequence","score":"requires_replay_quality_and_final_outcomes"});
+    if profile != CaptureProfile::Default {
+        result["profile"] = profile.proof();
+    }
+    println!("{result}");
     Ok(())
 }
 
@@ -606,6 +666,161 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+    fn profile_market() -> Market {
+        Market {
+            slug: "controlled_profile".into(),
+            condition_id: "condition".into(),
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: 300_000,
+            window_end_ms: 600_000,
+            tick_micro: 10_000,
+        }
+    }
+
+    #[test]
+    fn capture_profile_cli_is_explicit_unique_and_keeps_default_wire_and_source() {
+        let base = ["capture", "new.jsonl", "35", "65536", "1000"];
+        let mut arguments: Vec<_> = base.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            CaptureProfile::parse(&arguments),
+            Ok(CaptureProfile::Default)
+        );
+        assert_eq!(
+            CaptureProfile::Default.subscription(&profile_market()),
+            json!({"assets_ids":["1","2"],"type":"market","custom_feature_enabled":true})
+        );
+        assert_eq!(CaptureProfile::Default.source(), "native_public_ws_capture");
+        arguments.push("--capture-profile=no-initial-dump-v1".into());
+        let profile = CaptureProfile::parse(&arguments).unwrap();
+        assert_eq!(profile, CaptureProfile::NoInitialDumpV1);
+        assert_eq!(
+            profile.proof(),
+            json!({"capture_profile":"no-initial-dump-v1","source":"native_public_ws_capture_no_initial_dump_v1","clob_initial_dump":false,"prewarm_ms":60_000})
+        );
+        arguments.push("--capture-profile=no-initial-dump-v1".into());
+        assert!(CaptureProfile::parse(&arguments).is_err());
+        arguments.pop();
+        for unknown in [
+            "--capture-profile=unknown",
+            "--capture-profile=default",
+            "--no-initial-dump",
+            "--capture-profile=no-initial-dump-v1=extra",
+        ] {
+            arguments[5] = unknown.into();
+            assert!(CaptureProfile::parse(&arguments).is_err());
+        }
+        assert!(CaptureProfile::parse(&arguments[..4]).is_err());
+    }
+
+    #[test]
+    fn opt_in_prewarm_opens_only_current_and_next_at_exact_sixty_second_boundary() {
+        let profile = CaptureProfile::NoInitialDumpV1;
+        assert_eq!(profile.wanted_starts(239_999), vec![0]);
+        assert_eq!(profile.wanted_starts(240_000), vec![0, 300_000]);
+        assert_eq!(profile.wanted_starts(299_999), vec![0, 300_000]);
+        assert_eq!(profile.wanted_starts(300_000), vec![300_000]);
+        assert_eq!(CaptureProfile::Default.wanted_starts(279_999), vec![0]);
+        assert_eq!(
+            CaptureProfile::Default.wanted_starts(280_000),
+            vec![0, 300_000]
+        );
+        assert_eq!(profile.wanted_starts(u64::MAX).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn opt_in_subscription_wire_disables_only_initial_dump_and_preserves_later_books() {
+        let market = profile_market();
+        let subscription = CaptureProfile::NoInitialDumpV1.subscription(&market);
+        let (client_io, peer_io) = tokio::io::duplex(16_384);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer_io, Role::Server, None).await;
+        let native_frames = [
+            json!({"event_type":"price_change","market":"condition","timestamp":"300001","price_changes":[{"asset_id":"1","side":"BUY","price":"0.4","size":"5"}]}).to_string(),
+            json!({"event_type":"book","market":"condition","asset_id":"1","timestamp":"300002","bids":[{"price":"0.4","size":"5"}],"asks":[{"price":"0.6","size":"5"}]}).to_string(),
+            json!({"event_type":"book","market":"condition","asset_id":"2","timestamp":"300003","bids":[{"price":"0.4","size":"7"}],"asks":[{"price":"0.6","size":"7"}]}).to_string(),
+        ];
+        let (dir, capture) = retry_capture();
+        let capture_side = async {
+            write_bounded(client.send(Message::Text(subscription.to_string().into())))
+                .await
+                .unwrap();
+            for expected in &native_frames {
+                let Message::Text(text) = client.next().await.unwrap().unwrap() else {
+                    panic!("native public text expected");
+                };
+                assert_eq!(text.as_str(), expected);
+                assert!(emit_frame(
+                    &capture,
+                    tape::Input::Frame {
+                        feed: "clob".into(),
+                        market_slug: Some(market.slug.clone()),
+                        generation: 7,
+                        text: text.to_string(),
+                    },
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ));
+            }
+        };
+        let public_peer = async {
+            let Message::Text(text) = peer.next().await.unwrap().unwrap() else {
+                panic!("subscription text expected");
+            };
+            let request: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                request,
+                json!({"assets_ids":["1","2"],"type":"market","custom_feature_enabled":true,"initial_dump":false})
+            );
+            for text in &native_frames {
+                peer.send(Message::Text(text.clone().into())).await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(capture_side, public_peer);
+        })
+        .await
+        .unwrap();
+        {
+            let mut state = capture.lock().unwrap();
+            assert_eq!(state.frames, 3);
+            assert_eq!(state.gaps, 0);
+            let elapsed = millis(state.start.elapsed());
+            state
+                .writer
+                .append(
+                    wall(),
+                    elapsed,
+                    tape::Input::End {
+                        reason: "controlled".into(),
+                        frames: 3,
+                        gaps: 0,
+                        complete: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            state.writer.finish().unwrap();
+        }
+        let mut retained = Vec::new();
+        tape::visit(&dir.path().join("retry.jsonl"), 65_536, |record| {
+            if let tape::Input::Frame {
+                feed,
+                market_slug,
+                generation,
+                text,
+            } = record.input
+            {
+                assert_eq!(feed, "clob");
+                assert_eq!(market_slug.as_deref(), Some(market.slug.as_str()));
+                assert_eq!(generation, 7);
+                retained.push(text);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retained, native_frames);
+    }
 
     fn retry_capture() -> (tempfile::TempDir, Shared) {
         let dir = tempfile::tempdir().unwrap();
