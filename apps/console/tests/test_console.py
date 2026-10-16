@@ -153,6 +153,22 @@ class ConsoleTests(unittest.TestCase):
         self.assertFalse(state["connected"]); self.assertIsNotNone(state["state"])
         self.assertIn("last successful", state["error"])
 
+    def test_comparison_requires_owner_and_reads_never_send_commands_or_poll_engine(self):
+        self.assertEqual(self.request("GET", "/api/comparison")[0], 401)
+        cookie = self.login()
+        self.app.sample_once()
+        before = list(self.engine.calls)
+        for period in ("1h", "6h", "24h", "all"):
+            status, _, value = self.request("GET", "/api/comparison?period=" + period, cookie=cookie)
+            self.assertEqual(status, 200)
+            self.assertEqual(value["requested_period"], period)
+            self.assertEqual(value["reference"]["status"], "UNAVAILABLE")
+        self.assertEqual(self.engine.calls, before)
+        self.assertEqual(self.request("GET", "/api/comparison?period=7d", cookie=cookie)[0], 400)
+        self.assertEqual(self.request("GET", "/api/comparison?period=1h&period=24h", cookie=cookie)[0], 400)
+        self.assertEqual(self.request("POST", "/api/comparison", {}, cookie)[0], 404)
+        self.assertEqual(self.engine.calls, before)
+
     def test_sampler_start_is_single_and_reports_bounded_persistence(self):
         self.app.start(); first = self.app._sampler; self.app.start()
         self.assertIs(first, self.app._sampler)

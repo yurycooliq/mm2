@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import secrets
 from urllib.parse import urlsplit
 
@@ -18,6 +19,16 @@ def origin(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc.lower()}"
 
 
+def telegram_allowed_ids(value: str) -> frozenset[int]:
+    if not value:
+        return frozenset()
+    fields = value.split(",")
+    if len(value) > 272 or len(fields) > 16 or any(
+            not re.fullmatch(r"[1-9][0-9]{0,15}", item) or int(item) >= 2**52 for item in fields):
+        raise ValueError("Telegram additional access requires at most 16 positive integer user IDs")
+    return frozenset(map(int, fields))
+
+
 @dataclass(frozen=True)
 class Config:
     engine_url: str
@@ -31,6 +42,14 @@ class Config:
     telegram_token: str = field(default="", repr=False)
     telegram_owner: int | None = None
     miniapp_url: str = ""
+    telegram_only: bool = False
+    trusted_proxy_header: bool = False
+    research_view_dir: Path | None = None
+    telegram_allowed_ids: frozenset[int] = frozenset()
+
+    @property
+    def telegram_users(self):
+        return self.telegram_allowed_ids | (frozenset({self.telegram_owner}) if self.telegram_owner else frozenset())
 
     @classmethod
     def from_env(cls):
@@ -64,6 +83,15 @@ class Config:
         telegram_owner = int(owner_id) if owner_id else None
         if telegram_owner is not None and not 0 < telegram_owner < 2**52:
             raise ValueError("invalid Telegram owner ID")
+        additional_ids = telegram_allowed_ids(os.environ.get("MM2_TELEGRAM_ALLOWED_IDS", ""))
+        if additional_ids and telegram_owner is None:
+            raise ValueError("Telegram additional access requires a configured bot and owner")
+        telegram_policy = os.environ.get("MM2_TELEGRAM_ONLY", "false")
+        if telegram_policy not in {"true", "false"}:
+            raise ValueError("MM2_TELEGRAM_ONLY must be true or false")
+        proxy_policy = os.environ.get("MM2_TRUSTED_PROXY_HEADER", "false")
+        if proxy_policy not in {"true", "false"}:
+            raise ValueError("MM2_TRUSTED_PROXY_HEADER must be true or false")
         miniapp = os.environ.get("MM2_MINIAPP_URL", "")
         if miniapp:
             parsed = urlsplit(miniapp)
@@ -74,7 +102,10 @@ class Config:
         return cls(engine, engine_token, owner, state,
                    Path(os.environ.get("MM2_CONSOLE_STATIC_DIR", "/app/dashboard")), allowed,
                    os.environ.get("MM2_CONSOLE_HOST", "0.0.0.0"), int(os.environ.get("MM2_CONSOLE_PORT", "8080")),
-                   token, telegram_owner, miniapp)
+                   token, telegram_owner, miniapp, bool(token and telegram_owner) or telegram_policy == "true",
+                   proxy_policy == "true",
+                   Path(os.environ["MM2_CONSOLE_RESEARCH_VIEW_DIR"]) if os.environ.get("MM2_CONSOLE_RESEARCH_VIEW_DIR") else None,
+                   additional_ids)
 
     @property
     def secret_values(self):

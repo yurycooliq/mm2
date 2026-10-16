@@ -1,4 +1,4 @@
-use mm2_engine::{api::Api, auth::Auth, config::Config, runtime, sources};
+use mm2_engine::{api::Api, auth::Auth, config::Config, runtime, sources, tls};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -11,6 +11,10 @@ fn main() {
         .with_target(false)
         .with_max_level(tracing::Level::INFO)
         .init();
+    if let Err(error) = tls::initialize() {
+        tracing::error!(error_class=%error,"engine stopped");
+        std::process::exit(1);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -114,31 +118,27 @@ async fn run() -> Result<(), String> {
         .await?;
         actor.attach_live(live);
     }
+    let resolution_task = if config.feed_source == mm2_engine::config::FeedSource::Public {
+        handle.simulation_handle().map(|paper| {
+            tokio::spawn(mm2_engine::paper_resolution::run(
+                paper,
+                shutdown_rx.clone(),
+            ))
+        })
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|_| "cannot bind HTTP listener")?;
     let mut actor_task = tokio::spawn(actor.run());
-    let mut relay_shutdown = shutdown_rx.clone();
-    let mut relay_task = tokio::spawn(async move {
-        let mut input = source_feed_rx;
-        loop {
-            tokio::select! {
-                biased;
-                _=relay_shutdown.changed()=>break,
-                event=input.recv()=>match event {
-                    Some(event)=>{
-                        // Only the primary execution lane can backpressure the source.
-                        if let Some((sender,fault))=&paper_feed
-                            && sender.try_send(event.clone()).is_err() {
-                                fault.send_replace(Some("parallel simulation lost a feed event; rebuild its source state".into()));
-                        }
-                        if feed_tx.send(event).await.is_err() { break; }
-                    },
-                    None=>break,
-                }
-            }
-        }
-    });
+    let mut relay_task = tokio::spawn(mm2_engine::feeds::relay(
+        source_feed_rx,
+        feed_tx,
+        paper_feed,
+        shutdown_rx.clone(),
+        fault_tx.clone(),
+    ));
     let source_handle = handle.clone();
     let source_fault = fault_tx.clone();
     let source_shutdown = shutdown_rx.clone();
@@ -152,9 +152,7 @@ async fn run() -> Result<(), String> {
             source_shutdown.clone(),
         )
         .await;
-        if result.is_err() && !*source_shutdown.borrow() {
-            source_fault.send_replace(Some("public/demo source owner stopped".into()));
-        }
+        record_source_exit(&source_fault, &result, *source_shutdown.borrow());
         result
     });
     let mut server_shutdown = shutdown_rx.clone();
@@ -173,11 +171,13 @@ async fn run() -> Result<(), String> {
     let mut actor_done = false;
     let mut source_done = false;
     let mut server_done = false;
+    let mut relay_done = false;
     let result: Result<(), String> = tokio::select! {
         _ = signal() => Ok(()),
         _ = &mut actor_task => { actor_done=true; Err("core actor stopped unexpectedly".into()) },
         result = &mut source_task => { source_done=true; match result { Ok(Ok(())) => Err("source owner stopped unexpectedly".into()),Ok(Err(reason)) => Err(reason.chars().take(256).collect()),Err(_) => Err("source owner task failed".into()) } },
         _ = &mut server_task => { server_done=true; Err("HTTP server stopped unexpectedly".into()) },
+        result = &mut relay_task => { relay_done=true; Err(relay_exit_reason(result)) },
     };
     shutdown_tx.send_replace(true);
     // The outer deadline also bounds a stalled disk worker; process exit releases its OS fence.
@@ -191,9 +191,14 @@ async fn run() -> Result<(), String> {
         if !server_done {
             let _ = (&mut server_task).await;
         }
-        let _ = (&mut relay_task).await;
+        if !relay_done {
+            let _ = (&mut relay_task).await;
+        }
         if let Some(paper) = &mut paper_task {
             let _ = paper.await;
+        }
+        if let Some(resolution) = resolution_task {
+            let _ = resolution.await;
         }
     })
     .await;
@@ -210,6 +215,35 @@ async fn run() -> Result<(), String> {
     tracing::info!("mm2 engine stopped; acknowledged actions are durable");
     result
 }
+
+fn relay_exit_reason(result: Result<Result<(), String>, tokio::task::JoinError>) -> String {
+    match result {
+        Ok(Err(reason)) => format!(
+            "feed relay failed: {}",
+            mm2_engine::feeds::input_failure_detail(&reason)
+        ),
+        Ok(Ok(())) => "feed relay stopped unexpectedly".into(),
+        Err(error) if error.is_panic() => "feed relay task panicked".into(),
+        Err(_) => "feed relay task cancelled".into(),
+    }
+}
+fn record_source_exit(
+    fault: &watch::Sender<Option<String>>,
+    result: &Result<(), String>,
+    stopping: bool,
+) {
+    if result.is_err() && !stopping {
+        fault.send_if_modified(|first| {
+            if first.is_some() {
+                false
+            } else {
+                *first = Some("public/demo source owner stopped".into());
+                true
+            }
+        });
+    }
+}
+
 async fn signal() {
     #[cfg(unix)]
     {
@@ -221,4 +255,63 @@ async fn signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod source_exit_tests {
+    use super::*;
+
+    #[test]
+    fn relay_exit_reports_fixed_parser_cause_without_echoing_rejected_content() {
+        assert_eq!(
+            relay_exit_reason(Ok(Err("invalid decimal length".into()))),
+            "feed relay failed: invalid_decimal"
+        );
+        assert_eq!(
+            relay_exit_reason(Ok(Err(
+                "private response https://example.invalid/secret".into()
+            ))),
+            "feed relay failed: unclassified_feed_failure"
+        );
+        assert_eq!(
+            relay_exit_reason(Ok(Ok(()))),
+            "feed relay stopped unexpectedly"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_exit_distinguishes_task_panic_and_cancellation() {
+        let panic = tokio::spawn(async { panic!("test relay failure") })
+            .await
+            .unwrap_err();
+        assert_eq!(relay_exit_reason(Err(panic)), "feed relay task panicked");
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        assert_eq!(
+            relay_exit_reason(Err(task.await.unwrap_err())),
+            "feed relay task cancelled"
+        );
+    }
+
+    #[test]
+    fn source_exit_preserves_first_fault_instead_of_replacing_it_with_generic_owner_stop() {
+        let (fault, observed) = watch::channel(Some("feed queue overflow".to_owned()));
+        record_source_exit(&fault, &Err("feed queue overflow".into()), false);
+        assert_eq!(observed.borrow().as_deref(), Some("feed queue overflow"));
+    }
+
+    #[test]
+    fn source_exit_fallback_only_applies_to_unexpected_unclassified_failure() {
+        for (result, stopping) in [(Ok(()), false), (Err("shutdown".into()), true)] {
+            let (fault, observed) = watch::channel(None);
+            record_source_exit(&fault, &result, stopping);
+            assert!(observed.borrow().is_none());
+        }
+        let (fault, observed) = watch::channel(None);
+        record_source_exit(&fault, &Err("source task failed".into()), false);
+        assert_eq!(
+            observed.borrow().as_deref(),
+            Some("public/demo source owner stopped")
+        );
+    }
 }

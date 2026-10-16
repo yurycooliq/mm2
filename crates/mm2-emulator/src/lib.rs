@@ -200,6 +200,12 @@ pub struct PaperSession {
     fault: Option<String>,
 }
 impl PaperSession {
+    pub fn defer_automatic_posts(&mut self) {
+        self.core.defer_automatic_posts();
+    }
+    pub fn automatic_posts_deferred(&self) -> bool {
+        self.core.automatic_posts_deferred()
+    }
     pub fn new(limits: RiskLimits, latency: LatencyConfig) -> Result<Self> {
         latency.validate()?;
         Ok(Self {
@@ -264,12 +270,30 @@ impl PaperSession {
         Ok(())
     }
     pub fn set_book(&mut self, now_ms: u64, outcome: Outcome, book: Book) -> Result<()> {
+        self.set_book_inner(now_ms, outcome, book, false)
+    }
+    /// Public depth reductions do not prove which cancellations were ahead of us.
+    pub fn set_book_conservative(
+        &mut self,
+        now_ms: u64,
+        outcome: Outcome,
+        book: Book,
+    ) -> Result<()> {
+        self.set_book_inner(now_ms, outcome, book, true)
+    }
+    fn set_book_inner(
+        &mut self,
+        now_ms: u64,
+        outcome: Outcome,
+        book: Book,
+        conservative: bool,
+    ) -> Result<()> {
         book.validate()?;
         self.advance(now_ms)?;
         for order in self
             .venue
             .values_mut()
-            .filter(|o| !o.terminal && o.quote.outcome == outcome)
+            .filter(|o| !conservative && !o.terminal && o.quote.outcome == outcome)
         {
             order.external_queue_ahead_micros = order
                 .external_queue_ahead_micros
@@ -320,6 +344,39 @@ impl PaperSession {
         worst_price_micros: u64,
         quantity_micros: u64,
     ) -> Result<TradeResult> {
+        self.trade_inner(now_ms, outcome, worst_price_micros, quantity_micros, false)
+    }
+    /// A public print witnesses volume at one price, not a whole taker sweep.
+    pub fn trade_at_price(
+        &mut self,
+        now_ms: u64,
+        outcome: Outcome,
+        price_micros: u64,
+        quantity_micros: u64,
+    ) -> Result<TradeResult> {
+        // Closing public prints can be at 0/1. No legal passive order can match
+        // either boundary, so retain the witness without inventing a fill or fault.
+        if price_micros == 0 || price_micros == SCALE {
+            if quantity_micros == 0 || quantity_micros > 1_000_000_000 * SCALE {
+                return Err("invalid simulated taker trade".into());
+            }
+            self.advance(now_ms)?;
+            return Ok(TradeResult {
+                input_quantity_micros: quantity_micros,
+                unconsumed_micros: quantity_micros,
+                ..TradeResult::default()
+            });
+        }
+        self.trade_inner(now_ms, outcome, price_micros, quantity_micros, true)
+    }
+    fn trade_inner(
+        &mut self,
+        now_ms: u64,
+        outcome: Outcome,
+        worst_price_micros: u64,
+        quantity_micros: u64,
+        exact_price: bool,
+    ) -> Result<TradeResult> {
         if worst_price_micros == 0
             || worst_price_micros >= SCALE
             || quantity_micros == 0
@@ -334,7 +391,13 @@ impl PaperSession {
             .map(|b| {
                 b.bid_levels
                     .iter()
-                    .filter(|l| l.price_micros >= worst_price_micros)
+                    .filter(|l| {
+                        if exact_price {
+                            l.price_micros == worst_price_micros
+                        } else {
+                            l.price_micros >= worst_price_micros
+                        }
+                    })
                     .map(|l| l.price_micros)
                     .collect()
             })
@@ -345,7 +408,11 @@ impl PaperSession {
                 .filter(|o| {
                     !o.terminal
                         && o.quote.outcome == outcome
-                        && o.quote.price_micros >= worst_price_micros
+                        && if exact_price {
+                            o.quote.price_micros == worst_price_micros
+                        } else {
+                            o.quote.price_micros >= worst_price_micros
+                        }
                 })
                 .map(|o| o.quote.price_micros),
         );

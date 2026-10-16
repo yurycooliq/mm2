@@ -1,0 +1,28 @@
+[Unit]
+Description=mm2 trusted sanitized export; no primary state mutation
+After=mm2.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/mm2/current
+ExecStart=/opt/mm2-export-venv/bin/python -B scripts/research_export.py
+TimeoutStartSec=180
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=5%
+MemoryMax=192M
+MemorySwapMax=0
+LimitCORE=0
+TasksMax=24
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/mm2 /etc/mm2
+ReadWritePaths=/var/lib/mm2-export
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

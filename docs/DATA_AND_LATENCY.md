@@ -32,6 +32,50 @@ python -B tools/latency/clob-latency-probe.py --help
 
 Use identical token subscriptions and Binance symbols concurrently on candidate hosts. Record event hashes, dropped counts, reconnects and clock offset/error bounds. The comparator refuses numeric cross-host arrival differences without those bounds. Neither a cold HTTP request nor a public WebSocket proves authenticated post/cancel latency or account-specific capacity. Keep TLS verification enabled.
 
+The engine's Binance BTCUSDT trade stream supplies a latest spot-price diagnostic,
+not an execution tape or the governing TWAP60. It validates each message and keeps
+one pending reference per socket, publishing at a 50 ms interval without catch-up
+bursts. A full actor queue retains that slot until another attempt; newer prices
+replace the pending price. Original exchange and monotonic receive timestamps
+remain intact, so queue delay cannot make an old price fresh. CLOB books, trades
+and tick updates are never coalesced. The complete native frame is validated
+before admission, then streamed in FIFO chunks of at most 16 through the existing
+bounded queue. A valid frame may be larger than that queue. Admission waits for
+capacity until one absolute send deadline (5 seconds in the public profile),
+with shutdown priority. A permanent stall faults with `feed_backpressure_timeout`;
+a closed consumer remains a distinct fatal error. A timed-out frame can have an
+admitted prefix: its pending suffix is counted as discarded and the independent
+fault channel stops execution. Validation is atomic; queue admission is not.
+
+Each source exposes per-boot `ingress_frames`, `ingress_events`,
+`ingress_enqueued`, `ingress_waits`, `ingress_wait_ns`, `ingress_timeouts`,
+`ingress_pending_events`, `ingress_discarded_events`, `ingress_max_frame_events`
+and `ingress_queue_high_watermark`. `ingress_frames` includes recovery/Disconnect
+admission batches, rather than being a count of native socket frames alone.
+With no admission in progress, admitted plus discarded events account for the
+events offered to this boundary. Samples during admission are not atomic across
+counters, and admitted events are not proof of downstream processing or fills.
+
+The primary relay also has finite admission and observes fault/shutdown while
+blocked. Emulator intake groups up to 16 already queued inputs into one turn
+without waiting to fill a batch. New trade operations retain order in one journal
+transaction; one candidate copy and one sync precede its publication. Small
+journal segments reduce this limit. `metrics.execution_feed_batches`,
+`execution_trade_commits` and `execution_feed_batch_limit` expose this work.
+Stale/future-clock checks, receipt identity, finite capital and journal quotas
+still apply. See [queue review](QUEUE_BACKPRESSURE_REVIEW.md) for other queue
+policies and evidence limits.
+
+`feed_diagnostics.binance` exposes per-boot `reference_received`,
+`reference_coalesced`, `reference_delivered`, `reference_queue_full`,
+`reference_discarded`, `reference_pending` and `reference_publish_interval_ms`.
+Queue-full counts measure publication attempts, not missing trades. These
+independently sampled counters are diagnostics, not financial reconciliation.
+Ending a socket discards its pending reference; a recoverable Binance Disconnect
+waits for queue capacity only until the existing send deadline, preserving the
+order of already delivered prices. Closed consumers, invalid input and expired
+Disconnect admission remain fatal.
+
 After building the engine image, run `python -B scripts/smoke_public.py --seconds 35` for a bounded, credential-free public readiness check. It creates and removes only its labelled disposable container and state volume. On October 1, 2026 the current local Docker host passed API readiness but public IP eligibility metadata transport failed; shadow readiness was never reached. This result does not identify the transport failure's cause or measure latency on a future server.
 
 The core benchmark and `scripts/scenarios.py` provide offline timing and synthetic sensitivity. Scenario delays are assumptions, not measurements. The latter always reports scoring/live eligibility false and never computes a financial return.

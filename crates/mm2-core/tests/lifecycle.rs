@@ -18,6 +18,84 @@ fn posted(actions: Vec<Action>) -> Order {
     }
 }
 #[test]
+fn exact_outcome_costs_include_partial_and_cancel_race_fills_once() {
+    let mut core = Core::new(RiskLimits::default()).unwrap();
+    let order = posted(
+        core.quote(0, vec![q("up", Outcome::Up, 730_000, 5)])
+            .unwrap(),
+    );
+    let partial = Observation {
+        order_id: order.id,
+        cumulative_filled_micros: SCALE,
+        terminal: false,
+    };
+    core.observe(1, partial.clone()).unwrap();
+    core.observe(2, partial).unwrap();
+    core.cancel_all(3).unwrap();
+    core.observe(
+        4,
+        Observation {
+            order_id: order.id,
+            cumulative_filled_micros: 2 * SCALE,
+            terminal: true,
+        },
+    )
+    .unwrap();
+    let order = posted(
+        core.quote(5, vec![q("down", Outcome::Down, 210_000, 5)])
+            .unwrap(),
+    );
+    core.observe(
+        6,
+        Observation {
+            order_id: order.id,
+            cumulative_filled_micros: 5 * SCALE,
+            terminal: true,
+        },
+    )
+    .unwrap();
+    let account = core.snapshot().account;
+    assert_eq!(
+        account.outcome_spent_pico,
+        Some(["1460000000000".into(), "1050000000000".into()])
+    );
+    assert_eq!(account.spent_pico, "2510000000000");
+    core.validate().unwrap();
+    let restored: Core = serde_json::from_str(&serde_json::to_string(&core).unwrap()).unwrap();
+    assert_eq!(restored.snapshot(), core.snapshot());
+}
+
+#[test]
+fn legacy_checkpoint_side_costs_stay_unknown_and_corrupt_new_totals_are_rejected() {
+    let mut core = Core::new(RiskLimits::default()).unwrap();
+    let order = posted(
+        core.quote(0, vec![q("up", Outcome::Up, 400_000, 5)])
+            .unwrap(),
+    );
+    core.observe(
+        1,
+        Observation {
+            order_id: order.id,
+            cumulative_filled_micros: 5 * SCALE,
+            terminal: true,
+        },
+    )
+    .unwrap();
+    let mut value = serde_json::to_value(&core).unwrap();
+    value.as_object_mut().unwrap().remove("outcome_spent_pico");
+    let legacy: Core = serde_json::from_value(value.clone()).unwrap();
+    legacy.validate().unwrap();
+    assert_eq!(legacy.snapshot().account.spent_pico, "2000000000000");
+    assert_eq!(legacy.snapshot().account.outcome_spent_pico, None);
+    value["outcome_spent_pico"] = serde_json::json!([1, 0]);
+    assert!(
+        serde_json::from_value::<Core>(value)
+            .unwrap()
+            .validate()
+            .is_err()
+    );
+}
+#[test]
 fn cancelling_and_unknown_orders_keep_cash_and_directional_reservations() {
     let mut core = Core::new(RiskLimits::default()).unwrap();
     let o = posted(

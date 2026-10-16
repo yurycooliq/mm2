@@ -169,6 +169,10 @@ pub enum Gate {
     StaleSignal,
     InsufficientCapital,
     PairEdge,
+    OwnedCostUnknown,
+    InventoryDust,
+    InventoryCost,
+    LossBudget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,4 +420,61 @@ pub fn decide(rules: &Rules, input: &Input) -> Result<Decision> {
         center_micros: Some(center),
         half_width_micros: Some(width),
     })
+}
+
+/// Public paper policy. While inventory is unmatched, quote only its complement.
+/// Use immutable BUY fill costs, not the portfolio adapter's allocated side basis.
+/// Historical research `decide` and funded behavior remain separate contracts.
+pub fn decide_inventory_aware(
+    rules: &Rules,
+    input: &Input,
+    outcome_spent_pico: Option<[u128; 2]>,
+) -> Result<Decision> {
+    let mut decision = decide(rules, input)?;
+    if decision.reason != Gate::Quote {
+        return Ok(decision);
+    }
+    let quantities = [input.inventory_up_micros, input.inventory_down_micros];
+    let Some(costs) = outcome_spent_pico else {
+        return Ok(abstain(Gate::OwnedCostUnknown));
+    };
+    if costs.iter().zip(quantities).any(|(cost, quantity)| {
+        (*cost == 0) != (quantity == 0) || *cost > u128::from(quantity) * u128::from(SCALE)
+    }) {
+        return Err("invalid exact inventory cost".into());
+    }
+    if quantities[0] == quantities[1] {
+        return Ok(decision);
+    }
+    let owned = usize::from(quantities[1] > quantities[0]);
+    let lagging = 1 - owned;
+    let remaining = quantities[owned]
+        .abs_diff(quantities[lagging])
+        .saturating_sub([input.reserved_up_micros, input.reserved_down_micros][lagging]);
+    if remaining < input.min_order_micros {
+        return Ok(abstain(Gate::InventoryDust));
+    }
+    let average_paid = costs[owned].div_ceil(u128::from(quantities[owned]));
+    let cap = u128::from(SCALE - rules.max_pair_edge_micros).saturating_sub(average_paid);
+    // Round down: rounding to the nearest tick can turn a break-even pair into a loss.
+    let cap = (cap / u128::from(input.tick_micros)) as u64 * input.tick_micros;
+    decision.quotes.retain_mut(|quote| {
+        if quote.slot
+            != if lagging == 0 {
+                "up:hedge"
+            } else {
+                "down:hedge"
+            }
+        {
+            return false;
+        }
+        quote.price_micros = quote.price_micros.min(cap);
+        quote.quantity_micros = quote.quantity_micros.min(remaining);
+        quote.price_micros >= rules.min_price_micros
+            && quote.quantity_micros >= input.min_order_micros
+    });
+    if decision.quotes.is_empty() {
+        decision.reason = Gate::InventoryCost;
+    }
+    Ok(decision)
 }

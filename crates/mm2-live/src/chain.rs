@@ -258,6 +258,7 @@ impl DirectChain {
                     .relayer
                     .as_ref()
                     .ok_or("DepositWallet relayer configuration missing")?,
+                client.signer.address(),
                 settings.request_timeout_ms,
             )?);
         }
@@ -1056,6 +1057,60 @@ impl DirectChain {
         }
         self.verified_receipt(prepared, &prepared.hash, receipt, true)
             .await
+    }
+    /// Read-only finality proof for exchange fees. Does not sign or broadcast anything.
+    pub(crate) async fn execution_fees(
+        &self,
+        hash: &str,
+        tracked: &[crate::LiveOrder],
+    ) -> Result<Option<Vec<crate::fees::ExecutionFee>>, String> {
+        parse_hash(hash)?;
+        let receipt = self.rpc("eth_getTransactionReceipt", json!([hash])).await?;
+        if receipt.is_null() {
+            return Ok(None);
+        }
+        if receipt.get("transactionHash").and_then(Value::as_str) != Some(hash) {
+            return Err("execution fee receipt hash mismatch".into());
+        }
+        let block = quantity_u64(
+            receipt
+                .get("blockNumber")
+                .ok_or("fee receipt block missing")?,
+        )?;
+        let finalized = self
+            .rpc("eth_getBlockByNumber", json!(["finalized", false]))
+            .await?;
+        let height = quantity_u64(finalized.get("number").ok_or("fee finality unavailable")?)?;
+        if height
+            < block
+                .checked_add(self.settings.minimum_confirmations - 1)
+                .ok_or("fee finality overflow")?
+        {
+            return Ok(None);
+        }
+        let canonical = self
+            .rpc(
+                "eth_getBlockByNumber",
+                json!([format!("0x{block:x}"), false]),
+            )
+            .await?;
+        if !crate::fees::canonical_fee_receipt(
+            &receipt,
+            hash,
+            &canonical,
+            height,
+            self.settings.minimum_confirmations,
+        )? {
+            return Ok(None);
+        }
+        crate::fees::decode_receipt(
+            &receipt,
+            address(&self.live.exchange_address)?,
+            address(&self.live.funder_address)?,
+            tracked,
+            height,
+        )
+        .map(Some)
     }
     async fn verified_receipt(
         &self,

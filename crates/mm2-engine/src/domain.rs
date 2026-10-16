@@ -38,6 +38,98 @@ pub fn parse_micro(input: &str) -> Result<u64, String> {
         .ok_or_else(|| "decimal overflow".into())
 }
 
+#[cfg(test)]
+mod tick_recovery_tests {
+    use super::*;
+    #[test]
+    fn duplicate_tick_metadata_is_idempotent_without_refreshing_the_book() {
+        let mut core = Core::new(CoreConfig {
+            initial_collateral_micro: 1_000_000_000,
+            max_imbalance_micro: 10_000_000,
+            lot_micro: 5_000_000,
+            half_width_micro: 10_000,
+            max_feed_age_ms: 1000,
+        })
+        .unwrap();
+        let condition = format!("0x{}", "a".repeat(64));
+        core.set_market(Market {
+            slug: "tick-idempotency".into(),
+            condition_id: condition.clone(),
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: 100,
+            window_end_ms: 300100,
+            tick_micro: 10000,
+        })
+        .unwrap();
+        core.apply(FeedEvent::Snapshot {
+            condition_id: condition.clone(),
+            outcome: Outcome::Up,
+            exchange_ms: 101,
+            observed_mono_ms: 1,
+            bids: vec![Level {
+                price_micro: 490000,
+                quantity_micro: 5000000,
+            }],
+            asks: vec![Level {
+                price_micro: 510000,
+                quantity_micro: 5000000,
+            }],
+        })
+        .unwrap();
+        let tick = |at, old, new| FeedEvent::Tick {
+            condition_id: condition.clone(),
+            outcome: Outcome::Up,
+            exchange_ms: at,
+            observed_mono_ms: at - 100,
+            old_tick_micro: Some(old),
+            new_tick_micro: new,
+        };
+        core.apply(tick(102, 10000, 1000)).unwrap();
+        let book = core.snapshot().up_book;
+        core.apply(tick(103, 10000, 1000)).unwrap();
+        assert_eq!(core.snapshot().up_book, book);
+        let context = core.feed_clock_context(&tick(102, 10000, 1000)).unwrap();
+        assert_eq!(context.event_kind, "tick");
+        assert_eq!(context.previous_receive_ms, Some(3));
+        assert_eq!(context.book_exchange_ms, [Some(101), None]);
+        assert_eq!(context.tick_exchange_ms, [Some(103), None]);
+        assert_eq!(context.exchange_ms, 102);
+        assert_eq!(context.observed_mono_ms, 2);
+        assert!(core.clone().apply(tick(104, 1234, 1000)).is_err());
+        assert!(core.apply(tick(102, 10000, 1000)).is_err());
+        let mut core = Core::new(CoreConfig {
+            initial_collateral_micro: 1_000_000_000,
+            max_imbalance_micro: 10_000_000,
+            lot_micro: 5_000_000,
+            half_width_micro: 10_000,
+            max_feed_age_ms: 1000,
+        })
+        .unwrap();
+        core.set_market(Market {
+            slug: "tick-incompatible".into(),
+            condition_id: condition,
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: 100,
+            window_end_ms: 300100,
+            tick_micro: 10000,
+        })
+        .unwrap();
+        assert!(
+            core.apply(FeedEvent::Tick {
+                condition_id: format!("0x{}", "a".repeat(64)),
+                outcome: Outcome::Up,
+                exchange_ms: 101,
+                observed_mono_ms: 1,
+                old_tick_micro: Some(1000),
+                new_tick_micro: 100000
+            })
+            .is_err()
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Up,
@@ -129,6 +221,16 @@ pub enum FeedEvent {
         source: FeedSource,
         reason: String,
     },
+}
+/// Bounded public clocks only; never carries provider payloads or credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct FeedClockContext {
+    pub event_kind: &'static str,
+    pub exchange_ms: u64,
+    pub observed_mono_ms: u64,
+    pub previous_receive_ms: Option<u64>,
+    pub book_exchange_ms: [Option<u64>; 2],
+    pub tick_exchange_ms: [Option<u64>; 2],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -315,6 +417,19 @@ fn levels(input: Vec<Level>) -> Result<BTreeMap<u64, u64>, String> {
     result.retain(|_, q| *q > 0);
     Ok(result)
 }
+
+/// Only well-formed obsolete full snapshots may be suppressed by public ingress.
+/// Malformed books must still reach the strict validator and cut their suffix.
+pub(crate) fn snapshot_shape_valid(bids: &[Level], asks: &[Level]) -> bool {
+    let (Ok(bids), Ok(asks)) = (levels(bids.to_vec()), levels(asks.to_vec())) else {
+        return false;
+    };
+    match (bids.last_key_value(), asks.first_key_value()) {
+        (Some((bid, _)), Some((ask, _))) => bid < ask,
+        _ => true,
+    }
+}
+
 impl Core {
     pub fn new(config: CoreConfig) -> Result<Self, String> {
         valid_config(&config)?;
@@ -410,6 +525,34 @@ impl Core {
             }
         }
         Ok(())
+    }
+    pub fn feed_clock_context(&self, event: &FeedEvent) -> Option<FeedClockContext> {
+        let (event_kind, exchange_ms, observed_mono_ms) = match event {
+            FeedEvent::Snapshot {
+                exchange_ms,
+                observed_mono_ms,
+                ..
+            } => ("snapshot", *exchange_ms, *observed_mono_ms),
+            FeedEvent::Delta {
+                exchange_ms,
+                observed_mono_ms,
+                ..
+            } => ("delta", *exchange_ms, *observed_mono_ms),
+            FeedEvent::Tick {
+                exchange_ms,
+                observed_mono_ms,
+                ..
+            } => ("tick", *exchange_ms, *observed_mono_ms),
+            _ => return None,
+        };
+        Some(FeedClockContext {
+            event_kind,
+            exchange_ms,
+            observed_mono_ms,
+            previous_receive_ms: self.last_clob_mono_ms,
+            book_exchange_ms: self.books.each_ref().map(|book| book.exchange_ms),
+            tick_exchange_ms: self.books.each_ref().map(|book| book.tick_exchange_ms),
+        })
     }
     fn accept_clob_clock(
         &self,
@@ -570,7 +713,10 @@ impl Core {
                 }
                 let book = &self.books[outcome.index()];
                 if !valid_tick_micro(new_tick_micro)
-                    || old_tick_micro.is_some_and(|t| t != book.tick_micro)
+                    || old_tick_micro.is_some_and(|t| {
+                        !valid_tick_micro(t)
+                            || (t != book.tick_micro && new_tick_micro != book.tick_micro)
+                    })
                     || book.tick_exchange_ms.is_some_and(|t| exchange_ms < t)
                 {
                     return Err(self.invalid("invalid or incompatible tick transition"));
@@ -585,6 +731,21 @@ impl Core {
         self.last_error = None;
         self.input_invalid = false;
         Ok(())
+    }
+    /// Bounded projection of observed L2 at prices used by immutable paper orders.
+    pub fn bid_depth_at(&self, outcome: Outcome, prices: &[u64]) -> Vec<Level> {
+        let book = &self.books[outcome.index()];
+        let selected: std::collections::BTreeSet<_> = prices.iter().copied().collect();
+        selected
+            .into_iter()
+            .rev()
+            .filter_map(|price_micro| {
+                book.bids.get(&price_micro).map(|quantity_micro| Level {
+                    price_micro,
+                    quantity_micro: *quantity_micro,
+                })
+            })
+            .collect()
     }
     pub fn evaluate(&mut self, now_wall_ms: u64, now_mono_ms: u64) -> Decision {
         self.clear_proposals();

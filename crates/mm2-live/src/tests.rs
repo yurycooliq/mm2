@@ -85,6 +85,7 @@ impl Venue for MockVenue {
             order_id: format!("0x{n:064x}"),
             quote,
             signed_wire: serde_json::json!({"test_only":true,"salt":n}),
+            fee_policy: None,
         })
     }
     async fn post(&self, order: PreparedOrder) -> Result<PostResult, String> {
@@ -144,6 +145,7 @@ impl Venue for MockVenue {
     }
     async fn reconcile(&self, _: Vec<LiveOrder>) -> Result<AccountObservation, String> {
         Ok(AccountObservation {
+            execution_fees: vec![],
             collateral_micros: 100_000_000,
             allowance_micros: u64::MAX,
             positions: if self.account_position_micros.load(Ordering::Relaxed) > 0 {

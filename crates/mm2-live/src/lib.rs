@@ -1,5 +1,7 @@
 //! One-account live executor. SDK I/O is isolated from the pure risk and durable ledger.
 pub mod chain;
+pub mod credentials;
+pub mod fees;
 pub use chain::relay;
 mod journal;
 mod model;

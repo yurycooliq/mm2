@@ -29,6 +29,7 @@ struct OfflineVenue {
     serial: AtomicU64,
     posts: AtomicU64,
     orders: Mutex<BTreeMap<String, OrderObservation>>,
+    reconciliation_error: Mutex<Option<String>>,
 }
 #[async_trait]
 impl Venue for OfflineVenue {
@@ -38,6 +39,7 @@ impl Venue for OfflineVenue {
             order_id: format!("0x{id:064x}"),
             quote,
             signed_wire: serde_json::json!({"offline":true}),
+            fee_policy: None,
         })
     }
     async fn post(&self, order: PreparedOrder) -> Result<PostResult, String> {
@@ -68,6 +70,9 @@ impl Venue for OfflineVenue {
         Ok(ids)
     }
     async fn reconcile(&self, _: Vec<LiveOrder>) -> Result<AccountObservation, String> {
+        if let Some(reason) = self.reconciliation_error.lock().await.as_ref() {
+            return Err(reason.clone());
+        }
         Ok(AccountObservation {
             collateral_micros: 100_000_000,
             allowance_micros: 100_000_000,
@@ -82,6 +87,7 @@ impl Venue for OfflineVenue {
                 mergeable: false,
             }],
             foreign_order_ids: vec![],
+            execution_fees: vec![],
         })
     }
     async fn heartbeat(&self) -> Result<(), String> {
@@ -262,6 +268,17 @@ async fn begin_feeds(service: &mut Service) {
         tick_micro: 10_000,
     };
     service.handle.select_market(market).await.unwrap();
+    service.handle.fee_policy(Some(
+        mm2_live::fees::parse_policy(
+            &serde_json::json!({"c":condition(),
+        "t":[{"t":"1","o":"Up"},{"t":"2","o":"Down"}],"fd":{"r":0.07,"e":1,"to":true}}),
+            &condition(),
+            "1",
+            "2",
+            now,
+        )
+        .unwrap(),
+    ));
     let feeds = service.feeds.clone();
     let paper_feeds = service.paper_feeds.clone();
     let start = service.start;
@@ -320,6 +337,54 @@ async fn halt(mut service: Service) {
     }
     drop(service.delayed_paper.take());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_books_remain_ready_when_funded_eligibility_blocks_resume() {
+    for reason in [
+        "host/protocol eligibility is unverified or blocked",
+        "geoblock endpoint transport unavailable",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let venue = Arc::new(OfflineVenue::default());
+        let mut service = launch(dir.path(), true, false, venue.clone()).await;
+        begin_feeds(&mut service).await;
+        wait(
+            "fresh public books in both independent lanes",
+            || {
+                service.handle.state.borrow()["feed_ready"] == true
+                    && service.paper.state.borrow()["feed_ready"] == true
+            },
+            || public_snapshot(&service),
+        )
+        .await;
+        *venue.reconciliation_error.lock().await = Some(reason.into());
+        wait(
+            "funded reconciliation fail-closed with public books available",
+            || {
+                !service.live.snapshot().account_reconciled
+                    && service.handle.state.borrow()["live_eligible"] == false
+            },
+            || public_snapshot(&service),
+        )
+        .await;
+        assert_eq!(service.handle.state.borrow()["feed_ready"], true);
+        assert_eq!(service.paper.state.borrow()["feed_ready"], true);
+        assert!(!service.live.resume_ready());
+        assert_eq!(service.live.snapshot().phase, LivePhase::Paused);
+        let denial = service
+            .handle
+            .command(control("blocked-funded-resume", 0, "resume"))
+            .await
+            .unwrap_err();
+        assert_eq!(denial.kind, "conflict");
+        assert!(denial.message.contains("live account"));
+        assert_eq!(service.handle.state.borrow()["command_version"], 0);
+        assert_eq!(service.handle.state.borrow()["mode"], "paused");
+        assert_eq!(venue.posts.load(Ordering::Relaxed), 0);
+        halt(service).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mirrored_cas_adapts_to_paper_version_and_secondary_fault_does_not_stop_live() {
     let dir = tempfile::tempdir().unwrap();

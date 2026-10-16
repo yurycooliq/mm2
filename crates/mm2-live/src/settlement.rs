@@ -68,7 +68,9 @@ impl Ledger {
         let mut terminal: Vec<_> = self
             .orders
             .values()
-            .filter(|o| o.phase == OrderPhase::Closed)
+            // Filled orders retain their fee evidence in this finite ledger. Capacity
+            // exhaustion requires an explicit reviewed archive, never silent loss.
+            .filter(|o| o.phase == OrderPhase::Closed && o.cumulative_filled_micros == 0)
             .map(|o| (o.created_at_ms, o.order_id.clone()))
             .collect();
         terminal.sort();
@@ -76,6 +78,7 @@ impl Ledger {
         for (_, id) in terminal.into_iter().take(remove) {
             self.orders.remove(&id);
             self.signed_intents.remove(&id);
+            self.fee_policies.remove(&id);
         }
         let protected: BTreeSet<_> = self
             .orders

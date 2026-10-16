@@ -126,6 +126,9 @@ pub struct AccountSnapshot {
     pub available_micros_floor: u64,
     /// Exact 1e-12 USD amounts as strings, avoiding float/JS precision loss.
     pub spent_pico: String,
+    /// Exact cumulative BUY fill costs by outcome. Legacy checkpoints retain unknown.
+    #[serde(default)]
+    pub outcome_spent_pico: Option<[String; 2]>,
     pub reserved_pico: String,
     pub available_pico: String,
     pub up_inventory_micros: u64,
@@ -150,9 +153,16 @@ pub struct Core {
     slots: BTreeMap<String, u64>,
     cooldowns: BTreeMap<String, u64>,
     spent_pico: u128,
+    #[serde(default)]
+    outcome_spent_pico: Option<[u128; 2]>,
     inventory: [u64; 2],
     stats: ExecutionStats,
     halted: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    defer_automatic_posts: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl Core {
     pub fn new(limits: RiskLimits) -> Result<Self> {
@@ -165,13 +175,22 @@ impl Core {
             slots: BTreeMap::new(),
             cooldowns: BTreeMap::new(),
             spent_pico: 0,
+            outcome_spent_pico: Some([0, 0]),
             inventory: [0, 0],
             stats: ExecutionStats::default(),
             halted: None,
+            defer_automatic_posts: false,
         })
     }
     pub fn limits(&self) -> &RiskLimits {
         &self.limits
+    }
+    /// Paper V2 must reauthorize risk after fills/cancels before another post.
+    pub fn defer_automatic_posts(&mut self) {
+        self.defer_automatic_posts = true;
+    }
+    pub fn automatic_posts_deferred(&self) -> bool {
+        self.defer_automatic_posts
     }
     pub fn order(&self, id: u64) -> Option<&Order> {
         self.orders.get(&id)
@@ -228,7 +247,7 @@ impl Core {
             return Err("execution is halted".into());
         }
         self.desired = desired;
-        self.reconcile(now_ms)
+        self.reconcile_inner(now_ms, true)
     }
     pub fn cancel_all(&mut self, now_ms: u64) -> Result<Vec<Action>> {
         self.desired.clear();
@@ -337,8 +356,12 @@ impl Core {
         }
         let delta = observation.cumulative_filled_micros - o.cumulative_filled_micros;
         if delta > 0 {
-            self.spent_pico += u128::from(delta) * u128::from(o.quote.price_micros);
+            let cost = u128::from(delta) * u128::from(o.quote.price_micros);
+            self.spent_pico += cost;
             let index = if o.quote.outcome == Outcome::Up { 0 } else { 1 };
+            if let Some(costs) = &mut self.outcome_spent_pico {
+                costs[index] += cost;
+            }
             self.inventory[index] = self.inventory[index]
                 .checked_add(delta)
                 .ok_or("inventory overflow")?;
@@ -384,6 +407,9 @@ impl Core {
             .sum()
     }
     fn reconcile(&mut self, now_ms: u64) -> Result<Vec<Action>> {
+        self.reconcile_inner(now_ms, !self.defer_automatic_posts)
+    }
+    fn reconcile_inner(&mut self, now_ms: u64, allow_new_posts: bool) -> Result<Vec<Action>> {
         let mut actions = vec![];
         let keys: Vec<String> = self
             .slots
@@ -411,7 +437,10 @@ impl Core {
                 }
                 continue;
             }
-            if self.halted.is_some() || self.cooldowns.get(&key).is_some_and(|at| now_ms < *at) {
+            if !allow_new_posts
+                || self.halted.is_some()
+                || self.cooldowns.get(&key).is_some_and(|at| now_ms < *at)
+            {
                 continue;
             }
             let Some(mut q) = self.desired.get(&key).cloned() else {
@@ -489,6 +518,9 @@ impl Core {
                 reserved_micros_ceil: (reserved.div_ceil(u128::from(SCALE))) as u64,
                 available_micros_floor: (available / u128::from(SCALE)) as u64,
                 spent_pico: self.spent_pico.to_string(),
+                outcome_spent_pico: self
+                    .outcome_spent_pico
+                    .map(|costs| costs.map(|c| c.to_string())),
                 reserved_pico: reserved.to_string(),
                 available_pico: available.to_string(),
                 up_inventory_micros: self.inventory[0],
@@ -512,6 +544,13 @@ impl Core {
             || self.spent_pico + self.reserved_pico()
                 > u128::from(self.limits.initial_cash_micros) * u128::from(SCALE)
             || self.halted.as_ref().is_some_and(|x| x.len() > 512)
+            || self.outcome_spent_pico.is_some_and(|costs| {
+                costs[0].checked_add(costs[1]) != Some(self.spent_pico)
+                    || costs.iter().zip(self.inventory).any(|(cost, quantity)| {
+                        (*cost == 0) != (quantity == 0)
+                            || *cost > u128::from(quantity) * u128::from(SCALE)
+                    })
+            })
         {
             return Err("invalid persisted core bounds or collateral".into());
         }

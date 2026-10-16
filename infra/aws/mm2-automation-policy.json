@@ -1,0 +1,52 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OperateOnlyMm2WithExistingRunCommand",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ec2:eu-west-1:276571117378:instance/i-053db5508efc00b4a",
+        "arn:aws:ssm:eu-west-1::document/AWS-RunShellScript"
+      ],
+      "Condition": {"StringEquals": {"aws:RequestedRegion": "eu-west-1"}}
+    },
+    {
+      "Sid": "SshOnlyToMm2",
+      "Effect": "Allow",
+      "Action": "ssm:StartSession",
+      "Resource": [
+        "arn:aws:ec2:eu-west-1:276571117378:instance/i-053db5508efc00b4a",
+        "arn:aws:ssm:eu-west-1::document/AWS-StartSSHSession"
+      ],
+      "Condition": {
+        "StringEquals": {"aws:RequestedRegion": "eu-west-1"},
+        "BoolIfExists": {"ssm:SessionDocumentAccessCheck": "true"}
+      }
+    },
+    {
+      "Sid": "OwnSessionTransportAndCleanup",
+      "Effect": "Allow",
+      "Action": ["ssmmessages:OpenDataChannel", "ssm:ResumeSession", "ssm:TerminateSession"],
+      "Resource": [
+        "arn:aws:ssm:eu-west-1:276571117378:session/${aws:username}-*",
+        "arn:aws:ssm:eu-west-1:276571117378:session/${aws:userid}-*"
+      ],
+      "Condition": {"StringEquals": {"aws:RequestedRegion": "eu-west-1"}}
+    },
+    {
+      "Sid": "ReadMm2ConnectionStatus",
+      "Effect": "Allow",
+      "Action": "ssm:GetConnectionStatus",
+      "Resource": "arn:aws:ec2:eu-west-1:276571117378:instance/i-053db5508efc00b4a",
+      "Condition": {"StringEquals": {"aws:RequestedRegion": "eu-west-1"}}
+    },
+    {
+      "Sid": "ReconcileRunCommandReceiptsInIreland",
+      "Effect": "Allow",
+      "Action": ["ssm:ListCommands", "ssm:GetCommandInvocation"],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"aws:RequestedRegion": "eu-west-1"}}
+    }
+  ]
+}

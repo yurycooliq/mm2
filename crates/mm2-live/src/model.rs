@@ -145,6 +145,8 @@ pub struct AccountObservation {
     pub positions: Vec<LivePosition>,
     pub orders: Vec<OrderObservation>,
     pub foreign_order_ids: Vec<String>,
+    #[serde(default)]
+    pub execution_fees: Vec<crate::fees::ExecutionFee>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderObservation {
@@ -191,6 +193,10 @@ pub(crate) struct Ledger {
     pub session_gas_cost_wei: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chain_expiries: Vec<crate::relay::RelayExpiry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fee_policies: BTreeMap<String, crate::fees::FeePolicy>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub execution_fees: BTreeMap<String, crate::fees::ExecutionFee>,
 }
 impl Default for Ledger {
     fn default() -> Self {
@@ -217,10 +223,73 @@ impl Default for Ledger {
             realized_cost_pico: String::new(),
             session_gas_cost_wei: String::new(),
             chain_expiries: Vec::new(),
+            fee_policies: BTreeMap::new(),
+            execution_fees: BTreeMap::new(),
         }
     }
 }
 impl Ledger {
+    pub(crate) fn fees_mismatched(&self) -> bool {
+        crate::fees::mismatched(&self.fee_policies, &self.execution_fees)
+    }
+    fn latch_fee_mismatch(&mut self) {
+        if self.fees_mismatched() {
+            self.phase = LivePhase::Faulted;
+            self.fault = Some("execution fee or role mismatch; finalized evidence retained; owner reconciliation required".into());
+        }
+    }
+    pub(crate) fn fees_pending(&self) -> bool {
+        self.orders.values().any(|order| {
+            self.fee_policies.contains_key(&order.order_id)
+                && u128::from(order.cumulative_filled_micros)
+                    != self
+                        .execution_fees
+                        .values()
+                        .filter(|p| p.order_id == order.order_id)
+                        .map(|p| u128::from(p.quantity_micros))
+                        .sum::<u128>()
+        })
+    }
+    pub(crate) fn fee_summary(&self) -> serde_json::Value {
+        crate::fees::summary(&self.orders, &self.fee_policies, &self.execution_fees)
+    }
+    pub(crate) fn observe_fee(&mut self, proof: crate::fees::ExecutionFee) -> Result<(), String> {
+        let order = self
+            .orders
+            .get(&proof.order_id)
+            .ok_or("fee proof refers to untracked order")?;
+        let key = proof.key();
+        if let Some(prior) = self.execution_fees.get(&key) {
+            let mut comparable = proof.clone();
+            comparable.finalized_block_number = prior.finalized_block_number;
+            if prior != &comparable {
+                return Err("finalized fee proof changed".into());
+            }
+            self.latch_fee_mismatch();
+            return Ok(());
+        }
+        if self.execution_fees.len() >= 1024 {
+            return Err("bounded execution fee proof ledger exhausted".into());
+        }
+        let already: u64 = self
+            .execution_fees
+            .values()
+            .filter(|p| p.order_id == proof.order_id)
+            .try_fold(0u64, |sum, p| {
+                sum.checked_add(p.quantity_micros)
+                    .ok_or("fee quantity overflow")
+            })?;
+        if proof.quantity_micros == 0
+            || already
+                .checked_add(proof.quantity_micros)
+                .is_none_or(|q| q > order.cumulative_filled_micros)
+        {
+            return Err("finalized fee quantity exceeds authoritative order fill".into());
+        }
+        self.execution_fees.insert(key, proof);
+        self.latch_fee_mismatch();
+        Ok(())
+    }
     pub fn reserved_pico(&self) -> u128 {
         self.orders.values().map(LiveOrder::reserve_pico).sum()
     }
@@ -333,6 +402,7 @@ impl Ledger {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LiveSnapshot {
+    pub execution_fee_reconciliation: serde_json::Value,
     pub simulated: bool,
     pub phase: LivePhase,
     pub can_resume: bool,
@@ -357,6 +427,9 @@ pub struct LiveSnapshot {
     pub durable_sequence: u64,
     pub journal_bytes: u64,
     pub journal_max_bytes: u64,
+    /// Research readers must obey this committed prefix, never the mutable file's EOF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_committed_prefix: Option<serde_json::Value>,
     pub quotes_coalesced: u64,
     pub prepare_attempts: u64,
     pub prepare_failures: u64,

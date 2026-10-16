@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "release_gate": "INCONCLUSIVE until measured on stable isolated Linux and selected host",
+  "require_export_on_off_comparison": true,
+  "require_tail_latency_and_feed_age": true,
+  "require_recorded_sample_counts": true,
+  "require_queue_drop_and_capacity_metrics": true,
+  "permit_hosted_ci_latency_as_release_evidence": false,
+  "latency_regression_budget": null
+}

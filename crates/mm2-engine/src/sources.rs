@@ -158,11 +158,16 @@ async fn run_demo(
             }
             now = runtime::wall_ms();
         }
-        feeds::enqueue_frame(
+        if !feeds::enqueue_frame(
             tx,
             demo_frame(&market, now, runtime::mono_ms(start)),
             fault_tx,
-        )?;
+            shutdown,
+        )
+        .await?
+        {
+            return Ok(());
+        }
     }
 }
 
@@ -171,6 +176,32 @@ async fn run_demo(
 struct OwnedFeeds {
     task: Option<JoinHandle<Result<(), String>>>,
     shutdown: watch::Sender<bool>,
+}
+
+async fn join_generation<F, G>(
+    feeds: F,
+    fees: G,
+    shutdown: watch::Sender<bool>,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<(), String>>,
+    G: Future<Output = Result<(), String>>,
+{
+    tokio::pin!(feeds, fees);
+    let (feeds_finished, first) = tokio::select! {
+        result = &mut feeds => (true, result),
+        result = &mut fees => (false, result),
+    };
+    shutdown.send_replace(true);
+    // Fee shutdown may finish before the sockets. Dropping the feed future's
+    // JoinSet only requests aborts; it does not join its workers. The old
+    // generation must finish before SelectMarket acknowledges a new one.
+    let second = if feeds_finished {
+        fees.await
+    } else {
+        feeds.await
+    };
+    first.and(second)
 }
 impl OwnedFeeds {
     async fn stop(mut self, timeout: Duration) -> Result<(), String> {
@@ -257,6 +288,53 @@ async fn watch_window(
     }
 }
 
+async fn refresh_fees(
+    client: reqwest::Client,
+    market: Market,
+    handle: Handle,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut timer = tokio::time::interval(Duration::from_millis(mm2_live::fees::FEE_REFRESH_MS));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_shutdown(&mut shutdown) => return Ok(()),
+            _ = timer.tick() => {}
+        }
+        let fetch = async {
+            let version = discovery::get(&client, "https://clob.polymarket.com/version").await?;
+            if version.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
+                return Err("public fee proof requires pinned CLOB V2".into());
+            }
+            let raw = discovery::get(
+                &client,
+                &format!(
+                    "https://clob.polymarket.com/clob-markets/{}",
+                    market.condition_id
+                ),
+            )
+            .await?;
+            mm2_live::fees::parse_policy(
+                &raw,
+                &market.condition_id,
+                &market.up_token,
+                &market.down_token,
+                runtime::wall_ms(),
+            )
+        };
+        let result = tokio::select! {
+            biased;
+            _ = wait_shutdown(&mut shutdown) => return Ok(()),
+            result = fetch => result
+        };
+        if result.is_err() {
+            tracing::warn!("public fee evidence unavailable; new quotes blocked");
+        }
+        handle.fee_policy(result.ok());
+    }
+}
+
 async fn run_public(
     start: Instant,
     handle: &Handle,
@@ -271,9 +349,6 @@ async fn run_public(
         let _ = handle.source_status("discovering", None, None);
         let discovery = async {
             tokio::time::timeout(Duration::from_secs(25), async {
-                discovery::geoblock(&client)
-                    .await
-                    .map_err(|reason| format!("IP eligibility check: {reason}"))?;
                 discovery::current_btc(&client, runtime::wall_ms())
                     .await
                     .map_err(|reason| format!("BTC5m discovery: {reason}"))
@@ -287,9 +362,7 @@ async fn run_public(
             Err(reason) if fault.borrow().is_some() => return Err(reason),
             Err(reason) => {
                 let _ = handle.source_status("retrying", Some(reason), Some(retry_seconds * 1000));
-                tracing::warn!(
-                    "current BTC5m metadata or IP eligibility unavailable; source retry scheduled"
-                );
+                tracing::warn!("current BTC5m metadata unavailable; source retry scheduled");
                 if interruptible(
                     async {
                         tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
@@ -339,13 +412,26 @@ async fn run_public(
         let initial_epoch = reset_epoch(&state.borrow_and_update())?;
         // The actor has acknowledged the new identity before any new-market frame is emitted.
         let (feed_shutdown, feed_shutdown_rx) = watch::channel(false);
+        handle.fee_policy(None);
+        let fee_task = refresh_fees(
+            client.clone(),
+            market.clone(),
+            handle.clone(),
+            feed_shutdown_rx.clone(),
+        );
+        let feed_task = feeds::run_public_with_diagnostics(
+            market.clone(),
+            start,
+            tx.clone(),
+            fault_tx.clone(),
+            feed_shutdown_rx,
+            Some(handle.feed_diagnostics.clone()),
+        );
         let mut owned = OwnedFeeds {
-            task: Some(tokio::spawn(feeds::run_public(
-                market.clone(),
-                start,
-                tx.clone(),
-                fault_tx.clone(),
-                feed_shutdown_rx,
+            task: Some(tokio::spawn(join_generation(
+                feed_task,
+                fee_task,
+                feed_shutdown.clone(),
             ))),
             shutdown: feed_shutdown,
         };
@@ -373,10 +459,23 @@ async fn run_public(
             Transition::Refresh => {
                 let _ = handle.source_status(
                     "refreshing",
-                    Some("durable Reset requires fresh source snapshots".into()),
+                    Some("source refresh requires fresh snapshots".into()),
                     None,
                 );
                 owned.stop(FEED_STOP_TIMEOUT).await?;
+                if interruptible(
+                    async {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Ok(())
+                    },
+                    shutdown,
+                    fault,
+                )
+                .await?
+                .is_none()
+                {
+                    return Ok(());
+                }
             }
             Transition::Fault(reason) => {
                 let _ = owned.stop(FEED_STOP_TIMEOUT).await;
@@ -477,6 +576,62 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn fee_shutdown_cannot_acknowledge_generation_before_socket_workers_join() {
+        let (shutdown, mut fee_stop) = watch::channel(false);
+        let mut socket_stop = shutdown.subscribe();
+        let joined = Arc::new(AtomicBool::new(false));
+        let child_joined = joined.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let feeds = async move {
+            let mut workers = tokio::task::JoinSet::new();
+            workers.spawn(async move {
+                let _ = started.send(());
+                wait_shutdown(&mut socket_stop).await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                child_joined.store(true, Ordering::SeqCst);
+            });
+            while workers.join_next().await.is_some() {}
+            Ok(())
+        };
+        let fees = async move {
+            wait_shutdown(&mut fee_stop).await;
+            Ok(())
+        };
+        let task = tokio::spawn(join_generation(feeds, fees, shutdown.clone()));
+        ready.await.unwrap();
+        OwnedFeeds {
+            task: Some(task),
+            shutdown,
+        }
+        .stop(Duration::from_secs(1))
+        .await
+        .unwrap();
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "a new source generation could overtake the old socket worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_first_failure_cancels_and_joins_the_other_future() {
+        let (shutdown, mut fee_stop) = watch::channel(false);
+        let finished = Arc::new(AtomicBool::new(false));
+        let fee_finished = finished.clone();
+        let result = join_generation(
+            async { Err("first public source failure".into()) },
+            async move {
+                wait_shutdown(&mut fee_stop).await;
+                fee_finished.store(true, Ordering::SeqCst);
+                Err("secondary cancellation failure".into())
+            },
+            shutdown.clone(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "first public source failure");
+        assert!(*shutdown.borrow() && finished.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

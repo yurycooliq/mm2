@@ -1,11 +1,21 @@
 # Strategy and market portfolio contract
 
+New simulation histories use exact per-outcome BUY costs. Legacy aggregate
+histories replay unchanged and cannot authorize new risk while their side basis
+is uncertain. Public execution uses versioned observed depth at relevant order
+prices, conservative cancellation priority and single-price trade prints; its
+fills remain hypothetical. A sub-minimum residual can retain an already-live
+legal opposite order under the same pair-cost, inventory and loss bounds. No new
+lot is posted just to bypass dust, and cancel-in-flight quantities stay reserved.
+Confirmed fills and terminal cancels cannot automatically post another paper lot;
+the next explicit quote operation must first pass the updated risk checks.
+
 `mm2-strategy` and `mm2-portfolio` are deterministic Rust libraries without I/O, UI,
 wall-clock access, floats, databases or network clients. The caller supplies the
 clock, market identity, current tick/minimum, observed books and authenticated
 execution evidence. Simulator fills and receipts remain explicitly synthetic.
 
-## Frozen candidate
+## Quote reference and simulation policy
 
 The deployment candidate is a BUY-only Up/Down spread strategy. The Up mid supplies
 the book-only reference; the center is shrunk toward 0.50, then each side bids its
@@ -20,12 +30,38 @@ override lot, half-width, imbalance and freshness for the actual deployment.
 12:00–23:00 UTC use the full lot; otherwise use a whole-share rounded half lot.
 This UTC observation is not a daylight-saving timezone conversion.
 
-The lagging inventory side may add a hedge for its known net imbalance. Hedge,
+The historical `decide` reference may add a hedge for its known net imbalance. Hedge,
 regular lot and optional one-cent stub consume the same finite cash and independent
 possible one-sided-fill cap. The hedge receives admission priority. All output is
 bounded to six slots. Existing order reservations must be excluded from replacement
 budgets only when the execution ledger separately retains and checks them; counting
 the same retained desired order twice would cause artificial cancel/repost cycles.
+
+The `simulation` engine now uses `decide_inventory_aware`: while quantities differ,
+it proposes only the lagging hedge and suppresses fresh lots/stubs on both sides.
+The hedge's price is capped by the opposite inventory's exact cumulative BUY fill
+cost per share, the required pair edge, and downward tick rounding. The retained
+portfolio allocation imposes an additional cost cap. Unknown legacy side costs
+block proposals; replaying the complete journal reconstructs exact costs without
+changing historical financial results. An imbalance smaller than the venue minimum
+is retained for final outcome settlement (`inventory_dust`), without oversizing a
+hedge or inventing a fill. Cancel races remain possible and reserved until confirmed.
+
+Before each new simulation intent, the original daily gross-loss and drawdown limits
+also cover possible losses in every unresolved position and every pending order.
+Opposite possible fills are independent. Exact retained desired orders are counted
+once; replacements count both the old possible fill and the new intent until terminal
+cancellation. The upper bound checks all one-sided/both-sided fill endpoints, charges
+future units at the highest possible order price to cover aggregate side allocation,
+and conservatively rounds residual cost upward. It includes negative complete-set
+merges and losing residual redemption; prior pair profits cannot offset these losses.
+Insufficient headroom cancels proposals with `loss_budget`, without changing limits,
+forgetting positions, resetting realized history, or raising a runtime fault.
+
+Historical `emulator`/research quote parity and funded modes retain their prior quote
+contract. This simulation change does not establish a funded rollout or profitability.
+Report active quoting, minimum-size/budget abstention and fills separately from process
+uptime; a full day spent waiting is not a full day of active strategy acceptance.
 
 Missing, stale, future-dated, crossed or hollow books return an empty desired list.
 The close guard cancels every slot, including stubs. Empty desired lists require
@@ -63,8 +99,9 @@ Two mutually exclusive execution inputs are supported per market:
   consumed fee bound; cancel dispatch and unknown outcomes do not release it.
 - `record_execution_totals`: idempotent cumulative Core spent/inventory/fee snapshots.
   `spent_pico` includes `fee_pico`; backward or contradictory totals fail. Allocation
-  of aggregate cost between sides is proportional to added quantities, because
-  aggregate Core snapshots contain no per-side cost basis. Cash and total realized
+  of aggregate cost between sides retains its historical proportional-to-added-quantity
+  contract. The new Core side costs are strategy inputs, without reinterpretation of
+  old portfolio records. Cash and total realized
   results stay exact; per-side allocated cost is not historical execution evidence.
 
 Merge burns equal Up/Down quantities for $1 per complete set, using a receipt that

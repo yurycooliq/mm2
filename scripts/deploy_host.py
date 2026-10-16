@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify, import and select mm2 releases on a prepared Linux host; never resume trading."""
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -22,9 +23,45 @@ INSTALL_ROOT = Path("/opt/mm2")
 PRIVATE_KEYS = {"MM2_ENGINE_API_TOKEN", "MM2_CONSOLE_TOKEN", "MM2_DOMAIN", "MM2_POLY_PRIVATE_KEY", "MM2_POLY_API_KEY",
                 "MM2_POLY_API_SECRET", "MM2_POLY_API_PASSPHRASE", "MM2_POLYGON_RPC_URL",
                 "MM2_POLY_RELAYER_API_KEY", "MM2_POLY_RELAYER_API_KEY_ADDRESS",
-                "MM2_TELEGRAM_BOT_TOKEN", "MM2_TELEGRAM_OWNER_ID"}
+                "MM2_POLY_BUILDER_API_KEY", "MM2_POLY_BUILDER_API_SECRET", "MM2_POLY_BUILDER_API_PASSPHRASE",
+                "MM2_TELEGRAM_BOT_TOKEN", "MM2_TELEGRAM_OWNER_ID", "MM2_TELEGRAM_ALLOWED_IDS"}
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 MODES = {"simulation": "simulation", "trading": "trading", "both": "both", "shadow": "public", "demo": "demo"}
+BUILDER_KEYS = ("MM2_POLY_BUILDER_API_KEY", "MM2_POLY_BUILDER_API_SECRET", "MM2_POLY_BUILDER_API_PASSPHRASE")
+RELAYER_KEYS = ("MM2_POLY_RELAYER_API_KEY", "MM2_POLY_RELAYER_API_KEY_ADDRESS")
+
+
+def relayer_authentication(values, required=False, signer=None):
+    """One complete runtime scheme; credentials never appear in diagnostic text."""
+    owner = [values.get(key, "") for key in RELAYER_KEYS]
+    builder = [values.get(key, "") for key in BUILDER_KEYS]
+    if ((any(owner) and not all(owner)) or (any(builder) and not all(builder))
+            or (any(owner) and any(builder)) or (required and not any(owner + builder))):
+        raise ValueError("Relayer requires exactly one complete owner pair or Builder triplet")
+    if all(owner):
+        if (len(owner[0]) > 1024 or any(not 33 <= ord(char) <= 126 or char in "$'\"\\`" for char in owner[0])
+                or not re.fullmatch(r"0x[0-9a-fA-F]{40}", owner[1]) or int(owner[1][2:], 16) == 0):
+            raise ValueError("Relayer owner credentials exceed their supported literal bounds")
+        if signer is not None and owner[1].lower() != signer.lower():
+            raise ValueError("Relayer API key owner differs from the configured controlling signer")
+        return "owner"
+    if all(builder):
+        try:
+            key, secret, passphrase = builder
+            if len(key) != 36 or str(uuid.UUID(key)) != key.lower() or uuid.UUID(key).int == 0:
+                raise ValueError("invalid UUID")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{16,512}={0,2}", secret):
+                raise ValueError("invalid base64")
+            decoded = base64.b64decode(secret + "=" * (-len(secret) % 4), altchars=b"-_", validate=True)
+            canonical = base64.urlsafe_b64encode(decoded).decode("ascii")
+            if not 16 <= len(decoded) <= 256 or secret not in (canonical, canonical.rstrip("=")):
+                raise ValueError("noncanonical or invalid HMAC key")
+            if not 1 <= len(passphrase) <= 256 or any(not 33 <= ord(char) <= 126 or char in "$'\"\\`" for char in passphrase):
+                raise ValueError("invalid passphrase")
+        except (ValueError, TypeError):
+            raise ValueError("Builder credentials require a UUID, canonical URL-safe HMAC secret and bounded literal passphrase") from None
+        return "builder"
+    return None
 
 
 def private_environment(path):
@@ -46,14 +83,13 @@ def private_environment(path):
         raise ValueError("independent private owner and engine tokens are required")
     if bool(result.get("MM2_TELEGRAM_BOT_TOKEN")) != bool(result.get("MM2_TELEGRAM_OWNER_ID")):
         raise ValueError("Telegram token and owner ID must be configured together")
-    relay_key = result.get("MM2_POLY_RELAYER_API_KEY", "")
-    relay_owner = result.get("MM2_POLY_RELAYER_API_KEY_ADDRESS", "")
-    if bool(relay_key) != bool(relay_owner):
-        raise ValueError("Relayer API key and key-owner address must be configured together")
-    if relay_key and (len(relay_key) > 1024 or any(not 33 <= ord(char) <= 126 for char in relay_key)):
-        raise ValueError("Relayer API key exceeds its supported literal header bound")
-    if relay_owner and (not re.fullmatch(r"0x[0-9a-fA-F]{40}", relay_owner) or int(relay_owner[2:], 16) == 0):
-        raise ValueError("Relayer API key owner must be a nonzero public address")
+    additional = result.get("MM2_TELEGRAM_ALLOWED_IDS", "")
+    if additional and (not result.get("MM2_TELEGRAM_OWNER_ID") or len(additional) > 272
+                       or len(additional.split(",")) > 16
+                       or any(not re.fullmatch(r"[1-9][0-9]{0,15}", item) or int(item) >= 2**52
+                              for item in additional.split(","))):
+        raise ValueError("invalid additional Telegram access IDs")
+    relayer_authentication(result)
     return result
 
 
@@ -73,6 +109,7 @@ def bootstrap(domain, config=CONFIG_ROOT):
         "MM2_POLY_PRIVATE_KEY": "", "MM2_POLY_API_KEY": "", "MM2_POLY_API_SECRET": "", "MM2_POLY_API_PASSPHRASE": "",
         "MM2_POLYGON_RPC_URL": "",
         "MM2_POLY_RELAYER_API_KEY": "", "MM2_POLY_RELAYER_API_KEY_ADDRESS": "",
+        "MM2_POLY_BUILDER_API_KEY": "", "MM2_POLY_BUILDER_API_SECRET": "", "MM2_POLY_BUILDER_API_PASSPHRASE": "",
     }
     descriptor = os.open(config / "runtime.env", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="ascii") as stream:
@@ -125,10 +162,7 @@ def preflight(release, config=CONFIG_ROOT, state=STATE_ROOT, run=subprocess.run)
         if any(not values.get(key) for key in ("MM2_POLY_PRIVATE_KEY", "MM2_POLY_API_KEY", "MM2_POLY_API_SECRET", "MM2_POLY_API_PASSPHRASE", "MM2_POLYGON_RPC_URL")):
             raise ValueError("funded profile private runtime credentials are incomplete")
         if parsed["live"]["signature_type"] == 3:
-            if any(not values.get(key) for key in ("MM2_POLY_RELAYER_API_KEY", "MM2_POLY_RELAYER_API_KEY_ADDRESS")):
-                raise ValueError("deposit-wallet profile private relayer credentials are incomplete")
-            if values["MM2_POLY_RELAYER_API_KEY_ADDRESS"].lower() != parsed["live"]["signer_address"].lower():
-                raise ValueError("Relayer API key owner differs from the configured controlling signer")
+            relayer_authentication(values, required=True, signer=parsed["live"]["signer_address"])
     expected = image_environment(manifest)
     release_env = "".join(key + "=" + value + "\n" for key, value in sorted(expected.items()))
     if (config / "release.env").is_symlink() or (config / "release.env").read_text(encoding="ascii") != release_env:

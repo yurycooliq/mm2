@@ -2782,6 +2782,7 @@ dependencies = [
 name = "mm2-engine"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -2795,6 +2796,7 @@ dependencies = [
  "mm2-portfolio",
  "mm2-strategy",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2817,10 +2819,12 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "fs2",
  "futures-util",
  "hex",
+ "hmac",
  "mm2-core",
  "polymarket_client_sdk_v2",
  "reqwest 0.13.5",

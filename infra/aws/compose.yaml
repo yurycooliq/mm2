@@ -18,6 +18,9 @@ services:
       MM2_POLYGON_RPC_URL: ${MM2_POLYGON_RPC_URL:-}
       MM2_POLY_RELAYER_API_KEY: ${MM2_POLY_RELAYER_API_KEY:-}
       MM2_POLY_RELAYER_API_KEY_ADDRESS: ${MM2_POLY_RELAYER_API_KEY_ADDRESS:-}
+      MM2_POLY_BUILDER_API_KEY: ${MM2_POLY_BUILDER_API_KEY:-}
+      MM2_POLY_BUILDER_API_SECRET: ${MM2_POLY_BUILDER_API_SECRET:-}
+      MM2_POLY_BUILDER_API_PASSPHRASE: ${MM2_POLY_BUILDER_API_PASSPHRASE:-}
     volumes:
       - type: bind
         source: /etc/mm2/active.toml
@@ -49,12 +52,17 @@ services:
       MM2_ENGINE_URL: http://engine:8088
       MM2_ENGINE_API_TOKEN: ${MM2_ENGINE_API_TOKEN:?Private runtime token required}
       MM2_CONSOLE_TOKEN: ${MM2_CONSOLE_TOKEN:?Private runtime token required}
+      MM2_TELEGRAM_ONLY: "true"
+      # Only Caddy and this owner's private services reach this unpublished port.
+      MM2_TRUSTED_PROXY_HEADER: "true"
       MM2_TELEGRAM_BOT_TOKEN: ${MM2_TELEGRAM_BOT_TOKEN:-}
       MM2_TELEGRAM_OWNER_ID: ${MM2_TELEGRAM_OWNER_ID:-}
+      MM2_TELEGRAM_ALLOWED_IDS: ${MM2_TELEGRAM_ALLOWED_IDS:-}
       MM2_MINIAPP_URL: https://${MM2_DOMAIN:?Exact HTTPS domain required}/
       MM2_ALLOWED_ORIGINS: https://${MM2_DOMAIN:?Exact HTTPS domain required}
       MM2_CONSOLE_STATE_DIR: /data
       MM2_CONSOLE_STATIC_DIR: /app/dashboard
+      MM2_CONSOLE_RESEARCH_VIEW_DIR: /data/research-view
     volumes:
       - type: bind
         source: /srv/mm2/console
