@@ -33,6 +33,17 @@ ticks are skipped rather than replayed in a burst. These bounds prevent a stuck
 write from indefinitely blocking reads and shutdown; they do not prove that an
 observed remote disconnect has been eliminated.
 
+Peer close code 1013 is the registered "Try Again Later" signal
+([IANA registry](https://www.iana.org/assignments/websocket#close-code-number)).
+Retries after that signal use increasing five/ten/twenty/thirty-second pauses,
+with up to one second of random jitter and a thirty-second total cap. A connected
+session must receive text and remain stable for thirty seconds before resetting
+the streak; a short unrelated failure cannot erase it. The recorded numeric retry
+delay is the requested delay, clipped by the capture/market deadline. Every failed
+session still retains its gap and advances the source generation. This avoids
+aggressive retries; it cannot prevent a server from closing a healthy connection
+or reconstruct missed events.
+
 Replay is offline. Every candidate/latency combination owns a separate native
 emulator and finite portfolio. Capital, old positions, gross losses and drawdown
 survive rollovers and the training/holdout boundary. Queue position belongs to

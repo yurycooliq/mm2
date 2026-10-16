@@ -21,6 +21,26 @@ use tokio_tungstenite::{
 };
 
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const STABLE_SESSION: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct RetryBackoff {
+    retry_later_streak: u8,
+}
+impl RetryBackoff {
+    fn next_delay(&mut self, close_code: Option<u16>, stable: bool, jitter_ms: u64) -> Duration {
+        if stable {
+            self.retry_later_streak = 0;
+        }
+        if close_code == Some(1013) {
+            let seconds = [5, 10, 20, 30][usize::from(self.retry_later_streak.min(3))];
+            self.retry_later_streak = self.retry_later_streak.saturating_add(1).min(4);
+            return Duration::from_millis((seconds * 1000 + jitter_ms.min(1000)).min(30_000));
+        }
+        // A short transport failure does not erase the recent 1013 history.
+        Duration::from_millis(500)
+    }
+}
 
 // Fixed categories only. Never format a nested transport error, URL, header,
 // peer close reason, or payload into secondary diagnostics.
@@ -85,6 +105,7 @@ fn millis(duration: Duration) -> u64 {
 }
 struct SocketTrace {
     started: Instant,
+    connected_at: Option<Instant>,
     last_text: Option<Instant>,
     text_frames: u64,
     max_record_write_ms: u64,
@@ -94,11 +115,18 @@ impl SocketTrace {
     fn new() -> Self {
         Self {
             started: Instant::now(),
+            connected_at: None,
             last_text: None,
             text_frames: 0,
             max_record_write_ms: 0,
             max_heartbeat_late_ms: 0,
         }
+    }
+    fn stable(&self) -> bool {
+        self.text_frames > 0
+            && self
+                .connected_at
+                .is_some_and(|at| at.elapsed() >= STABLE_SESSION)
     }
     fn reason(
         &self,
@@ -200,7 +228,9 @@ async fn gap_and_retry(
     slug: Option<String>,
     reason: String,
     generation: &mut u64,
-) {
+    delay: Duration,
+    deadline: tokio::time::Instant,
+) -> bool {
     emit(
         c,
         tape::Input::Gap {
@@ -210,15 +240,40 @@ async fn gap_and_retry(
         },
     );
     *generation += 1;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_retry(c, delay, deadline).await
+}
+async fn wait_retry(c: &Shared, delay: Duration, deadline: tokio::time::Instant) -> bool {
+    let retry_at = tokio::time::Instant::now() + delay;
+    loop {
+        let now = tokio::time::Instant::now();
+        if c.lock().unwrap().stopped() || now >= deadline {
+            return false;
+        }
+        if now >= retry_at {
+            return true;
+        }
+        tokio::time::sleep_until(retry_at.min(deadline).min(now + Duration::from_millis(250)))
+            .await;
+    }
+}
+fn socket_deadline(c: &Shared, until_wall_ms: u64) -> tokio::time::Instant {
+    let capture_deadline = c.lock().unwrap().deadline;
+    let remaining = capture_deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_millis(until_wall_ms.saturating_sub(wall())));
+    (tokio::time::Instant::now() + remaining).min(tokio::time::Instant::from_std(capture_deadline))
 }
 async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
     let feed = if market.is_some() { "clob" } else { "binance" };
     let slug = market.as_ref().map(|m| m.slug.clone());
     let mut generation = 0;
+    let mut backoff = RetryBackoff::default();
     let until = market.as_ref().map_or(u64::MAX, |m| m.window_end_ms + 2000);
+    // A wall-clock correction cannot extend this connection's original bound.
+    let deadline = socket_deadline(&c, until);
     loop {
-        if c.lock().unwrap().stopped() || wall() >= until {
+        if c.lock().unwrap().stopped() || wall() >= until || tokio::time::Instant::now() >= deadline
+        {
             return Ok(());
         }
         let url = if market.is_some() {
@@ -230,13 +285,25 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
             .max_message_size(Some(feeds::MAX_MESSAGE_BYTES))
             .max_frame_size(Some(feeds::MAX_MESSAGE_BYTES));
         let mut trace = SocketTrace::new();
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            connect_async_with_config(url, Some(config), false),
-        )
-        .await;
+        let mut close_code = None;
+        let result = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return Ok(()),
+            result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_async_with_config(url, Some(config), false),
+            ) => result,
+        };
         let reason = match result {
             Ok(Ok((mut ws, _))) => 'connected: {
+                trace.connected_at = Some(Instant::now());
+                if c.lock().unwrap().stopped()
+                    || wall() >= until
+                    || tokio::time::Instant::now() >= deadline
+                {
+                    let _ = write_bounded(ws.close(None)).await;
+                    return Ok(());
+                }
                 if let Some(m) = &market {
                     let subscription = json!({"assets_ids":[m.up_token,m.down_token],"type":"market","custom_feature_enabled":true});
                     if let Err(class) =
@@ -254,12 +321,19 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
                 heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 heartbeat.tick().await;
                 loop {
-                    if c.lock().unwrap().stopped() || wall() >= until {
+                    if c.lock().unwrap().stopped()
+                        || wall() >= until
+                        || tokio::time::Instant::now() >= deadline
+                    {
                         let _ = write_bounded(ws.close(None)).await;
                         return Ok(());
                     }
                     tokio::select! {
-                        _=tokio::time::sleep(Duration::from_millis(250))=>{},
+                        biased;
+                        _=tokio::time::sleep_until(deadline)=>{
+                            let _=write_bounded(ws.close(None)).await;
+                            return Ok(());
+                        },
                         scheduled=heartbeat.tick()=>{
                             trace.max_heartbeat_late_ms=trace.max_heartbeat_late_ms.max(millis(tokio::time::Instant::now().saturating_duration_since(scheduled)));
                             if market.is_some() && let Err(class)=write_bounded(ws.send(Message::Text("PING".into()))).await {
@@ -268,6 +342,7 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
                         },
                         message=ws.next()=>{match message {
                             Some(Ok(Message::Text(text)))=>{
+                                if c.lock().unwrap().stopped() || wall() >= until || tokio::time::Instant::now() >= deadline {return Ok(());}
                                 let received=Instant::now();trace.last_text=Some(received);trace.text_frames+=1;
                                 if !emit(&c,tape::Input::Frame{feed:feed.into(),market_slug:slug.clone(),generation,text:text.to_string()}){return Ok(());}
                                 trace.max_record_write_ms=trace.max_record_write_ms.max(millis(received.elapsed()));
@@ -277,11 +352,15 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
                                     break trace.reason("pong_send",class,generation,None);
                                 }
                             },
-                            Some(Ok(Message::Close(frame)))=>break trace.reason("peer_close",ErrorClass::named("peer_close"),generation,frame.map(|frame|u16::from(frame.code))),
+                            Some(Ok(Message::Close(frame)))=>{
+                                close_code=frame.map(|frame|u16::from(frame.code));
+                                break trace.reason("peer_close",ErrorClass::named("peer_close"),generation,close_code);
+                            },
                             Some(Err(error))=>break trace.reason("read",error_class(&error),generation,None),
                             None=>break trace.reason("read",ErrorClass::named("stream_ended"),generation,None),
                             _=>{},
-                        }}
+                        }},
+                        _=tokio::time::sleep(Duration::from_millis(250))=>{},
                     }
                 }
             }
@@ -293,9 +372,24 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
                 None,
             ),
         };
+        let jitter_ms = (uuid::Uuid::new_v4().as_u128() % 1001) as u64;
+        let delay = backoff.next_delay(close_code, trace.stable(), jitter_ms);
+        let reason = format!("{reason};retry_delay_ms={}", millis(delay));
         // Subscription-send failures also consume a generation and back off;
         // a following frame can never masquerade as the failed connection.
-        gap_and_retry(&c, feed, slug.clone(), reason, &mut generation).await;
+        if !gap_and_retry(
+            &c,
+            feed,
+            slug.clone(),
+            reason,
+            &mut generation,
+            delay,
+            deadline,
+        )
+        .await
+        {
+            return Ok(());
+        }
     }
 }
 async fn fees(c: Shared, client: reqwest::Client, market: Market) {
@@ -504,6 +598,165 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 
+    fn retry_capture() -> (tempfile::TempDir, Shared) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = tape::Writer::new(&dir.path().join("retry.jsonl"), 65536).unwrap();
+        writer
+            .append(
+                wall(),
+                0,
+                tape::Input::Header {
+                    schema: 1,
+                    source: "controlled_retry_test".into(),
+                    started_wall_ms: wall(),
+                    max_bytes: 65536,
+                    max_frames: 10,
+                },
+                false,
+            )
+            .unwrap();
+        let start = Instant::now();
+        let c = Arc::new(Mutex::new(Capture {
+            writer,
+            start,
+            deadline: start + Duration::from_secs(3600),
+            frames: 0,
+            gaps: 0,
+            max_frames: 10,
+            stop: None,
+        }));
+        (dir, c)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_retry_later_closes_wait_with_jitter_cap_and_keep_every_gap() {
+        let (dir, c) = retry_capture();
+        let mut backoff = RetryBackoff::default();
+        let mut generation = 0;
+        for expected_ms in [5007, 10007, 20007, 30000, 30000] {
+            let delay = backoff.next_delay(Some(1013), false, 7);
+            assert_eq!(millis(delay), expected_ms);
+            let started = tokio::time::Instant::now();
+            let reason = format!(
+                "socket_peer_close;class=peer_close;generation={generation};close_code=1013;retry_delay_ms={expected_ms}"
+            );
+            assert!(
+                gap_and_retry(
+                    &c,
+                    "clob",
+                    Some("controlled".into()),
+                    reason,
+                    &mut generation,
+                    delay,
+                    started + Duration::from_secs(60)
+                )
+                .await
+            );
+            assert_eq!(started.elapsed(), delay);
+        }
+        assert_eq!(generation, 5);
+        {
+            let mut capture = c.lock().unwrap();
+            assert_eq!(capture.gaps, 5);
+            let elapsed = millis(capture.start.elapsed());
+            capture
+                .writer
+                .append(
+                    wall(),
+                    elapsed,
+                    tape::Input::End {
+                        reason: "test".into(),
+                        frames: 0,
+                        gaps: 5,
+                        complete: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            capture.writer.finish().unwrap();
+        }
+        let mut seen = 0;
+        tape::visit(&dir.path().join("retry.jsonl"), 65536, |record| {
+            if let tape::Input::Gap { reason, .. } = record.input {
+                assert!(reason.contains(&format!("generation={seen};")));
+                assert!(reason.contains("close_code=1013"));
+                seen += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_stable_observed_session_resets_retry_later_history() {
+        let (_dir, c) = retry_capture();
+        let mut backoff = RetryBackoff::default();
+        assert_eq!(
+            backoff.next_delay(Some(1013), false, 0),
+            Duration::from_secs(5)
+        );
+        // A different short failure uses its old generic delay but cannot erase
+        // the remembered service-requested pause.
+        assert_eq!(
+            backoff.next_delay(None, false, 999),
+            Duration::from_millis(500)
+        );
+        let mut trace = SocketTrace::new();
+        trace.connected_at = Some(Instant::now());
+        trace.text_frames = 1;
+        assert!(!trace.stable());
+        assert_eq!(
+            backoff.next_delay(Some(1013), trace.stable(), 0),
+            Duration::from_secs(10)
+        );
+        trace.connected_at = Some(Instant::now() - Duration::from_secs(31));
+        trace.text_frames = 0;
+        assert!(!trace.stable());
+        assert_eq!(
+            backoff.next_delay(Some(1013), trace.stable(), 0),
+            Duration::from_secs(20)
+        );
+        trace.text_frames = 1;
+        assert!(trace.stable());
+        let delay = backoff.next_delay(Some(1013), trace.stable(), 1001);
+        assert_eq!(delay, Duration::from_secs(6));
+        let started = tokio::time::Instant::now();
+        assert!(wait_retry(&c, delay, started + Duration::from_secs(60)).await);
+        assert_eq!(started.elapsed(), delay);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_wait_clips_to_deadline_and_observes_stop_without_reconnecting() {
+        let (_dir, c) = retry_capture();
+        let started = tokio::time::Instant::now();
+        assert!(
+            !wait_retry(
+                &c,
+                Duration::from_secs(30),
+                started + Duration::from_millis(800)
+            )
+            .await
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(800));
+        let started = tokio::time::Instant::now();
+        assert!(!wait_retry(&c, Duration::from_secs(30), started).await);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let started = tokio::time::Instant::now();
+        let stopper = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c.lock().unwrap().stop = Some("controlled_stop".into());
+        };
+        let waiter = wait_retry(
+            &c,
+            Duration::from_secs(30),
+            started + Duration::from_secs(60),
+        );
+        let (retry, ()) = tokio::join!(waiter, stopper);
+        assert!(!retry);
+        assert_eq!(started.elapsed(), Duration::from_millis(250));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stalled_websocket_send_and_close_are_bounded_before_discarding_connection() {
         // A real WebSocket over a tiny in-memory transport. The peer never
@@ -626,6 +879,8 @@ mod tests {
             Some("controlled".into()),
             reason,
             &mut generation,
+            Duration::from_millis(500),
+            before + Duration::from_secs(60),
         )
         .await;
         assert_eq!(generation, 8);
@@ -707,6 +962,7 @@ mod tests {
     fn numeric_connection_diagnostics_remain_bounded_and_keep_peer_close_code() {
         let trace = SocketTrace {
             started: Instant::now(),
+            connected_at: Some(Instant::now()),
             last_text: Some(Instant::now()),
             text_frames: u64::MAX,
             max_record_write_ms: u64::MAX,

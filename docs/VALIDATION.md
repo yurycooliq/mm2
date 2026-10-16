@@ -2,13 +2,18 @@
 
 ## October 16, 2026 - bounded capture writes and explicit recovered-input quality
 
-Formatting, all-target Clippy with warnings denied and **376 Rust tests** pass,
-with zero ignored tests. The complete accepted run is `rust-validation-1.log` in
+Formatting, all-target Clippy with warnings denied and **379 Rust tests** pass,
+with zero ignored tests. The complete accepted run is `rust-validation-2.log` in
 `output/r18-stream-recovery-20261016`. Two real in-memory WebSocket regressions
 cover stalled sends/close and successful application heartbeat/native Ping/Pong
 ordering. Three quality regressions cover actual two-book restoration, timeout,
 exact-age/after-close completion, malformed snapshots and historical recovery
 deficits surviving a generation reset.
+
+Three additional paused-time retry regressions cover repeated peer-close 1013
+signals, capped jitter, stable-session reset, preservation of gaps/generations and
+capture/market deadline clipping. Requested retry delays remain diagnostic data;
+the patch cannot prevent remote closure or reconstruct missing trade evidence.
 
 The default strict protocol and all sealed historical evidence retain their
 meaning. Opt-in `recovered_native_v2` separates fatal faults from verified native
