@@ -68,6 +68,9 @@ For a retained tape with fatal ingress errors, an optional final CLI argument
 source generation, event clocks and available state immediately before rejection.
 Raw payloads and arbitrary error text are excluded. A witness with unavailable
 pre-error state says so explicitly. The default report remains unchanged.
+Delta witnesses sample the exact current quantities of at most four touched
+levels. An absent level in an initialized book is known zero; an uninitialized
+book remains unknown. This observation cannot itself discard or accept a delta.
 Diagnostic mode preserves execution and accounting, disables candidate selection
 and cannot promote a strategy or erase faults. Reuse the original frozen tape and
 plan with a new report path; a second analysis is not a new economic holdout.

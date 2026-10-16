@@ -2,10 +2,11 @@
 
 ## October 16, 2026 - opt-in fatal-ingress witnesses
 
-Formatting, all-target Clippy with warnings denied and **383 Rust tests** pass,
-with zero ignored tests (`rust-validation-4.log` in
-`output/r18-stream-recovery-20261016`). Three regressions cover pre-rejection
-CLOB clocks, Reference watermark resets and bounded sanitized error witnesses.
+Formatting, all-target Clippy with warnings denied and **385 Rust tests** pass,
+with zero ignored tests (`rust-validation-5.log` in
+`output/r18-stream-recovery-20261016`). Five regressions cover pre-rejection
+CLOB clocks, Reference watermark resets, bounded sanitized error witnesses and
+exact read-only level quantities with absent zero distinguished from unknown.
 The native replay fixture checks full-report noninterference after restoring only
 the explicitly disabled diagnostic selection fields.
 

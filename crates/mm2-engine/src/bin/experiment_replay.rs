@@ -122,7 +122,7 @@ fn book_summary(book: &domain::BookSnapshot) -> Value {
         "best_bid_micro":book.best_bid_micro,"best_ask_micro":book.best_ask_micro,
         "exchange_ms":book.exchange_ms,"observed_mono_ms":book.observed_mono_ms})
 }
-fn event_summary(event: &FeedEvent) -> Value {
+fn event_summary(event: &FeedEvent, core: &Core) -> Value {
     let outcome = |outcome: domain::Outcome| {
         if outcome == domain::Outcome::Up {
             "up"
@@ -144,6 +144,7 @@ fn event_summary(event: &FeedEvent) -> Value {
                 "best_ask_micro":asks.iter().map(|level|level.price_micro).min()})
         }
         FeedEvent::Delta {
+            condition_id,
             exchange_ms,
             observed_mono_ms,
             changes,
@@ -151,9 +152,15 @@ fn event_summary(event: &FeedEvent) -> Value {
         } => {
             json!({"kind":"delta","exchange_ms":exchange_ms,"observed_mono_ms":observed_mono_ms,"changes":changes.len(),
                 "invalid_price_changes":changes.iter().filter(|change|change.level.price_micro==0 || change.level.price_micro>=1_000_000).count(),
-                "first_changes":changes.iter().take(4).map(|change|json!({"outcome":outcome(change.outcome),
+                "first_changes":changes.iter().take(4).map(|change|{
+                    let current=core.level_quantity(condition_id,change.outcome,change.side,change.level.price_micro).ok();
+                    json!({"outcome":outcome(change.outcome),
                     "side":if change.side==domain::BookSide::Bid {"bid"} else {"ask"},
-                    "price_micro":change.level.price_micro,"quantity_micro":change.level.quantity_micro})).collect::<Vec<_>>()})
+                    "price_micro":change.level.price_micro,"quantity_micro":change.level.quantity_micro,
+                    "pre_error_current_level":current,
+                    "lookup_valid":current.is_some(),
+                    "proposed_quantity_matches_current":current.and_then(|level|level.quantity_micro).map(|quantity|quantity==change.level.quantity_micro)})
+                }).collect::<Vec<_>>()})
         }
         FeedEvent::Tick {
             outcome: side,
@@ -319,7 +326,7 @@ impl MarketState {
         };
         let pre_error = diagnostic.as_ref().filter(|d|d.log.has_room() && (d.preflight_fault || reference_fault)).map(|d| {
             let snapshot = self.core.snapshot();
-            json!({"admitted_event_index":d.admitted_event_index,"event":event_summary(&event),"pre_error_summary_available":true,
+            json!({"admitted_event_index":d.admitted_event_index,"event":event_summary(&event,&self.core),"pre_error_summary_available":true,
                 "accepted_clock_watermarks":self.core.feed_clock_context(&event),
                 "pre_error_books":{"up":book_summary(&snapshot.up_book),"down":book_summary(&snapshot.down_book)},
                 "pre_error_reference":snapshot.reference.as_ref().map(|r|json!({"exchange_ms":r.exchange_ms,"observed_mono_ms":r.observed_mono_ms,"price_micro":r.price_micro})),
@@ -1646,6 +1653,129 @@ mod tests {
             default.diagnostic_reference.is_none(),
             "default has no diagnostic cache maintenance"
         );
+    }
+    #[test]
+    fn ingress_diagnostic_observes_exact_levels_before_failure_and_keeps_unknown_distinct() {
+        let mut observed = quality_state();
+        let mut ordinary = quality_state();
+        let changes = vec![
+            (
+                domain::Outcome::Up,
+                domain::BookSide::Bid,
+                490_000,
+                10_000_000,
+            ),
+            (domain::Outcome::Up, domain::BookSide::Bid, 480_000, 0),
+            (
+                domain::Outcome::Up,
+                domain::BookSide::Ask,
+                510_000,
+                9_000_000,
+            ),
+            (
+                domain::Outcome::Down,
+                domain::BookSide::Ask,
+                520_000,
+                5_000_000,
+            ),
+            (
+                domain::Outcome::Down,
+                domain::BookSide::Bid,
+                480_000,
+                1_000_000,
+            ),
+        ];
+        let event = FeedEvent::Delta {
+            condition_id: observed.market.condition_id.clone(),
+            exchange_ms: 998,
+            observed_mono_ms: 2,
+            changes: changes
+                .into_iter()
+                .map(
+                    |(outcome, side, price_micro, quantity_micro)| domain::Change {
+                        outcome,
+                        side,
+                        level: domain::Level {
+                            price_micro,
+                            quantity_micro,
+                        },
+                    },
+                )
+                .collect(),
+        };
+        let origin = diagnostic_origin("clob");
+        let mut log = IngressDiagnostics::default();
+        assert!(!observed.apply_public_diagnostic(
+            event.clone(),
+            1002,
+            2,
+            Some(DiagnosticContext {
+                log: &mut log,
+                origin: &origin,
+                admitted_event_index: 0,
+                preflight_fault: true,
+            })
+        ));
+        assert!(!ordinary.apply_public(event, 1002, 2));
+        assert_eq!(observed.core.snapshot(), ordinary.core.snapshot());
+        assert_eq!(observed.fatal_ingress_errors, ordinary.fatal_ingress_errors);
+        let event = &log.witnesses[0]["context"]["event"];
+        assert_eq!(event["changes"], 5);
+        let levels = event["first_changes"].as_array().unwrap();
+        assert_eq!(levels.len(), 4);
+        for (index, quantity) in [10_000_000, 0, 10_000_000, 0].into_iter().enumerate() {
+            assert_eq!(
+                levels[index]["pre_error_current_level"]["quantity_micro"],
+                quantity
+            );
+            assert_eq!(levels[index]["lookup_valid"], true);
+        }
+        assert_eq!(levels[0]["proposed_quantity_matches_current"], true);
+        assert_eq!(levels[1]["proposed_quantity_matches_current"], true);
+        assert_eq!(levels[1]["pre_error_current_level"]["present"], false);
+        assert_eq!(levels[2]["proposed_quantity_matches_current"], false);
+        assert_eq!(levels[3]["proposed_quantity_matches_current"], false);
+        assert_eq!(levels[2]["side"], "ask");
+
+        let mut uninitialized = quality_state();
+        uninitialized.clear_native(false);
+        let snapshot = quality_snapshot(
+            &uninitialized.market.condition_id,
+            domain::Outcome::Up,
+            1000,
+            2,
+        );
+        assert!(uninitialized.apply_public(snapshot, 1000, 2));
+        let event = FeedEvent::Delta {
+            condition_id: uninitialized.market.condition_id.clone(),
+            exchange_ms: 1001,
+            observed_mono_ms: 3,
+            changes: vec![domain::Change {
+                outcome: domain::Outcome::Down,
+                side: domain::BookSide::Bid,
+                level: domain::Level {
+                    price_micro: 490_000,
+                    quantity_micro: 0,
+                },
+            }],
+        };
+        let mut log = IngressDiagnostics::default();
+        assert!(!uninitialized.apply_public_diagnostic(
+            event,
+            1003,
+            3,
+            Some(DiagnosticContext {
+                log: &mut log,
+                origin: &origin,
+                admitted_event_index: 0,
+                preflight_fault: true,
+            })
+        ));
+        let change = &log.witnesses[0]["context"]["event"]["first_changes"][0];
+        assert_eq!(change["lookup_valid"], true);
+        assert_eq!(change["pre_error_current_level"]["initialized"], false);
+        assert!(change["pre_error_current_level"]["quantity_micro"].is_null());
+        assert!(change["proposed_quantity_matches_current"].is_null());
     }
     #[test]
     fn ingress_diagnostic_caps_witnesses_and_suppresses_unrecognized_error_text() {
