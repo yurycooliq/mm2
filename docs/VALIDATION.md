@@ -653,3 +653,16 @@ container CI job also exercises real timeout and excessive-output workers with
 no network, credentials, source mounts or Docker socket inside the worker.
 Local verification passed all 18 patch-broker unit tests and both real Docker
 failure cases. Those workers were confirmed absent after cleanup.
+
+## Retained fee mismatch repair, 2026-10-16
+
+Independent review found that Reset plus duplicate receipt reconciliation could
+clear a finalized fee/role mismatch. A ledger-derived predicate now independently
+blocks actor admission and public readiness; Reset refuses retained mismatches,
+and duplicate evidence re-latches the fault. An actor regression exercises a
+nonzero fee, unexpected taker role and valid zero-fee maker control through Reset,
+Resume, repeated reconciliation and recovery of an older cleared-fault journal.
+Proofs and capital history remain unchanged. Isolated offline Rust verification
+passed formatting, all-target Clippy with warnings denied and all 120 live tests.
+GitHub Actions currently cannot start jobs because of an account billing/spending
+restriction; local verification is not represented as a successful hosted CI run.

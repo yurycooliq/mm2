@@ -62,3 +62,11 @@ a new path and compare replay before activation. After a new `fee_rules` record 
 older binaries do not understand the new operation; do not point an old image at that
 newer journal. Use the retained pre-deployment backup for an isolated investigation,
 not to discard newly committed executions or reset the capital pool.
+# Retained mismatch and owner controls
+
+A finalized nonzero maker fee or unexpected taker role remains an independent
+admission failure even if an older journal has cleared its mutable fault flag.
+Full quantity coverage does not imply fee agreement. Reset refuses this state;
+repeated reconciliation of the same proof re-latches the fault. Neither Reset nor
+replay deletes evidence, changes the capital history or authorizes more orders.
+Any remediation requires a separately reviewed accounting/reconciliation path.
