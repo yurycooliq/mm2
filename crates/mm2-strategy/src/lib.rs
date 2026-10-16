@@ -173,6 +173,7 @@ pub enum Gate {
     InventoryDust,
     InventoryCost,
     LossBudget,
+    DirectionalGuard,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,5 +477,79 @@ pub fn decide_inventory_aware(
     if decision.quotes.is_empty() {
         decision.reason = Gate::InventoryCost;
     }
+    Ok(decision)
+}
+
+/// Gross-loss bound includes both an unmatched residual and a losing complete set.
+/// Positive complete-set profit must not offset a later gross redemption loss.
+pub fn inventory_loss_bound(quantities: [u64; 2], costs: [u128; 2]) -> u128 {
+    let matched = quantities[0].min(quantities[1]);
+    let owned = usize::from(quantities[1] > quantities[0]);
+    let residual = if quantities[owned] == 0 {
+        0
+    } else {
+        let quantity = u128::from(quantities[owned]);
+        let difference = u128::from(quantities[owned] - matched);
+        (costs[owned] / quantity) * difference
+            + ((costs[owned] % quantity) * difference).div_ceil(quantity)
+    };
+    residual.max((costs[0] + costs[1]).saturating_sub(u128::from(matched) * u128::from(SCALE)))
+}
+
+/// Experimental public-paper policy. A passive complement may lock a bounded loss
+/// or overbuy to the venue minimum only when its full fill strictly lowers gross risk.
+/// Existing possible fills and global loss limits are checked separately by execution.
+pub fn decide_inventory_repair(
+    rules: &Rules,
+    input: &Input,
+    outcome_spent_pico: Option<[u128; 2]>,
+) -> Result<Decision> {
+    let original = decide_inventory_aware(rules, input, outcome_spent_pico)?;
+    let quantities = [input.inventory_up_micros, input.inventory_down_micros];
+    if quantities[0] == quantities[1] {
+        return Ok(original);
+    }
+    let mut decision = decide(rules, input)?;
+    if decision.reason != Gate::Quote {
+        return Ok(original);
+    }
+    let Some(costs) = outcome_spent_pico else {
+        return Ok(original);
+    };
+    let owned = usize::from(quantities[1] > quantities[0]);
+    let lagging = 1 - owned;
+    let remaining = quantities[owned].abs_diff(quantities[lagging]);
+    let quantity = remaining.max(input.min_order_micros);
+    let bid = [input.up, input.down][lagging].bid_micros.unwrap_or(0);
+    let price = bid / input.tick_micros * input.tick_micros;
+    if price < rules.min_price_micros
+        || quantity > MAX_QUANTITY
+        || u128::from(price) * u128::from(quantity)
+            > u128::from(input.available_cash_micros) * u128::from(SCALE)
+    {
+        return Ok(original);
+    }
+    let mut after = quantities;
+    after[lagging] = after[lagging]
+        .checked_add(quantity)
+        .ok_or("repair quantity overflow")?;
+    if after[lagging] > MAX_QUANTITY || after[0].abs_diff(after[1]) > rules.max_imbalance_micros {
+        return Ok(original);
+    }
+    let mut after_costs = costs;
+    after_costs[lagging] += u128::from(price) * u128::from(quantity);
+    if inventory_loss_bound(after, after_costs) >= inventory_loss_bound(quantities, costs) {
+        return Ok(original);
+    }
+    decision.quotes = vec![DesiredQuote {
+        slot: format!("{}:repair", if lagging == 0 { "up" } else { "down" }),
+        outcome: if lagging == 0 {
+            Outcome::Up
+        } else {
+            Outcome::Down
+        },
+        price_micros: price,
+        quantity_micros: quantity,
+    }];
     Ok(decision)
 }

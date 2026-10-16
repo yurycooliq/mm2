@@ -107,6 +107,17 @@ async fn actual_feed_tick_change_cancels_and_drains_before_durable_requote() {
             let target_tick = *tick_rx.borrow_and_update();
             let wall = runtime::wall_ms();
             let mono = runtime::mono_ms(start);
+            if feeds
+                .send(FeedEvent::Reference {
+                    exchange_ms: wall,
+                    observed_mono_ms: mono,
+                    price_micro: 80_000_000_000,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
             if target_tick != current_tick {
                 for outcome in [Outcome::Up, Outcome::Down] {
                     if feeds
