@@ -100,6 +100,11 @@ def atomic_write(path, contents, private=False):
 class AwsError(RuntimeError):
     pass
 
+PUBLIC_AWS_ERRORS = {"InvalidClientTokenId", "UnrecognizedClientException", "AccessDenied", "AccessDeniedException",
+                     "NoSuchEntity", "EntityAlreadyExists", "LimitExceeded", "ServiceFailure", "Throttling",
+                     "ThrottlingException", "RequestExpired", "ExpiredToken", "ExpiredTokenException",
+                     "InvalidAccessKeyId", "SignatureDoesNotMatch", "AWS_CLI_FAILED"}
+
 def aws(executable, arguments, env=None):
     child_env = dict(os.environ if env is None else env)
     for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"):
@@ -250,10 +255,19 @@ def main():
             parser.error("--provision requires --receipt (public metadata only)")
         provision(args)
 
-if __name__ == "__main__":
+def cli():
     try:
         main()
+        return 0
     except Exception as error:
         # No subprocess output, response bodies, credentials or locals in diagnostics.
-        print("MM2 credential setup failed: " + type(error).__name__ + ": " + str(error), file=sys.stderr)
-        raise SystemExit(1)
+        category = type(error).__name__
+        if isinstance(error, AwsError):
+            code = str(error)
+            category += ": " + (code if code in PUBLIC_AWS_ERRORS else "AWS_CLI_FAILED")
+        print("MM2 credential setup failed: " + category, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

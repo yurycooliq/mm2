@@ -1,4 +1,6 @@
 import importlib.util
+import configparser
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,28 @@ access = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(access)
 
 class ProfileMigrationTests(unittest.TestCase):
+    def test_cli_diagnostics_never_echo_config_source_or_runtime_values(self):
+        marker = "DISPOSABLE-TEST-SECRET-NOT-A-CREDENTIAL"
+        parsing = configparser.ParsingError("test.config")
+        parsing.append(2, "aws_secret_access_key = " + marker)
+        cases = [parsing, configparser.MissingSectionHeaderError("test.config", 1, marker),
+                 RuntimeError(marker), ValueError(marker), access.AwsError(marker)]
+        for error in cases:
+            with self.subTest(kind=type(error).__name__), mock.patch.object(access, "main", side_effect=error), \
+                    mock.patch.object(access.sys, "stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(access.cli(), 1)
+                self.assertNotIn(marker, stderr.getvalue())
+                self.assertIn("MM2 credential setup failed:", stderr.getvalue())
+
+    def test_cli_reports_only_bounded_aws_error_codes_and_success_status(self):
+        with mock.patch.object(access, "main", side_effect=access.AwsError("InvalidClientTokenId")), \
+                mock.patch.object(access.sys, "stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(access.cli(), 1)
+            self.assertIn("AwsError: InvalidClientTokenId", stderr.getvalue())
+        with mock.patch.object(access, "main"), mock.patch.object(access.sys, "stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(access.cli(), 0)
+            self.assertEqual(stderr.getvalue(), "")
+
     def temporary_directory(self):
         root = Path(__file__).resolve().parents[1] / "output" / "iam-access-tests"
         root.mkdir(parents=True, exist_ok=True)
