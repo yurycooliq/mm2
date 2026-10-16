@@ -36,9 +36,10 @@ observed remote disconnect has been eliminated.
 Peer close code 1013 is the registered "Try Again Later" signal
 ([IANA registry](https://www.iana.org/assignments/websocket#close-code-number)).
 Retries after that signal use increasing five/ten/twenty/thirty-second pauses,
-with up to one second of random jitter and a thirty-second total cap. A connected
-session must receive text and remain stable for thirty seconds before resetting
-the streak; a short unrelated failure cannot erase it. The recorded numeric retry
+with up to one second of random jitter and a thirty-second total cap. Resetting
+the streak requires a connection age of thirty seconds and at least one observed
+text frame, which can be a PONG; this is not evidence of fresh valid books. A short
+unrelated failure cannot erase the streak. The recorded numeric retry
 delay is the requested delay, clipped by the capture/market deadline. Every failed
 session still retains its gap and advances the source generation. This avoids
 aggressive retries; it cannot prevent a server from closing a healthy connection

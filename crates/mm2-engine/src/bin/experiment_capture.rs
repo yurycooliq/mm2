@@ -171,10 +171,12 @@ struct Capture {
 }
 impl Capture {
     fn emit(&mut self, input: tape::Input) -> bool {
-        if self.stop.is_some() {
+        let frame = matches!(input, tape::Input::Frame { .. });
+        // A receive task may wait behind another writer. Check admission while
+        // owning the writer lock; retain late Gap evidence and the final footer.
+        if self.stop.is_some() || (frame && Instant::now() >= self.deadline) {
             return false;
         }
-        let frame = matches!(input, tape::Input::Frame { .. });
         let gap = matches!(input, tape::Input::Gap { .. });
         if frame && self.frames >= self.max_frames {
             self.stop = Some("frame_budget".into());
@@ -200,6 +202,13 @@ impl Capture {
 type Shared = Arc<Mutex<Capture>>;
 fn emit(c: &Shared, input: tape::Input) -> bool {
     c.lock().unwrap().emit(input)
+}
+fn emit_frame(c: &Shared, input: tape::Input, deadline: tokio::time::Instant) -> bool {
+    let mut capture = c.lock().unwrap();
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    capture.emit(input)
 }
 async fn get(client: &reqwest::Client, url: &str) -> Result<Value, String> {
     let mut r = client
@@ -344,7 +353,7 @@ async fn socket(c: Shared, market: Option<Market>) -> Result<(), String> {
                             Some(Ok(Message::Text(text)))=>{
                                 if c.lock().unwrap().stopped() || wall() >= until || tokio::time::Instant::now() >= deadline {return Ok(());}
                                 let received=Instant::now();trace.last_text=Some(received);trace.text_frames+=1;
-                                if !emit(&c,tape::Input::Frame{feed:feed.into(),market_slug:slug.clone(),generation,text:text.to_string()}){return Ok(());}
+                                if !emit_frame(&c,tape::Input::Frame{feed:feed.into(),market_slug:slug.clone(),generation,text:text.to_string()},deadline){return Ok(());}
                                 trace.max_record_write_ms=trace.max_record_write_ms.max(millis(received.elapsed()));
                             },
                             Some(Ok(Message::Ping(payload)))=>{
@@ -626,6 +635,41 @@ mod tests {
             stop: None,
         }));
         (dir, c)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn locked_frame_admission_checks_capture_and_socket_cutoffs_but_retains_late_gaps() {
+        let frame = || tape::Input::Frame {
+            feed: "clob".into(),
+            market_slug: Some("controlled".into()),
+            generation: 0,
+            text: "PONG".into(),
+        };
+        let (_dir, expired_capture) = retry_capture();
+        expired_capture.lock().unwrap().deadline = Instant::now() - Duration::from_millis(1);
+        let future_socket = tokio::time::Instant::now() + Duration::from_secs(10);
+        assert!(!emit_frame(&expired_capture, frame(), future_socket));
+        assert!(!emit(&expired_capture, frame()));
+        assert!(emit(
+            &expired_capture,
+            tape::Input::Gap {
+                feed: "clob".into(),
+                market_slug: Some("controlled".into()),
+                reason: "controlled_late_gap".into(),
+            }
+        ));
+        assert_eq!(expired_capture.lock().unwrap().frames, 0);
+        assert_eq!(expired_capture.lock().unwrap().gaps, 1);
+
+        let (_dir, active_capture) = retry_capture();
+        let socket_cutoff = tokio::time::Instant::now() + Duration::from_millis(50);
+        assert!(emit_frame(&active_capture, frame(), socket_cutoff));
+        tokio::time::advance(Duration::from_millis(50)).await;
+        // The capture still has ample time; the independent market/socket
+        // cutoff alone rejects a task that reaches the writer lock too late.
+        assert!(!active_capture.lock().unwrap().stopped());
+        assert!(!emit_frame(&active_capture, frame(), socket_cutoff));
+        assert_eq!(active_capture.lock().unwrap().frames, 1);
     }
 
     #[tokio::test(start_paused = true)]
