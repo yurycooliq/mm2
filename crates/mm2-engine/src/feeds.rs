@@ -740,6 +740,10 @@ impl Recovery {
     pub fn ready(&self) -> bool {
         self.initialized.iter().all(|ready| *ready)
     }
+    /// Read-only research evidence; never resets or advances native filter state.
+    pub fn exchange_watermarks(&self) -> [u64; 2] {
+        self.latest_exchange
+    }
     fn advance_watermark(
         &mut self,
         index: usize,

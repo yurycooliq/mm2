@@ -1,5 +1,21 @@
 # Validation evidence
 
+## October 16, 2026 - finite local input recovery proof
+
+Formatting and all-target Clippy pass. **385 workspace tests and four local-proof
+tests** pass with zero ignored tests in the sequential accepted run
+`local-proof-validation-2.log` under `output/r18-stream-recovery-20261016`.
+The preceding parallel run retained two owner-control timeout failures; test
+assertions and time limits were unchanged for the accepted sequential run.
+
+The offline `local_recovery_proof` example binds exactly five original fault
+fixtures and checks native CLOB prestate, filter floors and strict recovery
+boundaries. It remains paused and performs no strategy, execution or PnL work.
+Cancellation, possible fills, financial invariants and production scheduling
+remain unvalidated by this input-only proof. A read-only filter-floor accessor
+does not change filtering or recovery. Actual fixture verdicts require the
+separate one-run receipt; old gaps, fatal inputs and quality failures remain.
+
 ## October 16, 2026 - opt-in fatal-ingress witnesses
 
 Formatting, all-target Clippy with warnings denied and **385 Rust tests** pass,

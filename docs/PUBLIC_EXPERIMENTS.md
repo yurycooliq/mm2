@@ -75,6 +75,14 @@ Diagnostic mode preserves execution and accounting, disables candidate selection
 and cannot promote a strategy or erase faults. Reuse the original frozen tape and
 plan with a new report path; a second analysis is not a new economic holdout.
 
+The research-only `local_recovery_proof` example consumes five fixed sparse
+fixtures from the retained capture. It reproduces CLOB prestate and strict
+rejection, then checks whether two actually observed native books exceed retained
+filter floors inside the existing freshness and close limits. It stays paused,
+preserves the old invalid verdict and tests no orders or financial state. Missing
+books or uncertain provenance remain failures or unknowns. Sparse fixtures retain
+original record hashes and are not a new complete capture chain.
+
 Freeze candidate parameters and retain their exact plan hash before collection.
 The plan declares complete chronological training markets, an embargo for final
 outcomes, later holdout markets, costs and minimum activity. Selection uses only
