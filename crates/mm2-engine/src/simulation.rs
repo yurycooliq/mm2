@@ -32,6 +32,12 @@ pub struct MultiMarketPaper {
 fn is_false(value: &bool) -> bool {
     !*value
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayProgress {
+    pub execution: mm2_emulator::ProgressDelta,
+    pub daily_loss_pico: u128,
+    pub drawdown_pico: u128,
+}
 impl Deref for MultiMarketPaper {
     type Target = PaperSession;
     fn deref(&self) -> &Self::Target {
@@ -76,6 +82,23 @@ impl MultiMarketPaper {
     }
     pub fn portfolio_snapshot(&self) -> mm2_portfolio::Snapshot {
         self.portfolio.snapshot()
+    }
+    /// Same predicate as scanning the full portfolio snapshot; a registered
+    /// zero-size market is still unresolved until it has a resolution receipt.
+    pub fn has_unresolved_position(&self, condition_id: &str) -> bool {
+        self.portfolio
+            .market(condition_id)
+            .is_some_and(|position| position.resolution.is_none())
+    }
+    /// Read-only replacement for replay's full before/after telemetry snapshots.
+    /// Every execution operation, validation and durable field remains unchanged.
+    pub fn replay_progress_since(&self, before: mm2_emulator::ProgressMark) -> ReplayProgress {
+        let (daily_loss_pico, drawdown_pico) = self.portfolio.realized_risk_totals_pico();
+        ReplayProgress {
+            execution: self.session.progress_since(before),
+            daily_loss_pico,
+            drawdown_pico,
+        }
     }
     pub fn telemetry_portfolio_snapshot(&self) -> mm2_portfolio::Snapshot {
         self.portfolio.compact_snapshot(64)
@@ -462,7 +485,7 @@ impl MultiMarketPaper {
     }
     fn sync_portfolio(&mut self) -> Result<(), String> {
         if let Some(market) = &self.current_market {
-            let account = self.session.snapshot().account;
+            let account = self.session.account_snapshot();
             if self.exact_execution_costs {
                 let costs = account
                     .outcome_spent_pico
@@ -1214,6 +1237,153 @@ mod tests {
         )
         .unwrap();
         paper
+    }
+    #[test]
+    fn replay_progress_matches_full_snapshots_across_partial_cancel_rollover_and_loss() {
+        fn checked(paper: &mut MultiMarketPaper, operation: Operation) -> ReplayProgress {
+            let before = paper.snapshot();
+            let mark = paper.progress_mark();
+            apply(paper, &operation).unwrap();
+            let after = paper.snapshot();
+            let portfolio = paper.portfolio_snapshot();
+            assert_eq!(paper.account_snapshot(), after.account);
+            for position in &portfolio.positions {
+                assert_eq!(
+                    paper.has_unresolved_position(&position.market.id),
+                    position.resolution.is_none()
+                );
+            }
+            assert!(!paper.has_unresolved_position("unregistered-condition"));
+            let mut expected = mm2_emulator::ProgressDelta {
+                causality_excluded_prints: after
+                    .venue_stats
+                    .causality_excluded_prints
+                    .saturating_sub(before.venue_stats.causality_excluded_prints),
+                ..mm2_emulator::ProgressDelta::default()
+            };
+            if after.audit_sequence >= before.audit_sequence {
+                for event in after.recent_audit.iter().filter(|event| {
+                    event.sequence > before.audit_sequence && event.kind == "venue_fill"
+                }) {
+                    expected.fill_events += 1;
+                    if after
+                        .venue_orders
+                        .iter()
+                        .any(|order| Some(order.id) == event.order_id && order.remaining_micros > 0)
+                    {
+                        expected.partial_fill_events += 1;
+                    }
+                }
+            }
+            let persisted = serde_json::to_value(&paper).unwrap();
+            let progress = paper.replay_progress_since(mark);
+            assert_eq!(progress.execution, expected);
+            assert_eq!(
+                progress.daily_loss_pico.to_string(),
+                portfolio.daily_loss_pico
+            );
+            assert_eq!(progress.drawdown_pico.to_string(), portfolio.drawdown_pico);
+            assert_eq!(serde_json::to_value(&paper).unwrap(), persisted);
+            progress
+        }
+        let mut paper = experimental_paper();
+        for (name, bid) in [("up", 490_000), ("down", 530_000)] {
+            checked(
+                &mut paper,
+                Operation::Book {
+                    now_ms: 0,
+                    outcome: name.into(),
+                    bid,
+                    ask: bid + 20_000,
+                    ahead_micros: 0,
+                },
+            );
+        }
+        checked(
+            &mut paper,
+            Operation::Quotes {
+                now_ms: 0,
+                quotes: from_core_quotes(&[lot(Outcome::Up, 490_000), lot(Outcome::Down, 530_000)]),
+            },
+        );
+        checked(&mut paper, Operation::Advance { now_ms: 100 });
+        let excluded = checked(
+            &mut paper,
+            Operation::ObservedTradeV3 {
+                now_ms: 100,
+                received_wall_ms: 1100,
+                exchange_event_mono_ms: 20,
+                exchange_ms: 1020,
+                outcome: "up".into(),
+                price_micros: 490_000,
+                quantity_micros: 2_000_000,
+                fingerprint: "b".repeat(64),
+            },
+        );
+        assert_eq!(excluded.execution.causality_excluded_prints, 1);
+        let partial = checked(
+            &mut paper,
+            Operation::Trade {
+                now_ms: 101,
+                outcome: "up".into(),
+                worst_price_micros: 490_000,
+                quantity_micros: 2_000_000,
+            },
+        );
+        assert_eq!(partial.execution.fill_events, 1);
+        assert_eq!(partial.execution.partial_fill_events, 1);
+        checked(&mut paper, Operation::Advance { now_ms: 200 });
+        let partial = checked(
+            &mut paper,
+            Operation::Trade {
+                now_ms: 201,
+                outcome: "down".into(),
+                worst_price_micros: 530_000,
+                quantity_micros: 1_000_000,
+            },
+        );
+        assert_eq!(partial.execution.partial_fill_events, 1);
+        checked(&mut paper, Operation::Advance { now_ms: 300 });
+        checked(&mut paper, Operation::CancelAll { now_ms: 300 });
+        checked(&mut paper, Operation::Advance { now_ms: 1000 });
+        let rollover = checked(
+            &mut paper,
+            Operation::Market {
+                condition_id: id('b'),
+                start_ms: Some(300_000),
+                end_ms: Some(600_000),
+            },
+        );
+        assert_eq!(rollover.execution, mm2_emulator::ProgressDelta::default());
+        assert_eq!(rollover.daily_loss_pico, 20_000_000_000);
+        let resolution = checked(
+            &mut paper,
+            Operation::DemoResolution {
+                condition_id: id('a'),
+                winning_outcome: "down".into(),
+                at_ms: 300_001,
+            },
+        );
+        assert_eq!(resolution.daily_loss_pico, 510_000_000_000);
+        assert_eq!(resolution.drawdown_pico, 510_000_000_000);
+        let next_day = checked(&mut paper, Operation::RiskWindow { at_ms: 86_400_000 });
+        assert_eq!(next_day.daily_loss_pico, 0);
+        assert_eq!(next_day.drawdown_pico, 510_000_000_000);
+        // Exercise bounded audit eviction without allocating order-history telemetry.
+        for now_ms in 1001..1301 {
+            checked(
+                &mut paper,
+                Operation::Book {
+                    now_ms,
+                    outcome: "up".into(),
+                    bid: 490_000,
+                    ask: 510_000,
+                    ahead_micros: 0,
+                },
+            );
+        }
+        assert!(paper.snapshot().audit_evicted > 0);
+        paper.validate().unwrap();
     }
     #[test]
     fn experimental_pair_never_falls_back_to_singleton() {

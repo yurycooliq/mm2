@@ -149,33 +149,15 @@ impl Run {
         }
     }
     fn apply(&mut self, op: Operation) -> bool {
-        let before = self.paper.snapshot();
+        let before = self.paper.progress_mark();
         match simulation::apply(&mut self.paper, &op) {
             Ok(()) => {
-                let after = self.paper.snapshot();
-                self.skipped_delayed_prints += after
-                    .venue_stats
-                    .causality_excluded_prints
-                    .saturating_sub(before.venue_stats.causality_excluded_prints);
-                if after.audit_sequence >= before.audit_sequence {
-                    for event in after.recent_audit.iter().filter(|event| {
-                        event.sequence > before.audit_sequence && event.kind == "venue_fill"
-                    }) {
-                        self.fill_events += 1;
-                        if after.venue_orders.iter().any(|order| {
-                            Some(order.id) == event.order_id && order.remaining_micros > 0
-                        }) {
-                            self.partial_fill_events += 1;
-                        }
-                    }
-                }
-                let portfolio = self.paper.portfolio_snapshot();
-                self.max_daily_gross_loss = self
-                    .max_daily_gross_loss
-                    .max(portfolio.daily_loss_pico.parse().unwrap_or(u128::MAX));
-                self.max_drawdown = self
-                    .max_drawdown
-                    .max(portfolio.drawdown_pico.parse().unwrap_or(u128::MAX));
+                let after = self.paper.replay_progress_since(before);
+                self.skipped_delayed_prints += after.execution.causality_excluded_prints;
+                self.fill_events += after.execution.fill_events;
+                self.partial_fill_events += after.execution.partial_fill_events;
+                self.max_daily_gross_loss = self.max_daily_gross_loss.max(after.daily_loss_pico);
+                self.max_drawdown = self.max_drawdown.max(after.drawdown_pico);
                 true
             }
             Err(e) => {
@@ -260,7 +242,7 @@ impl Run {
         self.apply(Operation::FeeRules {
             policy: fee.clone(),
         });
-        let account = self.paper.snapshot().account;
+        let account = self.paper.account_snapshot();
         let balanced = account.up_inventory_micros == account.down_inventory_micros;
         if balanced {
             self.inventory_since = None;
@@ -857,9 +839,9 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                     .as_ref()
                     .and_then(|slug| states.get(slug))
                     .is_some_and(|s| s.market.condition_id != evidence.target.condition_id)
-                    && run.paper.portfolio_snapshot().positions.iter().any(|p| {
-                        p.market.id == evidence.target.condition_id && p.resolution.is_none()
-                    })
+                    && run
+                        .paper
+                        .has_unresolved_position(&evidence.target.condition_id)
                 {
                     run.apply(Operation::PublicResolution {
                         evidence: evidence.clone(),

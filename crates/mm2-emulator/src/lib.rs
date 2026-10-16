@@ -144,6 +144,23 @@ pub struct SessionSnapshot {
     pub audit_evicted: u64,
     pub fault: Option<String>,
 }
+
+/// Read-only telemetry cursor; never serialized into execution state or used to
+/// change decisions. Capturing this mark does not clone orders or audit history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressMark {
+    audit_sequence: u64,
+    causality_excluded_prints: u64,
+}
+
+/// Exactly the fill/partial/cause counters derived from the corresponding full
+/// SessionSnapshot pair. A market reset retains the historical reset semantics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProgressDelta {
+    pub fill_events: u64,
+    pub partial_fill_events: u64,
+    pub causality_excluded_prints: u64,
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradeResult {
     pub input_quantity_micros: u64,
@@ -868,6 +885,46 @@ impl PaperSession {
         self.fault = Some(reason.to_string());
         self.core.halt(reason);
         Err(reason.into())
+    }
+    pub fn account_snapshot(&self) -> AccountSnapshot {
+        self.core.account_snapshot()
+    }
+    pub fn progress_mark(&self) -> ProgressMark {
+        ProgressMark {
+            audit_sequence: self.audit_sequence,
+            causality_excluded_prints: self.venue_stats.causality_excluded_prints,
+        }
+    }
+    pub fn progress_since(&self, before: ProgressMark) -> ProgressDelta {
+        let mut delta = ProgressDelta {
+            causality_excluded_prints: self
+                .venue_stats
+                .causality_excluded_prints
+                .saturating_sub(before.causality_excluded_prints),
+            ..ProgressDelta::default()
+        };
+        if self.audit_sequence > before.audit_sequence {
+            // The audit ring is bounded and unchanged. Reverse traversal avoids
+            // scanning old events on the common one-event/no-event operation.
+            for event in self
+                .audit
+                .iter()
+                .rev()
+                .take_while(|event| event.sequence > before.audit_sequence)
+            {
+                if event.kind == "venue_fill" {
+                    delta.fill_events += 1;
+                    if event
+                        .order_id
+                        .and_then(|id| self.venue.get(&id))
+                        .is_some_and(|order| !order.terminal && order.remaining_micros > 0)
+                    {
+                        delta.partial_fill_events += 1;
+                    }
+                }
+            }
+        }
+        delta
     }
     pub fn snapshot(&self) -> SessionSnapshot {
         let core = self.core.snapshot();

@@ -369,6 +369,11 @@ impl Portfolio {
     pub fn risk_clock_ms(&self) -> u64 {
         self.last_event_ms
     }
+    /// Raw read-only telemetry; avoids cloning every position and receipt just
+    /// to observe these two already-computed realized risk values.
+    pub fn realized_risk_totals_pico(&self) -> (u128, u128) {
+        (self.daily_loss_pico, self.drawdown_pico())
+    }
 
     /// Caller-supplied UTC, persisted by the execution actor before new risk.
     /// Advancing a day never releases reservations, old inventory or a latched halt.
