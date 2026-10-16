@@ -46,6 +46,8 @@ pub struct PreparedOrder {
     pub order_id: String,
     pub quote: LiveQuote,
     pub signed_wire: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_policy: Option<crate::fees::FeePolicy>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PostResult {
@@ -142,6 +144,8 @@ pub(crate) struct SdkVenue {
     market_cache: Mutex<BTreeMap<String, (u64, MarketResponse)>>,
     gamma_cache: Mutex<BTreeMap<String, (u64, GammaIdentity)>>,
     token_cache: Mutex<BTreeMap<String, (u64, ClobMarketInfoResponse)>>,
+    fee_cache: Mutex<BTreeMap<String, (u64, crate::fees::FeePolicy)>>,
+    fee_receipts: Mutex<BTreeMap<String, Vec<crate::fees::ExecutionFee>>>,
     chain: Option<crate::chain::DirectChain>,
 }
 const METADATA_TTL_MS: u64 = 1000;
@@ -306,11 +310,11 @@ pub(crate) fn maker_fee_bound(
     fee: &sdk::clob::types::response::FeeDetails,
     price_micros: u64,
 ) -> Result<u32, String> {
-    if fee.taker_only {
-        return Ok(0);
-    }
     if fee.rate.is_sign_negative() || fee.rate > Decimal::ONE || fee.exponent > 16 {
         return Err("unsupported V2 fee parameters".into());
+    }
+    if fee.taker_only {
+        return Ok(0);
     }
     let price = decimal(price_micros);
     let mut fee_per_share = fee.rate;
@@ -497,6 +501,8 @@ impl SdkVenue {
         };
         let client = auth.authenticate().await.map_err(map_error)?;
         let public_http = reqwest::Client::builder()
+            .user_agent("mm2-public-metadata/1.0")
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(settings.request_timeout_ms))
             .https_only(true)
             .build()
@@ -517,6 +523,8 @@ impl SdkVenue {
             market_cache: Mutex::new(BTreeMap::new()),
             gamma_cache: Mutex::new(BTreeMap::new()),
             token_cache: Mutex::new(BTreeMap::new()),
+            fee_cache: Mutex::new(BTreeMap::new()),
+            fee_receipts: Mutex::new(BTreeMap::new()),
             chain,
         }))
     }
@@ -670,6 +678,52 @@ impl SdkVenue {
         cache.insert(quote.condition_id.clone(), (now_ms(), info.clone()));
         Ok(info)
     }
+    async fn fee_policy(
+        &self,
+        quote: &LiveQuote,
+        gamma: &GammaIdentity,
+    ) -> Result<crate::fees::FeePolicy, String> {
+        if let Some((at, policy)) = self.fee_cache.lock().await.get(&quote.condition_id)
+            && now_ms().saturating_sub(*at) < METADATA_TTL_MS
+        {
+            return Ok(policy.clone());
+        }
+        let mut response = self
+            .public_http
+            .get(format!(
+                "{}/clob-markets/{}",
+                self.settings.clob_url, quote.condition_id
+            ))
+            .send()
+            .await
+            .map_err(|_| "public fee refresh failed")?
+            .error_for_status()
+            .map_err(|_| "public fee refresh rejected")?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| "public fee body failed")?
+        {
+            if body.len() + chunk.len() > 262_144 {
+                return Err("public fee response exceeds bound".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let raw: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| "invalid public fee response")?;
+        let policy = crate::fees::parse_policy(
+            &raw,
+            &quote.condition_id,
+            &gamma.tokens[0].to_string(),
+            &gamma.tokens[1].to_string(),
+            now_ms(),
+        )?;
+        let mut cache = self.fee_cache.lock().await;
+        prune_cache(&mut cache);
+        cache.insert(quote.condition_id.clone(), (now_ms(), policy.clone()));
+        Ok(policy)
+    }
     fn observation(
         &self,
         raw: sdk::clob::types::response::OpenOrderResponse,
@@ -701,6 +755,9 @@ impl SdkVenue {
 #[async_trait]
 impl Venue for SdkVenue {
     async fn prepare(&self, mut quote: LiveQuote) -> Result<PreparedOrder, String> {
+        if self.chain.is_none() {
+            return Err("finalized execution fee verification RPC is not configured".into());
+        }
         quote.validate(&self.settings, now_ms())?;
         let token = U256::from_str(&quote.token_id).map_err(|_| "invalid token identifier")?;
         if token.to_string() != quote.token_id {
@@ -722,6 +779,7 @@ impl Venue for SdkVenue {
             Outcome::Down => "Down",
         };
         validate_clob_market(&market, &gamma, &quote)?;
+        let fee_policy = self.fee_policy(&quote, &gamma).await?;
         if info.condition_id != condition
             || info.neg_risk
             || !info
@@ -791,6 +849,7 @@ impl Venue for SdkVenue {
             || payload.order.tokenId != token
             || payload.order.side != 0
             || payload.order.signatureType != self.settings.signature_type
+            || payload.order.builder != B256::ZERO
             || !commitment.is_multiple_of(1_000_000)
             || payload.order.makerAmount != U256::from(commitment / 1_000_000)
             || payload.order.takerAmount != U256::from(quote.quantity_micros)
@@ -829,6 +888,7 @@ impl Venue for SdkVenue {
             order_id,
             quote,
             signed_wire,
+            fee_policy: Some(fee_policy),
         })
     }
     async fn post(&self, prepared: PreparedOrder) -> Result<PostResult, String> {
@@ -914,6 +974,7 @@ impl Venue for SdkVenue {
         };
         let mut cursor = None;
         let mut seen = BTreeSet::new();
+        let mut fee_transactions = BTreeSet::new();
         for page_no in 0..8 {
             let page = self
                 .client
@@ -998,6 +1059,12 @@ impl Venue for SdkVenue {
                 {
                     return Err("trade exceeds authoritative cumulative order observation".into());
                 }
+                if relevant && trade.transaction_hash != B256::ZERO {
+                    fee_transactions.insert(format!("{:#x}", trade.transaction_hash));
+                    if fee_transactions.len() > 256 {
+                        return Err("execution fee transaction bound exceeded".into());
+                    }
+                }
             }
             if page.next_cursor == "LTE=" || page.next_cursor.is_empty() {
                 break;
@@ -1006,6 +1073,32 @@ impl Venue for SdkVenue {
                 return Err("trade pagination incomplete".into());
             }
             cursor = Some(page.next_cursor);
+        }
+        if let Some(chain) = &self.chain {
+            // Finalized proofs are immutable; cache them to avoid repeated RPC work.
+            let mut uncached = 0;
+            for hash in fee_transactions {
+                let cached = self.fee_receipts.lock().await.get(&hash).cloned();
+                let proofs = if let Some(proofs) = cached {
+                    Some(proofs)
+                } else if uncached < 8 {
+                    uncached += 1;
+                    chain.execution_fees(&hash, &tracked).await?
+                } else {
+                    None
+                };
+                if let Some(proofs) = proofs {
+                    let mut cache = self.fee_receipts.lock().await;
+                    if cache.len() >= 256 && !cache.contains_key(&hash) {
+                        return Err("finalized fee cache capacity exhausted".into());
+                    }
+                    cache.insert(hash, proofs.clone());
+                    result.execution_fees.extend(proofs);
+                    if result.execution_fees.len() > 1024 {
+                        return Err("execution fee proof bound exceeded".into());
+                    }
+                }
+            }
         }
         for offset in (0..512).step_by(128) {
             let req = PositionsRequest::builder()

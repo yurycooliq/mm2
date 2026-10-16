@@ -1,4 +1,5 @@
 import type { Command, CommandReply, Envelope, Log, Sample } from './types';
+import type { ComparisonPeriod, ComparisonSnapshot } from './comparisonModel';
 
 export class ApiError extends Error {
   constructor(public readonly status: number, public readonly kind: string, message: string) { super(message); }
@@ -23,6 +24,7 @@ export const api = {
   state: () => request<Envelope>('/api/state'),
   history: () => request<{ samples: Sample[] }>('/api/history?limit=120'),
   logs: () => request<{ logs: Log[] }>('/api/logs?limit=100'),
+  comparison: (period: ComparisonPeriod) => request<ComparisonSnapshot>(`/api/comparison?period=${period}`),
   localAuth: (token: string) => request('/api/auth/local', 'POST', { token }),
   telegramAuth: (init_data: string) => request('/api/auth/telegram', 'POST', { init_data }),
   logout: () => request('/api/logout', 'POST', {}),

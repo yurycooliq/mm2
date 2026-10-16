@@ -89,6 +89,17 @@ async fn actual_feed_tick_change_cancels_and_drains_before_durable_requote() {
         .unwrap();
 
     let (next_tick, mut tick_rx) = watch::channel(100u64);
+    handle.fee_policy(Some(
+        mm2_live::fees::parse_policy(
+            &serde_json::json!({"c":condition,
+        "t":[{"t":"1","o":"Up"},{"t":"2","o":"Down"}],"fd":{"r":0.07,"e":1,"to":true}}),
+            &condition,
+            "1",
+            "2",
+            wall,
+        )
+        .unwrap(),
+    ));
     // A single bounded producer preserves Tick -> Snapshot ordering for each outcome.
     let feeder = tokio::spawn(async move {
         let mut current_tick = 100;

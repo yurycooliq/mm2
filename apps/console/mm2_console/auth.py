@@ -67,7 +67,7 @@ class Sessions:
             self._replays[digest] = self.clock() + TELEGRAM_MAX_AGE + TELEGRAM_FUTURE_SKEW + 1
 
 
-def validate_telegram(init_data, bot_token, owner_id, now=None):
+def _telegram_identity(init_data, bot_token, owner_id, now=None):
     if not isinstance(bot_token, str) or not bot_token or type(owner_id) is not int or not 0 < owner_id < 2**52:
         raise ValueError("Telegram authentication is disabled")
     if not isinstance(init_data, str) or not 1 <= len(init_data.encode("utf-8")) <= 8192:
@@ -91,7 +91,7 @@ def validate_telegram(init_data, bot_token, owner_id, now=None):
     if not re.fullmatch(r"[1-9][0-9]{0,12}", auth_date):
         raise ValueError("invalid Telegram authentication date")
     age = (int(time.time()) if now is None else now) - int(auth_date)
-    if not -TELEGRAM_FUTURE_SKEW <= age <= TELEGRAM_MAX_AGE:
+    if age < -TELEGRAM_FUTURE_SKEW:
         raise ValueError("Telegram authentication expired")
     def unique_object(pairs):
         if len({key for key, _ in pairs}) != len(pairs):
@@ -101,7 +101,27 @@ def validate_telegram(init_data, bot_token, owner_id, now=None):
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite Telegram user")))
     if not isinstance(user, dict) or type(user.get("id")) is not int or user["id"] != owner_id or user.get("is_bot") is True:
         raise ValueError("Telegram user is not the configured owner")
+    return digest, age
+
+
+def validate_telegram(init_data, bot_token, owner_id, now=None):
+    digest, age = _telegram_identity(init_data, bot_token, owner_id, now)
+    if age > TELEGRAM_MAX_AGE:
+        raise ValueError("Telegram authentication expired")
     return digest
+
+
+def telegram_session(sessions, existing, init_data, bot_token, owner_id, now=None):
+    # Always validate signed identity, even with a cookie: a switched owner or
+    # tampered launch must revoke access at the caller. Old data can ONLY reuse
+    # its original still-live bound session, never mint or extend a new one.
+    digest, age = _telegram_identity(init_data, bot_token, owner_id, now)
+    if sessions.valid(existing, telegram_digest=digest):
+        return existing
+    if age > TELEGRAM_MAX_AGE:
+        raise ValueError("Telegram authentication expired; reopen the Mini App")
+    sessions.consume_telegram(digest)
+    return sessions.create(telegram_digest=digest)
 
 
 class RateLimiter:

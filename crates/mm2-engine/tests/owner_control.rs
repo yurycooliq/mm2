@@ -90,7 +90,22 @@ async fn market(service: &Service) -> Market {
         tick_micro: 10_000,
     };
     service.handle.select_market(market.clone()).await.unwrap();
+    fixture_fees(service, &market);
     market
+}
+fn fixture_fees(service: &Service, market: &Market) {
+    service.handle.fee_policy(Some(
+        mm2_live::fees::parse_policy(
+            &serde_json::json!({
+        "c":market.condition_id,"t":[{"t":"1","o":"Up"},{"t":"2","o":"Down"}],
+        "fd":{"r":0.07,"e":1,"to":true}}),
+            &market.condition_id,
+            "1",
+            "2",
+            runtime::wall_ms(),
+        )
+        .unwrap(),
+    ));
 }
 async fn snapshots(service: &Service, market: &Market, observed: u64) {
     for outcome in [Outcome::Up, Outcome::Down] {
@@ -343,6 +358,7 @@ async fn public_reset_waits_for_joined_source_refresh_even_when_old_socket_recei
         .select_market(selected.clone())
         .await
         .unwrap();
+    fixture_fees(&service, &selected);
     tokio::time::sleep(Duration::from_millis(5)).await;
     snapshots(&service, &selected, runtime::mono_ms(service.start)).await;
     wait(&service, "shadow_ready", true.into()).await;

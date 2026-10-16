@@ -1,6 +1,6 @@
 import { ApiError } from './api.js';
 
-export type OwnerAccess = 'authenticated' | 'local' | 'not_found' | 'unavailable';
+export type OwnerAccess = 'authenticated' | 'local' | 'not_found' | 'unavailable' | 'session_expired';
 type AuthenticationApi = { state: () => Promise<unknown>; telegramAuth: (initData: string) => Promise<unknown> };
 
 export async function ownerAccess(client: AuthenticationApi, readTelegram: () => Promise<string | null>): Promise<OwnerAccess> {

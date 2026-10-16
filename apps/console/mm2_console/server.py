@@ -8,7 +8,7 @@ from pathlib import Path
 import threading
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .auth import COOKIE, validate_telegram
+from .auth import COOKIE, telegram_session
 
 MAX_BODY = 16_384
 
@@ -181,12 +181,8 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         if not isinstance(body, dict) or set(body) != {"init_data"}:
                             raise ValueError("invalid Telegram authentication")
-                        digest = validate_telegram(body["init_data"], app.config.telegram_token, app.config.telegram_owner)
-                        if app.sessions.valid(existing, telegram_digest=digest):
-                            token = existing
-                        else:
-                            app.sessions.consume_telegram(digest)
-                            token = app.sessions.create(telegram_digest=digest)
+                        token = telegram_session(app.sessions, existing, body["init_data"],
+                                                 app.config.telegram_token, app.config.telegram_owner)
                     except ValueError:
                         # A switched Telegram account must not keep an earlier
                         # owner's cookie usable in a shared browser/WebView.
@@ -209,6 +205,10 @@ class Handler(BaseHTTPRequestHandler):
                 limit = int(query.get("limit", ["120"])[0])
                 if path == "/api/state" and self.command == "GET":
                     self._send(200, app.state())
+                elif path == "/api/comparison" and self.command == "GET":
+                    if set(query) - {"period"} or len(query.get("period", [])) > 1:
+                        raise ValueError("unsupported comparison query")
+                    self._send(200, app.comparison(query.get("period", ["1h"])[0]))
                 elif path == "/api/history" and self.command == "GET":
                     self._send(200, {"samples": app.store.history(limit)})
                 elif path == "/api/logs" and self.command == "GET":

@@ -1,5 +1,331 @@
 # Validation evidence
 
+## Automated maker fee evidence and live reconciliation: October 9, 2026
+
+Public quote readiness now requires strict current-market fee metadata, refreshed off
+the execution path every 30 seconds with a 90-second maximum age. Missing fields,
+wrong identities, unsupported protocol or nonzero maker schedules block new work.
+Accepted paper policies are durable replay inputs; legacy amounts remain unchanged.
+The authenticated adapter freezes its fee policy before submission and compares it
+with canonical finalized V2 `OrderFilled.fee` evidence. Unknown coverage stays null;
+pending new fills block quoting, and actual fee/role discrepancies retain the proof
+before faulting. Collections and receipt-query fanout remain bounded. See
+[the complete contract and limitations](FEE_RECONCILIATION.md).
+
+Local formatting, all-targets Clippy with `-D warnings` and **278 Rust workspace
+tests** passed, including **74 engine library tests**. Seven new regressions cover
+explicit missing/invalid fee fields, exact identity/expiry, canonical finality/reorgs,
+actual fee matching/idempotency/mismatch, malformed fill receipts, legacy financial
+replay and the public actor's fee gate. Existing integration fixtures now supply
+explicit synthetic fee evidence and continue testing Reset/source-generation fences,
+paper/live isolation and tick cancellation/draining.
+
+Local Python suites collected **499 tests**, with **25 platform/optional dependency
+skips** and no failures (console 118, data 21, latency 34, ops 148, research 178).
+All **55 Node tests** and the dashboard type check/production build passed. Final
+commit CI, exact-image integration and selected-host recovery/run receipts are stored
+with the deployment report; these local results alone do not establish those gates.
+
+No authenticated funded execution was performed. Fee comparison tests use synthetic
+receipt fixtures; the eligible account's real behavior remains an external gate.
+Zero verified maker exchange fees do not establish zero gas, rebates, infrastructure
+cost, executable open-position valuation, net profit, real PnL, ROI or a completed
+economic holdout. Older binaries cannot replay new fee operations; rollback must
+preserve the newer journal and use an isolated pre-deployment copy for investigation.
+
+## CLOB backpressure and durable trade batching: October 9, 2026
+
+The R2 public simulation on `b6a9646` stopped at 11:51:44 UTC with fatal
+`feed_queue_overflow source=clob`. Code review reproduced immediate failure on
+transient Full and valid native frames exceeding the queue's capacity. It also
+found per-trade full-state comparison/sync overhead and a relay that could hide
+shutdown while blocked. Exact frame size and disk latency at the AWS failure
+remain unknown. See [the detailed queue review](QUEUE_BACKPRESSURE_REVIEW.md).
+
+Fully validated CLOB frames now enter existing bounded queues in ordered chunks
+of at most 16, with one finite admission deadline, explicit pending/discarded
+suffix accounting and an independent fatal timeout signal. Reference coalescing
+is confined to Binance. Emulator actors drain up to 16 already queued inputs,
+validate ordered trade operations and sync one transaction before publishing
+candidate finances; small segments reduce the batch size. Funded/shadow actors
+retain one-event scheduling. The relay observes shutdown/fault during admission.
+
+The local workspace check passed **271 Rust tests**, including **72 engine
+library tests**, plus formatting and all-targets Clippy with `-D warnings`.
+Twelve new regressions cover 4096 ordered events through capacity 16, a real
+1024-event CLOB WebSocket frame, original clocks, permanent stalls, cancelled
+admission, relay fault/shutdown, isolated paper overflow, exact financial replay,
+duplicates, stale/future clocks, quota rejection, failed sync/poisoning and 1 KiB
+segments. The production-image build repeats the suite for its actual inputs.
+
+Local Python suites collected **498 tests** with **25 platform/optional dependency
+skips** and no failures (console 118, data 21, latency 34, ops 148, research 177).
+All **55 Node tests** passed (strategy parity 6, reference 19, dashboard 30), and
+dashboard type checking/production build passed. Dependency-complete Linux CI
+and exact-image integration are recorded with the final release evidence.
+
+This change preserves queue capacities, capital, owner receipts, strategy,
+journal/portfolio quotas and funded authorization. Source-boundary diagnostics
+are per-boot counters, not durable financial reconciliation. No new forward run,
+24-hour host acceptance, real PnL or economic holdout is established here.
+
+## Binance reference burst isolation: October 9, 2026
+
+The selected AWS simulation exited at 10:43:07 UTC with a fatal Binance
+`feed_queue_overflow`. The source sent every BTCUSDT trade through the same
+bounded queue as CLOB execution input. Binance supplies a latest reference
+price, so this diagnostic traffic could exhaust capacity needed by execution.
+
+The Binance reader now validates every trade and keeps one pending reference
+per socket, attempting delivery every 50 ms with missed ticks skipped. Full
+queues retain that slot; newer valid references replace it. Exchange/receive
+clocks remain original, regressions remain errors, and socket termination
+discards pending references before Disconnect. Recoverable Binance Disconnect
+admission waits only until the existing send deadline and remains interruptible
+by shutdown. CLOB whole-frame admission, ordering and fatal overflow behavior
+are unchanged. Per-boot counters expose coalescing, delivery, capacity pressure
+and discarded pending references.
+
+All **259 Rust workspace tests passed**, including **60 engine library tests**
+and six new regressions. The new checks cover 50,000 references against a full
+queue, an actual 4,096-message loopback WebSocket burst, original timestamps,
+regressions, closed consumers, socket cleanup, ordered Disconnect admission,
+its finite deadline and shutdown priority. Workspace formatting and
+all-targets Clippy with `-D warnings` passed. The local production build forces
+engine recompilation using source mtimes only, as required by the earlier
+shared-cache incident below.
+
+Final-head Rust/release, Python, parity, frontend and container jobs in
+[PR 5](https://github.com/yurycooliq/mm2/pull/5), exact-image smoke checks and
+separate stopped-ledger recovery receipts establish release acceptance. These
+tests do not establish a continuous 24-hour run or economic profitability.
+The failed forward session remains a failed, partial technical acceptance;
+restarting with a preserved ledger begins a separate observation period.
+
+## Established WebSocket recovery: October 8, 2026
+
+After its earlier successful 16-minute public-feed simulation, the retained
+`144143f` preview exited while paused at 19:01:33 UTC: native CLOB diagnostics
+reported `invalid_websocket_protocol`, fatal, exit code 1, OOM false. The
+preterminal cached sample did not contain that later fault; it is not a terminal
+receipt or proof of continued health. Bounded native logs and a byte-hashed
+stopped backup preserve this event. Its exact protocol subtype is unknown.
+
+The established-socket reader previously treated every tungstenite protocol
+error as fatal, including `ResetWithoutClosingHandshake`, which denotes a lost
+connection without the closing handshake ([pinned upstream contract](https://docs.rs/tungstenite/0.28.0/tungstenite/error/enum.ProtocolError.html#variant.ResetWithoutClosingHandshake)).
+Only that variant now takes the existing recoverable transport path: mandatory
+Disconnect admission, backoff, REST cutoffs and new native snapshots for both
+outcomes. Other protocol violations, capacity violations, malformed data and
+failed disconnect admission remain fatal. Static protocol categories preserve
+diagnostic detail without formatting headers, payloads or nested exceptions.
+This fixes a reproduced classification defect; it does not prove the subtype
+or cause of the earlier production or local event.
+
+Controlled loopback TCP FIN reproduces the old fatal classification. Three
+new real-wire regressions check reconnect with cleared books and no intents
+until both fresh books arrive, invalid opcode remaining fatal, and full/closed
+Disconnect admission preserving the first fault. All 17 transport checks and
+93 engine checks pass. Workspace formatting and engine all-target Clippy with
+`-D warnings` pass; final-head CI is required before acceptance. An earlier bare socket-drop assertion was
+ambiguous because unread data can produce a TCP reset instead of an EOF; it
+does not establish the classification reproduction.
+
+Virtual before/after testing exposed a stale Cargo artifact in the local shared
+BuildKit target cache. A forced recompilation corrected the test builder; final
+local image acceptance must force recompilation of the mm2-engine package and
+verify new test counts, release compilation, exact revision labels and actual
+runtime behavior. Cargo clean refused the shared target without a valid cache
+directory marker; no files were deleted or guard bypassed. A one-use local copy
+of the production Dockerfile touches the engine source before its unchanged
+test/release command. That changes build freshness only. No engine journal or
+capital reset is part of that build-cache operation.
+
+Both push and PR CI for the earlier `81028a0` history candidate passed 803
+automated checks without skips (250 Rust, 498 Python, 30 dashboard, 19 reference,
+6 parity) plus 14 container checks and zero live orders
+([push](https://github.com/yurycooliq/mm2/actions/runs/37829183818),
+[PR](https://github.com/yurycooliq/mm2/actions/runs/37829189473)). Final-head
+checks in [PR 5](https://github.com/yurycooliq/mm2/pull/5) must independently
+establish this subsequent WebSocket candidate. AWS rollout, real Telegram,
+continuous host capacity and economic/funded acceptance remain separate gates.
+
+## Restarted simulation action history: October 8, 2026, 19:04 UTC
+
+Actual-container acceptance on `144143f` first passed the desktop/mobile
+comparison, but refreshing after engine restore lost the current audit list.
+The synthetic portfolio and durable command receipts were preserved. This was
+a reporting defect, not evidence that the capital journal was lost.
+
+The console now captures a bounded sanitized action projection before raw-state
+compaction, in its existing secondary SQLite store. Reads merge that retained
+projection with the current ring without writing, issuing commands or parsing
+the primary journal. Recovered paused snapshots with no active simulation can
+still select a source-qualified retained history. Limits, sampling gaps,
+API-tail omissions, boot uncertainty and generation changes remain visible;
+actions/financial completeness remain false. A published directory locator is
+not an authenticated account or globally unique financial ledger identity.
+
+Repeated independent review reproduced and fixed an audit-sequence rollback
+mixing old/new generations and a logical-time event being relabeled as a new
+observation on every read. Existing IDs keep the first observation clock before
+period filtering; evicted observations do not resurrect. Reset epochs separate
+sources. Legacy backfill is restricted to validated current boot/profile/locator/
+epoch because legacy samples do not prove their configured observer endpoint.
+Published u64 counters retain exact text values instead of overflowing SQLite
+signed integers. Missing or compacted old data cannot establish past actions.
+
+The frozen console suite passes 118 checks, including 12 action-history
+regressions; dashboard 30 checks and its production build pass. The earlier
+exact `144143f` push and PR CI both passed 250 Rust, 486 Python, 29 dashboard,
+19 reference and 6 parity checks, plus 14 real-container smoke checks and zero
+live orders ([push run](https://github.com/yurycooliq/mm2/actions/runs/37822689889),
+[PR run](https://github.com/yurycooliq/mm2/actions/runs/37822695840)). Those are
+dated earlier-candidate receipts. Final-head checks in [PR 5](https://github.com/yurycooliq/mm2/pull/5)
+and the separate final exact-image restart/browser receipts must establish this
+new history candidate. No AWS rollout or economic/funded result follows from
+these local checks.
+
+## Simulation/comparison preparation: October 8, 2026, 18:10 UTC
+
+The owner console now has separate MM2 simulation and mo-money public-observation
+lanes, exact decimal values, source clocks, selected-period aggregates, recent
+actions, positions, sampled NAV continuity and a complete sanitized JSON export.
+Incomplete public accounting and bounded synthetic audit remain explicit;
+neither turnover nor sampled NAV is claimed as authenticated bot profit.
+Separate optional panels now show cumulative synthetic closed-position results
+and the venue's cumulative public wallet estimates. Actual selected point
+endpoints and daily source fidelity remain explicit; net selected-period PnL
+and full public financial completeness remain unknown.
+
+An actual read-only v2 capture covered October 7 18:05:05 through October 8
+18:05:05 UTC: 4,353 normalized events, 11 public GET requests, 3,808,703 received
+bytes. Activity pagination completed, while financial completeness and MM2
+attribution remain false. Observer ID:
+`aa614e28bb095effded2d2f9f6674edec272a7742a5d07a20c1e3ee7c8110c1e`.
+The optional public PnL source was available and its exact response/receipt was
+retained. This capture records a working-tree source revision; final images and
+the final-head CI must establish the committed candidate independently.
+The new dedicated comparison cache retains two verified hot copies plus
+immutable daily rolling-window checkpoints, with explicit gaps and finite
+quotas. Existing research archives and engine state were not pruned.
+
+Deterministic engine tests reproduced timer starvation when durable periodic
+work exceeds 100 ms. Overrun recovery now gives ready feeds an intake interval,
+preserving durable writes and control/fault priority. Disconnection enqueue
+failures retain overflow/closed classifications and the first fatal cause.
+These reproductions do not establish the cause of historical AWS restarts.
+
+Local Windows validation plus targeted final-review regressions: 486 Python
+checks, 461 passed and 25 platform/dependency skips (console 106, data 21,
+latency 34, operations 148, research 177). The six new
+engine regression checks passed with 90 engine tests, formatting and targeted
+Clippy. Dashboard 29 checks, production build, rendered fixture desktop/mobile
+interaction and exact JSON-download parity passed. Full locked Rust/workspace,
+Python Linux, parity/reference, new exact-image container acceptance and final
+independent image/host acceptance remain required for this candidate; use final-head PR checks
+for authoritative full-suite results.
+
+Repeated integration review found and fixed chart connections across gaps over
+120 seconds, boot-identity omission from NAV continuity, and dropped v2 TIP/open
+position scope warnings. Requested-feed completeness is now distinguished from
+all wallet activity. Legacy samples without known boot identity cannot establish
+a continuous gain or connecting chart line; current samples from separate boots
+never join.
+Final review reproduced extreme optional PnL decimal overflow and silent
+underflow. Both now yield an invalid optional source with null amounts while
+valid activity still publishes. The regression verifies the full evidence chain;
+the saved real provider response retains its exact values.
+The primary screen also exposes sampled engine/simulation/live faults and
+warning/critical/full journal capacity without expanding diagnostics. Rendered
+desktop/mobile fault and capacity fixtures passed with no control submissions.
+Actual isolated collector acceptance on `d5e48f2`: UID 10002, read-only root,
+no execution credentials/network, 0.5 CPU/192 MiB, 4,370 events and 393 OPEN
+positions, ten public GETs and 3,807,128 received bytes. Cold publication took
+20.791 seconds; independent verification finished at 21.586 seconds. Peak
+process RSS was 125,060 KiB and OOM was false. Observer/view/current identities,
+source revision and v2 scope warnings were verified; financial completeness
+remained false. At 0.1 CPU the preceding cold test did not finish publication
+by 90 seconds; its partial public evidence was preserved. Only new labeled
+test containers/network/volumes were removed. This does not establish AWS
+performance, long retention or continuous engine capacity.
+
+AWS STS was verified expired on October 8. Ordinary console sign-in now loads in
+the owner's browser; human authentication is pending. No candidate rollout,
+real Telegram acceptance, cloud certificate trust or funded order occurred.
+The historical checkpoints below retain their original dates and scope.
+
+## Owner-directed preparation checkpoint: October 8, 2026 (Lisbon)
+
+Windows research publication reproduced two transient directory-rename denials
+on the unchanged `cd51558` candidate. Diagnostic-only retries of the same verified
+staging directories succeeded after 62/63 ms with unchanged manifests. The lock
+holder was not identified. Publication now retries only WinError 5 with an absent
+destination and verified unchanged staging data, at most four rename attempts
+with 50/150/300 ms delays. Permanent denial, corrupted staging, conflicting
+publication and mutation during backoff still fail and retain staging evidence.
+There is no archive deletion or retry of collection, journal writes or requests.
+
+The final local Windows research suite ran 144 tests: 143 passed, one Linux-only
+skip. Five new cross-platform fault-injection checks cover these failure modes.
+The report generator now includes an allowlisted AWS preflight snapshot and
+timestamps/ages in both views. It prioritizes restoring failed research access
+without calling that failure an engine outage; historical diagnostics are never
+labeled fresh. All 10 report tests passed locally, including three new access,
+future-time and historical-age regression checks.
+The current Python suite contains 422 checks: console 80, data 21, latency 34,
+ops 140, research 147. Full Linux results for the latest candidate must be read
+from [PR 5](https://github.com/yurycooliq/mm2/pull/5), rather than inferred from
+the local Windows result. The preceding exact `cd51558` CI completed successfully:
+244 Rust tests plus format/Clippy/release build, 414 Python tests without skips,
+16 dashboard tests/build, 19 reference checks, 6 parity checks, 14 container smoke
+checks and zero live orders ([run 37549266326](https://github.com/yurycooliq/mm2/actions/runs/37549266326)).
+
+The separately authorized local MM2 CA and worker certificate are now enrolled
+in the current user's Windows certificate store. RSA-3072/SHA256 software CNG
+keys have nonexportable policies; this is not TPM evidence. Public chain and
+official helper 1.8.5 signature verification passed. No cloud trust or machine
+profile is enabled. October 8 STS reports the human session expired; two renewed
+login flows returned browser 400 as reported by the owner. Latest server health
+therefore remains unverified, and October 6 snapshots below remain dated evidence.
+Independent review, paused rollout, real Telegram acceptance, machine access
+renewal/revocation and financial/venue acceptance remain pending.
+
+## Owner-directed recovery checkpoint: October 7, 2026 (Lisbon)
+
+The recovery candidate addresses Telegram launch-data expiry with a live bound
+session, missing cost declarations, per-window diagnostic context and control
+reporting. Queue overflow and a closed consumer now have distinct fixed diagnostic
+codes; queue size, whole-frame reservation, fault latching and stopping behavior
+are unchanged. This diagnostic change does not claim to fix production restarts.
+
+Verified application revision at this checkpoint:
+`458764d2aaa99b1a568e10c86b3bc329ef4b1117`, based on `66ec7df`.
+Subsequent documentation/guard changes do not replace exact-revision CI evidence.
+See [draft PR 5](https://github.com/yurycooliq/mm2/pull/5) for final-head check status.
+
+| Check | Confirmed scope |
+| --- | --- |
+| Python CI | 414 passed: console 80, data 21, latency 34, ops 140, research 139. Pinned Python 3.13; root-required atomic-runtime fixtures executed in CI. |
+| Offline isolation | 359 candidate tests: 348 passed, 11 root-only skips. Separately mounted unchanged baseline: 128 passed. Real network/source-write/home/credentials/Docker-socket denial probes passed. This is owner-directed validation, not an independent broker receipt. |
+| Dashboard and parity | Dashboard 16 tests and production build passed; 19 reference and 6 strategy parity checks passed in CI. |
+| Rendered UI | Local Playwright API fixtures, desktop 1280×800 and mobile 390×844: expiry/reopen rendering, no relevant browser errors or width overflow, pending identity preserved, zero control/limits submissions. Not real Telegram acceptance. |
+| AWS preparation | Read-only STS/access preflight verified after authorized human login. Disabled Roles Anywhere/SSM template passed AWS validate-template and cfn-lint 1.57.1; cfn-guard 3.2.1 checks default-disabled state, bounded sessions, exact transport actions/resources and certificate/anchor identity. No resources deployed. |
+| Rust and containers | Locked workspace format/Clippy/tests/release and real container smoke remain required; final-head CI runs and their individual receipts in PR 5 are the authority. Do not infer these results from Python or UI passes. |
+
+Production remained `e294475`, simulation paused, at the 23:50:10 UTC October 6
+read-only snapshot. Both public feeds were streaming, `live_eligible=false` and
+venue host geoblock reported `blocked=true` (IE/L). Bounded diagnosis observed
+NRestarts 19 then 20 and fatal Binance `feed_queue_unavailable` rows; legacy codes
+cannot distinguish overflow from closed consumer or establish historical causality.
+
+Windows archive publication WinError 5 remains unresolved. Independent final-head
+review, paused rollout/state preservation, real Telegram Desktop long-session
+acceptance, machine certificate enrollment/renewal/revocation, venue eligibility,
+full authenticated MM2 attribution/accounting, economic holdout and funded canary
+remain separate gates. No automatic merge, state reset, approvals or trading
+activation occurred. Prior checkpoints below remain dated historical evidence.
+
 ## Current checkpoint: October 6, 2026 — Builder Relayer and existing CLOB setup
 
 The Relayer now accepts exactly one complete owner key/address pair or Builder
@@ -327,3 +653,16 @@ container CI job also exercises real timeout and excessive-output workers with
 no network, credentials, source mounts or Docker socket inside the worker.
 Local verification passed all 18 patch-broker unit tests and both real Docker
 failure cases. Those workers were confirmed absent after cleanup.
+
+## Retained fee mismatch repair, 2026-10-16
+
+Independent review found that Reset plus duplicate receipt reconciliation could
+clear a finalized fee/role mismatch. A ledger-derived predicate now independently
+blocks actor admission and public readiness; Reset refuses retained mismatches,
+and duplicate evidence re-latches the fault. An actor regression exercises a
+nonzero fee, unexpected taker role and valid zero-fee maker control through Reset,
+Resume, repeated reconciliation and recovery of an older cleared-fault journal.
+Proofs and capital history remain unchanged. Isolated offline Rust verification
+passed formatting, all-target Clippy with warnings denied and all 120 live tests.
+GitHub Actions currently cannot start jobs because of an account billing/spending
+restriction; local verification is not represented as a successful hosted CI run.

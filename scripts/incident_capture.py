@@ -44,7 +44,7 @@ SAFE_CODES = {
     "native_snapshot_bootstrap_timeout": "source_bootstrap",
     **{key: "transport" for key in ("connect_unavailable", "rest_book_unavailable", "receive_timeout",
         "transport_disconnected", "transport_send_failed", "transport_unavailable")},
-    **{key: "source_input" for key in ("feed_queue_unavailable", "input_capacity_exceeded",
+    **{key: "source_input" for key in ("feed_queue_unavailable", "feed_queue_overflow", "feed_backpressure_timeout", "feed_consumer_closed", "input_capacity_exceeded",
         "invalid_websocket_protocol", "invalid_public_input", "invalid_tick_input",
         "invalid_exchange_clock", "invalid_market_identity", "invalid_book_input", "source_fault")},
     "durability_fault": "durability", "capacity_fault": "durability",
@@ -84,6 +84,11 @@ def classify(message: str) -> str:
 
 def diagnostic_message(raw: str) -> str:
     """Only fixed diagnostic codes leave the host; arbitrary log text is quarantined."""
+    # Export/report layers may project an already sanitized incident again.
+    # Preserve only this exact fixed-code grammar, never append arbitrary text.
+    fixed = re.fullmatch(r"diagnostic_code=([a-z_]+)(?: source=(clob|binance))?(?: fatal=(true|false))?", raw)
+    if fixed and fixed.group(1) in SAFE_CODES:
+        return raw
     start = raw.find("{")
     if start >= 0:
         try:

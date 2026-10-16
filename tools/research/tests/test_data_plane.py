@@ -124,6 +124,33 @@ class ExactSchemaTests(unittest.TestCase):
 
 
 class AccountingTests(unittest.TestCase):
+    def test_unknown_bound_differs_from_explicit_zero_and_preserves_known_subtotal(self):
+        known = event("known", "0", amounts={"cost_bound_pico": "123"})
+        unknown = event("unknown", "0")
+        result = calculate([known, unknown], snapshot(), snapshot(at=END))
+        self.assertEqual(result["components"]["observed_cost_bound_pico"], "123")
+        self.assertIsNone(result["components"]["conservative_cost_bound_pico"])
+        self.assertEqual(result["components"]["cost_evidence_coverage"]["missing_cost_bound"], 1)
+        # Full NAV accounting remains valid independently of cost decomposition.
+        self.assertEqual(result["net_pnl_pico"], "0")
+        unknown["amounts"]["cost_bound_pico"] = "0"
+        self.assertEqual(calculate([known, unknown], snapshot(), snapshot(at=END))["components"]["conservative_cost_bound_pico"], "123")
+
+    def test_empty_partial_window_has_unknown_bound_not_free_execution(self):
+        result = calculate([], None, snapshot(at=END), quality("PARTIAL"))
+        self.assertEqual(result["components"]["observed_cost_bound_pico"], "0")
+        for name in ("conservative_cost_bound_pico", "actual_cost_total_pico", "actual_fees_total_pico"):
+            self.assertIsNone(result["components"][name])
+        self.assertEqual(calculate([], snapshot(), snapshot(at=END))["components"]["conservative_cost_bound_pico"], "0")
+
+    def test_closeout_unknown_cost_applicability_keeps_complete_bound_unknown(self):
+        events = [event("trade", "0", amounts={"cost_bound_pico": "100"}), event("closeout", "0", kind="MERGE")]
+        result = calculate(events, snapshot(), snapshot(at=END))
+        self.assertIsNone(result["components"]["conservative_cost_bound_pico"])
+        self.assertEqual(result["components"]["cost_evidence_coverage"]["cost_bound_records"], 2)
+        self.assertIsNone(result["components"]["actual_cost_total_pico"])
+        self.assertIsNone(result["components"]["actual_fees_total_pico"])
+
     def test_fee_inclusive_cash_not_charged_twice_and_reservation_not_loss(self):
         opening = snapshot()
         opening["reserved_pico"] = amount("4.5")
@@ -258,6 +285,18 @@ class AccountingTests(unittest.TestCase):
 
 
 class ObserverTests(unittest.TestCase):
+    def test_cosmetic_public_title_does_not_change_financial_event_identity(self):
+        first = activity(1)
+        first["title"] = "Bitcoin Up or Down"
+        second = deepcopy(first)
+        second["title"] = "Updated public market title"
+        one = observe_account(FixtureAPI([first]), {"account_id": ACCOUNT}, epoch_utc(1), epoch_utc(2))
+        two = observe_account(FixtureAPI([second]), {"account_id": ACCOUNT}, epoch_utc(1), epoch_utc(2))
+        self.assertEqual(one["events"], two["events"])
+        self.assertEqual(one["activity_rows"][0]["display_title"], first["title"])
+        self.assertEqual(two["activity_rows"][0]["display_title"], second["title"])
+        self.assertNotIn("title", one["activity_rows"][0]["row"])
+
     def test_activity_half_open_dense_windows_split_and_keep_multiplicity(self):
         rows = [activity(second, second * 10 + i) for second in (1, 2, 3) for i in (0, 1)]
         api = FixtureAPI(rows)
@@ -362,6 +401,80 @@ class ObserverTests(unittest.TestCase):
 
 
 class ArchiveComparisonTests(unittest.TestCase):
+    @staticmethod
+    def windows_access_denied():
+        error = PermissionError("simulated Windows rename access denied")
+        error.winerror = 5
+        return error
+
+    def test_transient_windows_rename_reuses_verified_staging_without_rewriting(self):
+        original = archive.os.rename
+        calls = []
+        def transient(source, target):
+            calls.append((source, target))
+            if len(calls) == 1:
+                raise self.windows_access_denied()
+            return original(source, target)
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            with patch.object(archive.os, "rename", side_effect=transient), patch.object(archive.time, "sleep") as sleep:
+                bundle = publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                    utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(calls[0], calls[1])
+            sleep.assert_called_once_with(0.05)
+            self.assertEqual(verify_bundle(bundle)["bundle_id"], bundle.name)
+            self.assertEqual(len(list(Path(temp).iterdir())), 1)
+
+    def test_permanent_windows_denial_is_bounded_and_retains_verified_staging(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            with patch.object(archive.os, "rename", side_effect=self.windows_access_denied()) as rename, patch.object(archive.time, "sleep") as sleep:
+                with self.assertRaises(PermissionError):
+                    publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                        utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(rename.call_count, 4)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.05, 0.15, 0.3])
+            staging = list(Path(temp).glob("publishing-*"))
+            self.assertEqual(len(staging), 1)
+            verify_bundle(staging[0])
+            self.assertEqual(len(list(Path(temp).iterdir())), 1)
+
+    def test_changed_staging_after_windows_denial_cannot_publish(self):
+        def corrupt(source, target):
+            (source / "events.jsonl").write_bytes(b"{}\n")
+            raise self.windows_access_denied()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            with patch.object(archive.os, "rename", side_effect=corrupt) as rename, patch.object(archive.time, "sleep") as sleep:
+                with self.assertRaises(ResearchError):
+                    publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                        utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(rename.call_count, 1)
+            sleep.assert_not_called()
+            self.assertEqual(len(list(Path(temp).glob("publishing-*"))), 1)
+
+    def test_windows_denial_with_conflicting_destination_never_retries_or_adopts(self):
+        def conflict(source, target):
+            shutil.copytree(source, target)
+            (target / "events.jsonl").write_bytes(b"{}\n")
+            raise self.windows_access_denied()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            with patch.object(archive.os, "rename", side_effect=conflict) as rename, patch.object(archive.time, "sleep") as sleep:
+                with self.assertRaises(ResearchError):
+                    publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                        utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(rename.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_staging_mutation_during_windows_backoff_is_rejected_before_next_rename(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            def mutate_during_backoff(_):
+                staging = next(Path(temp).glob("publishing-*"))
+                (staging / "events.jsonl").write_bytes(b"{}\n")
+            with patch.object(archive.os, "rename", side_effect=self.windows_access_denied()) as rename, patch.object(archive.time, "sleep", side_effect=mutate_during_backoff):
+                with self.assertRaises(ResearchError):
+                    publish_bundle(temp, {"events.jsonl": []}, scope=SCOPE,
+                        utc_range=RANGE, quality=COMPLETE, created_at_utc=END)
+            self.assertEqual(rename.call_count, 1)
+            self.assertEqual(len(list(Path(temp).glob("publishing-*"))), 1)
+
     def test_bundle_integrity_idempotency_and_no_path_escape(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
             args = {"scope": SCOPE, "utc_range": RANGE, "quality": COMPLETE, "created_at_utc": END}

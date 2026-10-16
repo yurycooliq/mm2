@@ -225,6 +225,165 @@ fn receipt(p: &PreparedChainTransaction) -> ChainReceipt {
         sponsored_gas_cost_wei: None,
     }
 }
+
+#[tokio::test]
+async fn retained_fee_mismatch_blocks_reset_resume_reconciliation_and_recovery() {
+    for (fee, taker) in [(123, false), (0, true), (0, false)] {
+        let mismatch = fee != 0 || taker;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _, prepared) = fixture(dir.path()).await;
+        let now = now_ms();
+        let order_id = format!("0x{}", "e".repeat(64));
+        let mut next = actor.ledger.clone();
+        next.orders.insert(
+            order_id.clone(),
+            LiveOrder {
+                order_id: order_id.clone(),
+                quote: LiveQuote {
+                    slot: "fee-fixture".into(),
+                    condition_id: prepared.plan.condition_id.clone(),
+                    market_slug: "fixture".into(),
+                    token_id: "1".into(),
+                    outcome: mm2_core::Outcome::Up,
+                    price_micros: 490_000,
+                    quantity_micros: 5_000_000,
+                    window_start_ms: now - 10_000,
+                    window_end_ms: now + 200_000,
+                    tick_micros: 1000,
+                    min_order_micros: 5_000_000,
+                    fee_bps: 0,
+                    protocol: 2,
+                    neg_risk: false,
+                },
+                phase: OrderPhase::Closed,
+                cumulative_filled_micros: 5_000_000,
+                created_at_ms: now,
+                last_operation_ms: now,
+                retry_at_ms: now,
+            },
+        );
+        next.signed_intents
+            .insert(order_id.clone(), serde_json::json!({"test_only":true}));
+        next.fee_policies.insert(
+            order_id.clone(),
+            crate::fees::FeePolicy {
+                condition_id: prepared.plan.condition_id.clone(),
+                up_token: "1".into(),
+                down_token: "2".into(),
+                rate: "0.07".into(),
+                exponent: 1,
+                taker_only: true,
+                observed_at_ms: now,
+                response_sha256: "a".repeat(64),
+            },
+        );
+        let proof = crate::fees::ExecutionFee {
+            order_id,
+            transaction_hash: format!("0x{}", "c".repeat(64)),
+            log_index: 2,
+            block_number: 16,
+            block_hash: format!("0x{}", "d".repeat(64)),
+            finalized_block_number: 32,
+            quantity_micros: 5_000_000,
+            actual_fee_micros: fee,
+            taker,
+        };
+        next.observe_fee(proof.clone()).unwrap();
+        actor.persist("fee_fixture", next).await.unwrap();
+        let retained = actor.ledger.execution_fees.clone();
+        let spent = actor.ledger.session_spent_pico.clone();
+        assert!(
+            !actor.ledger.fees_pending(),
+            "full quantity coverage is not fee agreement"
+        );
+
+        // Reproduce a retained state written by the old Reset path. Both runtime
+        // admission and public readiness must reject its proof without a fault flag.
+        let mut old_reset = actor.ledger.clone();
+        old_reset.phase = LivePhase::Paused;
+        old_reset.fault = None;
+        actor.persist("old_reset_fixture", old_reset).await.unwrap();
+        actor.publish();
+        assert_eq!(actor.healthy(), !mismatch);
+        assert_eq!(actor.publish.borrow().can_resume, !mismatch);
+        assert_eq!(actor.ledger.fees_mismatched(), mismatch);
+        assert_eq!(
+            actor
+                .control("fee-resume".into(), ControlAction::Resume)
+                .await
+                .is_err(),
+            mismatch
+        );
+        assert_eq!(
+            actor
+                .control("fee-reset".into(), ControlAction::Reset)
+                .await
+                .is_err(),
+            mismatch
+        );
+
+        // The exact same finalized proof can recur in every account observation.
+        actor
+            .result(ResultEvent::Reconciled(
+                actor.chain_effect_epoch,
+                Ok(AccountObservation {
+                    execution_fees: vec![proof],
+                    collateral_micros: actor.ledger.collateral_micros,
+                    allowance_micros: actor.ledger.allowance_micros,
+                    positions: actor.ledger.positions.values().cloned().collect(),
+                    orders: vec![],
+                    foreign_order_ids: vec![],
+                }),
+            ))
+            .await;
+        actor.publish();
+        assert_eq!(actor.ledger.execution_fees, retained);
+        assert_eq!(actor.ledger.session_spent_pico, spent);
+        assert_eq!(actor.ledger.fault.is_some(), mismatch);
+        if mismatch {
+            assert!(!actor.healthy());
+            assert!(!actor.publish.borrow().can_resume);
+            assert!(
+                actor
+                    .control("fee-reset-again".into(), ControlAction::Reset)
+                    .await
+                    .is_err()
+            );
+        }
+
+        // A journal produced by an older binary can already have cleared fault.
+        // Replay must still expose a blocking mismatch with unchanged evidence.
+        let mut old_reset = actor.ledger.clone();
+        old_reset.phase = LivePhase::Paused;
+        old_reset.fault = None;
+        actor
+            .persist("old_reset_recovery_fixture", old_reset)
+            .await
+            .unwrap();
+        let settings = actor.settings.clone();
+        drop(actor);
+        let (journal, recovered) = Journal::open(dir.path(), &settings).unwrap();
+        assert_eq!(recovered.execution_fees, retained);
+        assert_eq!(recovered.session_spent_pico, spent);
+        let state = snapshot(
+            &recovered,
+            &settings,
+            &journal,
+            PublicationState {
+                connected: true,
+                account: Some(now_ms()),
+                heartbeat: Some(now_ms()),
+                reconciled: true,
+                coalesced: 0,
+            },
+        );
+        assert_eq!(state.can_resume, !mismatch);
+        assert_eq!(
+            state.execution_fee_reconciliation["status"],
+            if mismatch { "MISMATCH" } else { "MATCH" }
+        );
+    }
+}
 #[tokio::test]
 async fn shutdown_ack_releases_journal_fence_before_actor_drop() {
     let dir = tempfile::tempdir().unwrap();

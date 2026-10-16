@@ -42,12 +42,18 @@ def price_micros(value):
     return int(whole) * 1_000_000 + int(fraction.ljust(6, "0") or "0")
 
 
+def valuation_boot(state):
+    boot = obj(state).get("boot_id")
+    return boot if isinstance(boot, str) and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot) else None
+
+
 def valuation_context(state):
     state = obj(state)
     profile = state.get("execution_mode")
     if profile not in {"emulator", "simulation", "shadow", "trading", "both"}:
         profile = "unknown"
-    return json.dumps({"profile": profile, "reset_epoch": _units(state.get("reset_epoch"))}, separators=(",", ":"))
+    return json.dumps({"profile": profile, "reset_epoch": _units(state.get("reset_epoch")),
+                       "boot_id": valuation_boot(state)}, separators=(",", ":"))
 
 
 def bid(state, outcome):

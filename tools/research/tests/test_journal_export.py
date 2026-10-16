@@ -32,6 +32,19 @@ def engine_fixture(source):
 
 
 class JournalExportTests(unittest.TestCase):
+    def test_public_fee_evidence_is_strict_and_keeps_exact_rate(self):
+        policy = {"condition_id": "0x" + "a" * 64, "up_token": "1", "down_token": "2",
+            "rate": "0.07", "exponent": 1, "taker_only": True, "observed_at_ms": 1000,
+            "response_sha256": "b" * 64}
+        self.assertEqual(exporter._operation({"kind": "fee_rules", "policy": policy})["policy"], policy)
+        for key in policy:
+            partial = dict(policy)
+            del partial[key]
+            with self.assertRaises(exporter.ExportError):
+                exporter._operation({"kind": "fee_rules", "policy": partial})
+        with self.assertRaises(exporter.ExportError):
+            exporter._operation({"kind": "fee_rules", "policy": {**policy, "api_token": "secret"}})
+
     def setUp(self):
         # Stay inside the verified repository root on managed Windows sandbox hosts.
         self.temp = tempfile.TemporaryDirectory(prefix=".journal-export-test-", dir=Path(__file__).resolve().parents[3])

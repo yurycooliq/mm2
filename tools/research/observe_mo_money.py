@@ -51,6 +51,13 @@ def _public_row(raw, fields):
     return _exact_public({key: raw[key] for key in sorted(fields) if key in raw})
 
 
+def display_title(raw):
+    # Cosmetic labels are outside the financial row digest/event identity. They
+    # remain bounded public source evidence inside the verified observer bundle.
+    value = raw.get("title")
+    return value if isinstance(value, str) and 0 < len(value) <= 128 and all(ord(char) >= 32 for char in value) else None
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *_args, **_kwargs):
         raise ResearchError("public API redirect refused")
@@ -146,7 +153,7 @@ def collect_activity(client, account_id, start, end, page_size=500, max_rows=100
                     projected = _public_row(raw, ACTIVITY_FIELDS)
                     canonical(projected)
                     selected.append({"row": projected, "receipt_hash": digest(receipt),
-                                     "observed_at_utc": receipt["observed_at_utc"]})
+                                     "observed_at_utc": receipt["observed_at_utc"], "display_title": display_title(raw)})
                 if len(page) < page_size:
                     if len(rows) + len(selected) > max_rows:
                         raise ResearchError("capture row budget exhausted")

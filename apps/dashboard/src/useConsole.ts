@@ -54,7 +54,7 @@ export function useConsole() {
       } catch (failure) {
         if (cancelled) return;
         if (failure instanceof ApiError && (failure.status === 401 || failure.status === 404)) {
-          setAccess(failure.status === 401 ? 'local' : 'not_found'); setAuthenticated(false); setEnvelope(null); setHistory([]); setLogs([]);
+          setAccess(failure.status === 401 ? 'local' : 'session_expired'); setAuthenticated(false); setEnvelope(null); setHistory([]); setLogs([]);
         }
         else setEnvelope(previous => previous ? { ...previous, connected: false, error: 'Console unavailable. Displayed state is stale.' } : null);
       } finally { tick += 1; if (!cancelled) timer = window.setTimeout(poll, 1000); }
@@ -97,7 +97,7 @@ export function useConsole() {
         catch { setStorageError('Command storage unavailable; controls are blocked.'); }
       } else if (!(failure instanceof ApiError)) setStorageError('Command storage unavailable; controls are blocked.');
       if (failure instanceof ApiError && (failure.status === 401 || failure.status === 404)) {
-        setAccess(failure.status === 401 ? 'local' : 'not_found'); setAuthenticated(false); setEnvelope(null); setHistory([]); setLogs([]);
+        setAccess(failure.status === 401 ? 'local' : 'session_expired'); setAuthenticated(false); setEnvelope(null); setHistory([]); setLogs([]);
       }
     } finally { sending.current = false; if (mounted.current) setBusy(false); }
   }, []);

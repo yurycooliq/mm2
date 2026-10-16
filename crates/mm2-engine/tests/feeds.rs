@@ -206,10 +206,11 @@ fn binance_uses_trade_clock_and_never_claims_oracle_identity() {
     }
 }
 
-#[tokio::test]
-async fn queue_overflow_latches_fault_without_partial_frame_or_silent_drop() {
+#[tokio::test(start_paused = true)]
+async fn queue_timeout_latches_fault_and_preserves_the_admitted_prefix() {
     let (tx, mut rx) = mpsc::channel(1);
     let (fault, state) = watch::channel(None);
+    let (_stop, mut shutdown) = watch::channel(false);
     let events = vec![
         FeedEvent::Disconnect {
             source: FeedSource::Clob,
@@ -220,8 +221,22 @@ async fn queue_overflow_latches_fault_without_partial_frame_or_silent_drop() {
             reason: "second".into(),
         },
     ];
-    assert!(enqueue_frame(&tx, events, &fault).is_err());
-    assert_eq!(state.borrow().as_deref(), Some("feed queue overflow"));
+    assert!(
+        enqueue_frame(&tx, events, &fault, &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state.borrow().as_deref(),
+        Some("feed backpressure deadline exceeded")
+    );
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        FeedEvent::Disconnect {
+            source: FeedSource::Clob,
+            ..
+        }
+    ));
     assert!(rx.try_recv().is_err());
     drop(rx);
     assert!(
@@ -231,9 +246,14 @@ async fn queue_overflow_latches_fault_without_partial_frame_or_silent_drop() {
                 source: FeedSource::Clob,
                 reason: "closed".into()
             }],
-            &fault
+            &fault,
+            &mut shutdown,
         )
+        .await
         .is_err()
     );
-    assert_eq!(state.borrow().as_deref(), Some("feed queue overflow"));
+    assert_eq!(
+        state.borrow().as_deref(),
+        Some("feed backpressure deadline exceeded")
+    );
 }

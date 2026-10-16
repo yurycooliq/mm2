@@ -56,6 +56,7 @@ export interface EngineState {
 }
 export interface Envelope {
   state: EngineState | null; observed_at_ms: number | null; connected: boolean; error: string | null;
+  execution?: { journal?: { stage: string; used_bytes: number | null; limit_bytes: number | null } };
   telemetry: { sampling_interval_ms: number; sample_count: number; history_dropped: number; logs_dropped: number;
     overruns: number; last_sampling_ms: number | null; storage_error: string | null; publication_lag_ms: number | null };
 }

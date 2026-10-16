@@ -329,6 +329,46 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 
 pub(crate) fn validate_ledger(ledger: &Ledger, settings: &LiveSettings) -> Result<(), String> {
     crate::settlement::validate(ledger, settings)?;
+    if ledger.fee_policies.len() > 256 || ledger.execution_fees.len() > 1024 {
+        return Err("live fee evidence exceeds bounded ledger".into());
+    }
+    for (id, policy) in &ledger.fee_policies {
+        policy.validate()?;
+        let order = ledger
+            .orders
+            .get(id)
+            .ok_or("fee policy without tracked intent")?;
+        if policy.condition_id != order.quote.condition_id
+            || !policy.maker_zero()
+            || ![&policy.up_token, &policy.down_token].contains(&&order.quote.token_id)
+            || order.created_at_ms < policy.observed_at_ms
+            || order.created_at_ms.saturating_sub(policy.observed_at_ms) >= crate::fees::FEE_TTL_MS
+        {
+            return Err("live fee policy identity mismatch".into());
+        }
+    }
+    for (key, proof) in &ledger.execution_fees {
+        if key != &proof.key()
+            || !ledger.orders.contains_key(&proof.order_id)
+            || !crate::settings::condition(&proof.transaction_hash)
+            || !crate::settings::condition(&proof.block_hash)
+            || proof.finalized_block_number < proof.block_number
+            || proof.quantity_micros == 0
+        {
+            return Err("invalid finalized execution fee proof".into());
+        }
+    }
+    for order in ledger.orders.values() {
+        let quantity: u128 = ledger
+            .execution_fees
+            .values()
+            .filter(|p| p.order_id == order.order_id)
+            .map(|p| u128::from(p.quantity_micros))
+            .sum();
+        if quantity > u128::from(order.cumulative_filled_micros) {
+            return Err("replayed fee coverage exceeds authoritative fills".into());
+        }
+    }
     if ledger.orders.len() > 256
         || ledger.positions.len() > 128
         || ledger.position_floor.len() > 128
