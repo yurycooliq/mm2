@@ -99,28 +99,37 @@ def inventory(prs, main_at, now):
     return issues
 
 
-def independent_review(review, head, base, author):
+def review_receipt(review, head, base):
     if review.get("commit", {}).get("oid") != head:
-        return False
+        return None
     # Single-owner repositories can record a separate agent's review using the
     # owner's account. This is a named agent receipt, never a human approval.
     if review.get("state") not in {"COMMENTED", "APPROVED"}:
-        return False
+        return None
     body = review.get("body", "")
-    if not isinstance(body, str) or len(body) > 16_384:
-        return False
+    if not isinstance(body, str) or not body.splitlines() or body.splitlines()[0] != "MM2 independent review":
+        return None
+    if len(body) > 16_384:
+        raise PolicyError("independent review receipt exceeds its bound")
     fields = {}
     for line in body.splitlines():
         if line.startswith(("Head: ", "Base: ", "Reviewer: ", "Result: ")):
             key, value = line.split(": ", 1)
             if key in fields:
-                return False
+                raise PolicyError("ambiguous independent review receipt")
             fields[key] = value
-    binding = (body.startswith("MM2 independent review\n") and fields.get("Head") == head
-               and fields.get("Base") == base and fields.get("Result") == "PASS")
+    if set(fields) != {"Head", "Base", "Reviewer", "Result"} or fields["Result"] not in {"PASS", "FAIL", "HOLD"}:
+        raise PolicyError("incomplete independent review receipt")
+    return fields if fields["Head"] == head and fields["Base"] == base else None
+
+
+def independent_review(review, head, base, author):
+    fields = review_receipt(review, head, base)
+    if fields is None or fields["Result"] != "PASS":
+        return False
     if review.get("state") == "APPROVED":
-        return binding and review.get("author", {}).get("login") not in {None, author}
-    return binding and bool(re.fullmatch(r"agent:[A-Za-z0-9_/-]{1,128}", fields.get("Reviewer", "")))
+        return review.get("author", {}).get("login") not in {None, author}
+    return bool(re.fullmatch(r"agent:[A-Za-z0-9_/-]{1,128}", fields["Reviewer"]))
 
 
 def readiness(pr, main_sha):
@@ -151,7 +160,21 @@ def readiness(pr, main_sha):
             decisions[review.get("author", {}).get("login")] = review["state"]
     if "CHANGES_REQUESTED" in decisions.values():
         errors.append("A contributor still requests changes.")
-    if not isinstance(reviews, list) or not any(independent_review(review, head, base, pr.get("author", {}).get("login")) for review in reviews):
+    agents = {}
+    human_pass = False
+    if isinstance(reviews, list):
+        for review in sorted((row for row in reviews if row.get("state") in {"COMMENTED", "APPROVED"}),
+                             key=lambda row: timestamp(row["submittedAt"])):
+            fields = review_receipt(review, head, base)
+            if fields is None:
+                continue
+            if review["state"] == "COMMENTED" and re.fullmatch(r"agent:[A-Za-z0-9_/-]{1,128}", fields["Reviewer"]):
+                agents[fields["Reviewer"]] = fields["Result"]
+            elif review["state"] == "APPROVED":
+                human_pass |= independent_review(review, head, base, pr.get("author", {}).get("login"))
+    if any(result != "PASS" for result in agents.values()):
+        errors.append("A named agent's latest bound review is FAIL or HOLD.")
+    if not (human_pass or "PASS" in agents.values()):
         errors.append("No independent PASS review is bound to this exact head and base.")
     return {"status": "HOLD" if errors else "READY", "pr": pr["number"], "head": head, "base": base,
             "errors": errors, "mutations_performed": False}

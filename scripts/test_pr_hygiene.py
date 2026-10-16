@@ -90,6 +90,25 @@ class ReadinessTests(unittest.TestCase):
         item["reviews"].append(approved)
         self.assertEqual(policy.readiness(item, BASE)["status"], "READY")
 
+    def test_latest_negative_agent_receipt_blocks_old_pass_and_other_agents(self):
+        for result in ("FAIL", "HOLD"):
+            item = ready_pr()
+            prior = item["reviews"][0]
+            negative = dict(prior, body=prior["body"].replace("Result: PASS", "Result: " + result), submittedAt="2026-10-16T11:00:00Z")
+            item["reviews"].append(negative)
+            item["reviews"].append(dict(prior, body=prior["body"].replace("independent_reviewer", "another_reviewer")))
+            self.assertEqual(policy.readiness(item, BASE)["status"], "HOLD")
+            item["reviews"].append(dict(prior, submittedAt="2026-10-16T12:00:00Z"))
+            self.assertEqual(policy.readiness(item, BASE)["status"], "READY")
+
+    def test_malformed_or_ambiguous_current_receipt_never_keeps_old_pass(self):
+        for suffix in ("Result: FAIL\n", "Head: " + HEAD + "\n"):
+            item = ready_pr()
+            prior = item["reviews"][0]
+            item["reviews"].append(dict(prior, body=prior["body"] + suffix, submittedAt="2026-10-16T11:00:00Z"))
+            with self.assertRaises(policy.PolicyError):
+                policy.readiness(item, BASE)
+
     def test_missing_failed_pending_skipped_or_billing_blocked_checks_hold(self):
         for change in ("missing", "FAILURE", "SKIPPED", "pending"):
             item = ready_pr()
@@ -116,7 +135,11 @@ class ReadinessTests(unittest.TestCase):
                 item["reviews"] = []
             else:
                 main = "c" * 40
-            self.assertEqual(policy.readiness(item, main)["status"], "HOLD")
+            if change == "duplicate":
+                with self.assertRaises(policy.PolicyError):
+                    policy.readiness(item, main)
+            else:
+                self.assertEqual(policy.readiness(item, main)["status"], "HOLD")
 
     def test_draft_stacked_closed_and_experimental_work_cannot_be_ready(self):
         for key, value in [("isDraft", True), ("baseRefName", "codex/dependency"), ("state", "CLOSED"),
