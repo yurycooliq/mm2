@@ -928,6 +928,22 @@ The [ten-point comparison ledger](DASHBOARD_DESIGN.md) records layout, palette, 
 
 The [checks workflow](https://github.com/yurycooliq/mm2/actions/workflows/checks.yml) reproduces Rust, Python, reference/dashboard and production-container checks on push. External Telegram delivery, Mini App embedding in actual Telegram clients and funded order execution remain unverified.
 
+## October 16, 2026 — integration review
+
+The [integration review](INTEGRATION_REVIEW_20261016.md) binds the combined
+candidate source/tree and independent PR dispositions. The stable candidate
+passed 333 Rust tests, formatting, all-target Clippy and locked release build;
+556 Python cases ran with 555 passing and one Linux skip of Windows DPAPI;
+55 Node tests and the dashboard production build passed. All 14 real stack checks,
+both validation-worker cleanup cases, Compose configuration and browser
+login/Resume/Pause/logout checks passed using disposable local demo resources.
+The nineteen policy regressions are included in the Python count.
+
+Hosted Actions could not start because of GitHub's account billing/spending
+restriction. The review records the owner's one-time local-validation exception,
+build-harness adaptations and remaining platform/external gates. These results do
+not include #10–#12 experiments and do not establish production or funded readiness.
+
 ## Integration review repair, 2026-10-16
 
 Independent source review found that killing the Docker attach client could leave
