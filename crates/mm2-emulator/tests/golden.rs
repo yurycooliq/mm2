@@ -14,6 +14,16 @@ fn corrected_contract_golden_tapes() {
         let session = run_tape(&tape).unwrap();
         session.validate().unwrap();
         let snapshot = session.snapshot();
+        // These dated V1/V2 tapes must keep their original execution semantics.
+        // New causality telemetry is explicit rather than rewriting the fixtures.
+        assert_eq!(snapshot.venue_stats.causality_excluded_prints, 0);
+        for order in &snapshot.venue_orders {
+            assert!(
+                order
+                    .posted_at_ms
+                    .is_some_and(|posted| posted <= snapshot.now_ms)
+            );
+        }
         assert_eq!(
             snapshot.account.up_inventory_micros,
             expected["up_inventory_micros"].as_u64().unwrap(),

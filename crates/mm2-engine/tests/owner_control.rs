@@ -29,6 +29,7 @@ fn config(path: &std::path::Path) -> Config {
         journal_max_bytes: 1_048_576,
         journal: None,
         strategy: Default::default(),
+        paper_policy: None,
         live: None,
         command_capacity: 8,
         feed_capacity: 16,

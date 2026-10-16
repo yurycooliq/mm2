@@ -47,10 +47,23 @@ fn exact_cost_version_blocks_the_reproduced_excess_risk_and_replays() {
     let tape = fixture["operations"].as_array().unwrap();
     let mut legacy = simulation::new(&limits()).unwrap();
     simulation::replay(&mut legacy, tape).unwrap();
-    assert_eq!(
-        serde_json::to_value(legacy.portfolio_snapshot()).unwrap(),
-        fixture["legacy_after_rollover"]
-    );
+    let mut legacy_snapshot = serde_json::to_value(legacy.portfolio_snapshot()).unwrap();
+    // The historical fixture predates this additional accounting dimension.
+    // Check it explicitly, then compare every original field without rewriting
+    // the dated evidence or dropping any of its financial assertions.
+    for (position, expected_loss) in legacy_snapshot["positions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(["2600000000000", "2600000000000", "0", "0"])
+    {
+        assert_eq!(position["market_realized_gross_loss_pico"], expected_loss);
+        position
+            .as_object_mut()
+            .unwrap()
+            .remove("market_realized_gross_loss_pico");
+    }
+    assert_eq!(legacy_snapshot, fixture["legacy_after_rollover"]);
     assert!(simulation::apply(&mut legacy, &Op::ExactAccounting {}).is_err());
     let mut decision: mm2_strategy::Decision =
         serde_json::from_value(fixture["strategy_decision"].clone()).unwrap();

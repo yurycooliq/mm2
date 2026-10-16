@@ -94,7 +94,39 @@ pub struct MarketPosition {
     /// Present only for versioned imports with exact, fee-inclusive side costs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_outcome_spent_pico: Option<[String; 2]>,
+    /// Lifetime negative closeout events for this condition. None preserves
+    /// legacy uncertainty; profitable merges and UTC rollover never replenish it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_realized_gross_loss_pico: Option<String>,
     pub totals_imported: bool,
+}
+
+impl MarketPosition {
+    pub fn realized_gross_loss_pico(&self) -> Result<Option<u128>> {
+        self.market_realized_gross_loss_pico
+            .as_ref()
+            .map(|value| {
+                value
+                    .parse::<u128>()
+                    .map_err(|_| "invalid market gross loss".into())
+            })
+            .transpose()
+    }
+    fn record_gross_closeout_loss(
+        &mut self,
+        payout: u128,
+        fee: u128,
+        removed_cost: u128,
+    ) -> Result<()> {
+        if let Some(previous) = self.realized_gross_loss_pico()? {
+            let total = previous
+                .checked_add((removed_cost + fee).saturating_sub(payout))
+                .filter(|value| *value <= MAX_MONEY)
+                .ok_or("market gross loss bound exceeded")?;
+            self.market_realized_gross_loss_pico = Some(total.to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +348,7 @@ impl Portfolio {
                 execution_down_micros: 0,
                 execution_fee_pico: 0,
                 execution_outcome_spent_pico: None,
+                market_realized_gross_loss_pico: Some("0".into()),
                 totals_imported: false,
             },
         );
@@ -335,6 +368,11 @@ impl Portfolio {
 
     pub fn risk_clock_ms(&self) -> u64 {
         self.last_event_ms
+    }
+    /// Raw read-only telemetry; avoids cloning every position and receipt just
+    /// to observe these two already-computed realized risk values.
+    pub fn realized_risk_totals_pico(&self) -> (u128, u128) {
+        (self.daily_loss_pico, self.drawdown_pico())
     }
 
     /// Caller-supplied UTC, persisted by the execution actor before new risk.
@@ -810,6 +848,7 @@ impl Portfolio {
             .markets
             .get_mut(&receipt.market_id)
             .expect("checked market");
+        market.record_gross_closeout_loss(payout, receipt.fee_pico, removed_up + removed_down)?;
         market.up.quantity_micros -= receipt.quantity_micros;
         market.down.quantity_micros -= receipt.quantity_micros;
         market.up.cost_pico -= removed_up;
@@ -858,6 +897,7 @@ impl Portfolio {
             .markets
             .get_mut(&receipt.market_id)
             .expect("checked market");
+        market.record_gross_closeout_loss(payout, receipt.fee_pico, cost)?;
         market.up = Position::default();
         market.down = Position::default();
         market.resolution = Some(receipt.clone());
@@ -960,6 +1000,12 @@ impl Portfolio {
             return Err("portfolio exact accounting or capacity invariant failed".into());
         }
         for (id, market) in &self.markets {
+            if market
+                .realized_gross_loss_pico()?
+                .is_some_and(|value| value > MAX_MONEY)
+            {
+                return Err("market gross loss bound exceeded".into());
+            }
             market.market.validate()?;
             if let Some(costs) = &market.execution_outcome_spent_pico {
                 let up = costs[0]

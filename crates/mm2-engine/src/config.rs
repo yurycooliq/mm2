@@ -17,6 +17,9 @@ pub struct Config {
     pub journal: Option<crate::journal::JournalOptions>,
     #[serde(default)]
     pub strategy: mm2_strategy::Rules,
+    /// Explicit isolated public-paper experiment; never a funded policy switch.
+    #[serde(default)]
+    pub paper_policy: Option<mm2_strategy::PaperPolicy>,
     #[serde(default)]
     pub live: Option<mm2_live::LiveSettings>,
     pub command_capacity: usize,
@@ -126,6 +129,12 @@ impl Config {
         }
         self.limits.core()?;
         self.strategy.validate()?;
+        if let Some(policy) = &self.paper_policy {
+            policy.validate()?;
+            if self.mode != "simulation" || self.feed_source != FeedSource::Public {
+                return Err("experimental paper policy requires public simulation".into());
+            }
+        }
         if let Some(options) = &self.journal {
             options.validate()?;
         }
@@ -146,6 +155,12 @@ impl Config {
         use std::io::Write;
         let path = self.state_dir.join("execution-profile.json");
         let mut identity = serde_json::json!({"schema":1,"mode":self.mode,"feed_source":match self.feed_source { FeedSource::Demo=>"demo",FeedSource::Public=>"public" }});
+        if let Some(policy) = &self.paper_policy {
+            identity["paper_policy"] = serde_json::to_value(policy)
+                .map_err(|_| "cannot encode experimental paper policy")?;
+            identity["experimental_strategy"] = serde_json::to_value(&self.strategy)
+                .map_err(|_| "cannot encode experimental strategy")?;
+        }
         if let Some(path) = &self.live_state_dir {
             identity["live_state_dir"] =
                 serde_json::to_value(path).map_err(|_| "cannot encode live state location")?;
@@ -249,5 +264,32 @@ mod tests {
         let mut config = Config::load(&root.join("demo.toml")).unwrap();
         config.mode = "trading".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn experimental_policy_is_public_paper_only_and_immutable_for_its_ledger() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let mut config = Config::load(&root.join("simulation.toml")).unwrap();
+        assert!(config.paper_policy.is_none());
+        let directory = tempfile::tempdir().unwrap();
+        config.state_dir = directory.path().into();
+        config.paper_policy = Some(mm2_strategy::PaperPolicy::default());
+        config.validate().unwrap();
+        config.bind_profile().unwrap();
+        config.bind_profile().unwrap();
+        config.strategy.max_pair_edge_micros = 30_000;
+        assert!(config.bind_profile().is_err());
+        config.strategy = mm2_strategy::Rules::default();
+        config.paper_policy = None;
+        assert!(config.bind_profile().is_err());
+        config.paper_policy = Some(mm2_strategy::PaperPolicy::default());
+        config.mode = "shadow".into();
+        assert!(config.validate().is_err());
+        config.mode = "simulation".into();
+        config.feed_source = FeedSource::Demo;
+        assert!(config.validate().is_err());
+        let mut trading = Config::load(&root.join("trading.toml")).unwrap();
+        trading.paper_policy = Some(mm2_strategy::PaperPolicy::default());
+        assert!(trading.validate().is_err());
     }
 }

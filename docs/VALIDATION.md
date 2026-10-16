@@ -1,5 +1,134 @@
 # Validation evidence
 
+## October 16, 2026 - prospective capture profile and comparison boundaries
+
+Formatting, all-target Clippy, **390 workspace tests and four local-proof
+tests** pass with zero ignored tests in `research-validation-2.log` under
+`output/r19-flow-valid-20261016`. The first attempt failed a new checkpoint test
+that incorrectly treated portfolio reservations as active emulator reservations.
+The corrected test checks the active account's retained reservation and the
+unchanged portfolio separately; it also compares the entire serialized paper
+state before and after observation.
+
+Three capture regressions check explicit/default CLI identity, exact 60-second
+prewarm and actual duplex subscription wire with `initial_dump:false`, followed
+by unchanged native frame retention. Two checkpoint regressions check bounded
+requests and partial fills/cancel-in-flight reservations. The existing full tape
+fixture also proves that optional boundary reads leave all other report bytes
+and execution/financial values unchanged.
+
+These are controlled source tests. The capture profile remains an unproved
+prospective input hypothesis; remote 1013 prevention, fresh economic quality,
+same-period public-wallet accounting and stable income require separate receipts.
+
+## October 16, 2026 - finite local input recovery proof
+
+Formatting and all-target Clippy pass. **385 workspace tests and four local-proof
+tests** pass with zero ignored tests in the sequential accepted run
+`local-proof-validation-2.log` under `output/r18-stream-recovery-20261016`.
+The preceding parallel run retained two owner-control timeout failures; test
+assertions and time limits were unchanged for the accepted sequential run.
+
+The offline `local_recovery_proof` example binds exactly five original fault
+fixtures and checks native CLOB prestate, filter floors and strict recovery
+boundaries. It remains paused and performs no strategy, execution or PnL work.
+Cancellation, possible fills, financial invariants and production scheduling
+remain unvalidated by this input-only proof. A read-only filter-floor accessor
+does not change filtering or recovery. Actual fixture verdicts require the
+separate one-run receipt; old gaps, fatal inputs and quality failures remain.
+
+## October 16, 2026 - opt-in fatal-ingress witnesses
+
+Formatting, all-target Clippy with warnings denied and **385 Rust tests** pass,
+with zero ignored tests (`rust-validation-5.log` in
+`output/r18-stream-recovery-20261016`). Five regressions cover pre-rejection
+CLOB clocks, Reference watermark resets, bounded sanitized error witnesses and
+exact read-only level quantities with absent zero distinguished from unknown.
+The native replay fixture checks full-report noninterference after restoring only
+the explicitly disabled diagnostic selection fields.
+
+The optional `--diagnostic-ingress` mode records up to 32 actual ingress failures
+with hashes, source generation and available pre-error state. It preserves
+execution/accounting and disables selection; the default report has no diagnostic
+fields or frame hashing. Opt-in frame hashing adds linear processing cost. A
+diagnostic rerun of a retained tape is not a new holdout or proof of income.
+
+## October 16, 2026 - bounded capture writes and explicit recovered-input quality
+
+Formatting, all-target Clippy with warnings denied and **380 Rust tests** pass,
+with zero ignored tests. The complete accepted run is `rust-validation-3.log` in
+`output/r18-stream-recovery-20261016`. Two real in-memory WebSocket regressions
+cover stalled sends/close and successful application heartbeat/native Ping/Pong
+ordering. Three quality regressions cover actual two-book restoration, timeout,
+exact-age/after-close completion, malformed snapshots and historical recovery
+deficits surviving a generation reset.
+
+Three additional paused-time retry regressions cover repeated peer-close 1013
+signals, capped jitter, stable-session reset, preservation of gaps/generations and
+capture/market deadline clipping. Requested retry delays remain diagnostic data;
+the patch cannot prevent remote closure or reconstruct missing trade evidence.
+A further regression verifies frame admission under the writer lock at expired
+global and exact socket cutoffs, while late genuine Gap evidence remains retained.
+
+The default strict protocol and all sealed historical evidence retain their
+meaning. Opt-in `recovered_native_v2` separates fatal faults from verified native
+recovery without changing execution decisions or forgiving actual capture gaps.
+Exact-image acceptance, whole-report strict compatibility and fresh bounded
+public collection have separate receipts. No disconnect cause, clean economic
+holdout, repeatable income or funded readiness is established by these tests.
+See [public experiments](PUBLIC_EXPERIMENTS.md).
+
+## October 16, 2026 - paired paper policy and accelerated common-input experiments
+
+Formatting, all-target Clippy with warnings denied and **371 Rust tests** pass,
+with zero ignored tests. The accepted complete run is `rust-validation-14.log` in
+`output/r18-accelerated-20261016`; earlier compile/fixture attempts remain there.
+Real-clock actor fixtures now use scoped test-only wall/monotonic clocks, retaining
+their freshness, cancellation, grid-change, journal replay and deadline checks.
+Production SystemTime/Instant behavior and the one-second freshness limit remain.
+
+The opt-in public-paper policy preserves paired entry admission, lifetime
+condition loss allocation, cost-capped ordinary hedges and staged bounded repair.
+Tests cover pending possible fills, retained partial order identity, legacy unknown
+allocations, immutable policy/strategy profiles and strict causal V3 public prints.
+Historical V2 execution remains replayable. Native common-input replay tests cover
+separate ledgers, unknown terminal value and training-only selection without
+substituting a different winner after observing holdout failure.
+
+The actor and replay now share native frame watermark filtering, split-delta
+snapshot recovery and valid-prefix admission. Three regressions cover both-book
+recovery, invalid suffix cutoff and obsolete validated snapshots. Missing REST
+bootstrap/refresh evidence and actor scheduling/fatal-latch parity remain explicit.
+
+The later capture-only patch adds bounded socket failure categories, close codes,
+capacity and processing/heartbeat timings without retaining peer/error text.
+Subscription-send failure now records one gap, advances the generation and takes
+the common reconnect backoff. Three new tests cover those diagnostic/retry cases.
+
+Replay and portfolio synchronization now read small account/progress/risk values
+and borrow unresolved positions instead of cloning complete telemetry snapshots.
+The new regression compares the original snapshot-based counters and persisted
+state across partial fills, causal exclusions, cancellation, market rollover,
+loss/settlement, UTC reset and audit eviction. Execution operations and validation
+remain unchanged. Complete old/new report equivalence and observed-input timing
+require separately retained runner receipts, not an economic profit claim.
+
+Python collects 520 tests: **495 pass, 25 platform/optional skips**, including 128
+console tests. Node passes **25 checks**: six strategy parity and nineteen
+execution/reference checks. Both the first `516108f` and shared-ingress `169523b`
+runtime images pass fourteen container integration checks and five explicit
+experimental-profile acceptance checks, with separate immutable-image receipts.
+The later recorder diagnostics do not change runtime/replay source or the retained
+capture; their source and future collector build remain separately bound.
+See [public experiments](PUBLIC_EXPERIMENTS.md).
+
+The full R17 terminal prefix was independently audited: 98,085 records, 167,787
+execution operations, 68 filled virtual orders over 36 markets and no observed
+accounting discrepancy or risk breach. Its final model result is -$3.5044 with
+zero open cost. That result does not establish real profitability. New parameters
+and assumed execution latencies are experiments; no completed clean economic
+holdout or funded readiness is claimed. Existing global $10/$20 limits remain.
+
 ## October 15, 2026 - public-paper filter order and quote subset admission
 
 Fresh-source formatting, all-target Clippy with warnings denied and **341 Rust
@@ -19,7 +148,7 @@ drawdown caps, settlement accounting and funded behavior remain unchanged.
 See [R17 policy and replay limits](PAPER_STRATEGY_R17.md). This does not establish
 counterfactual profit, a completed holdout or funded readiness.
 
-## October 14, 2026 — experimental public-paper entry and inventory repair
+## October 14, 2026 â€” experimental public-paper entry and inventory repair
 
 Fresh-source validation passes **338 Rust tests**, formatting and all-target Clippy
 with warnings denied. Public-paper new entries use a bounded one-second/one-basis-point
@@ -963,3 +1092,21 @@ Root verified the integrated local UI in the Codex in-app browser. Desktop/mobil
 The [ten-point comparison ledger](DASHBOARD_DESIGN.md) records layout, palette, typography, controls, metrics, tables, copy and intentional differences: illustrative $1,000 values were replaced by observed API values, and required stop/age/recovery information was added. [Desktop](design/desktop-integrated-qa.jpg) and [mobile](design/mobile-integrated-qa.jpg) artifacts contain simulated QA data.
 
 The [checks workflow](https://github.com/yurycooliq/mm2/actions/workflows/checks.yml) reproduces Rust, Python, reference/dashboard and production-container checks on push. External Telegram delivery, Mini App embedding in actual Telegram clients and funded order execution remain unverified.
+
+## October 16, 2026: transport diagnostic controlled validation
+
+The explicit `transport-diagnostic-v1` capture profile adds bounded close-reason
+evidence, one deadline-clipped flush of the peer Close acknowledgement and scalar
+receive/writer/heartbeat measurements. Default and `no-initial-dump-v1` behavior
+and report fields are preserved. Six new controlled tests cover profile
+isolation, safe UTF8 reason retention, actual duplex Ping/Pong/Close wire behavior
+with a retained Gap, stalled acknowledgement deadlines, task cancellation during
+an acknowledgement with the retained Gap and incomplete hash-chain footer, and
+metric boundaries.
+Format, all-target Clippy with warnings denied and 401 Rust tests passed in the
+full final validation attempt. Exact revision, image, release-binary and CLI
+receipts remain required before public use. One previous attempt timed out in
+the unchanged owner-control readiness fixture; its original failure is retained.
+The same test passed separately and in the full repeat without source or timeout
+changes; the actual timeout trigger remains unknown. These local checks establish
+neither the remote 1013 cause nor a valid economic holdout.

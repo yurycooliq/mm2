@@ -1,5 +1,6 @@
 //! Offline actor regression: feed ticks reach the durable paper execution contract.
-use mm2_engine::{
+use super::TestClock;
+use crate::{
     config::{Config, FeedSource, Limits},
     domain::{FeedEvent, Level, Market, Outcome},
     journal::{Command, Journal, JournalOptions},
@@ -23,6 +24,7 @@ fn config(directory: &Path) -> Config {
         journal_max_bytes: 8_388_608,
         journal: None,
         strategy: Default::default(),
+        paper_policy: None,
         live: None,
         command_capacity: 8,
         feed_capacity: 32,
@@ -60,11 +62,24 @@ async fn live_orders(handle: &Handle, tick: u64) -> mm2_emulator::SessionSnapsho
         }
     })
     .await
-    .expect("paper actor did not publish two legal live orders within five seconds")
+    .unwrap_or_else(|_| {
+        let state = handle.state.borrow();
+        let details = serde_json::json!({
+            "mode":state["mode"],"stop_reasons":state["stop_reasons"],
+            "strategy_gate":state["strategy_gate"],"fault":state["fault"],
+            "last_input_error":state["last_input_error"],
+            "awaiting_source_refresh":state["awaiting_source_refresh"],
+            "awaiting_native_snapshots":state["awaiting_native_snapshots"],
+            "source_status":state["source_status"],"books":state["books"],
+            "reference":state["reference"],"orders":state["simulation"]["orders"]
+        });
+        panic!("paper actor did not publish two legal live orders within five seconds: {details}");
+    })
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn actual_feed_tick_change_cancels_and_drains_before_durable_requote() {
+    let _clock = TestClock::fixed(1_800_000_000_000, 0);
     let directory = tempfile::tempdir().unwrap();
     let config = config(directory.path());
     let start = Instant::now();
@@ -104,6 +119,7 @@ async fn actual_feed_tick_change_cancels_and_drains_before_durable_requote() {
     let feeder = tokio::spawn(async move {
         let mut current_tick = 100;
         for _ in 0..500 {
+            TestClock::advance_current(20);
             let target_tick = *tick_rx.borrow_and_update();
             let wall = runtime::wall_ms();
             let mono = runtime::mono_ms(start);

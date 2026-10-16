@@ -128,6 +128,117 @@ mod tick_recovery_tests {
             .is_err()
         );
     }
+    #[test]
+    fn level_quantity_distinguishes_unknown_absent_and_present_without_mutation() {
+        let mut core = Core::new(CoreConfig {
+            initial_collateral_micro: 1_000_000_000,
+            max_imbalance_micro: 10_000_000,
+            lot_micro: 5_000_000,
+            half_width_micro: 10_000,
+            max_feed_age_ms: 1000,
+        })
+        .unwrap();
+        let condition = format!("0x{}", "a".repeat(64));
+        assert!(
+            core.level_quantity(&condition, Outcome::Up, BookSide::Bid, 490_000)
+                .is_err()
+        );
+        core.set_market(Market {
+            slug: "level-evidence".into(),
+            condition_id: condition.clone(),
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: 100,
+            window_end_ms: 300100,
+            tick_micro: 10000,
+        })
+        .unwrap();
+        let unknown = LevelQuantitySnapshot {
+            initialized: false,
+            present: false,
+            quantity_micro: None,
+        };
+        assert_eq!(
+            core.level_quantity(&condition, Outcome::Up, BookSide::Bid, 490_000)
+                .unwrap(),
+            unknown
+        );
+        core.apply(FeedEvent::Snapshot {
+            condition_id: condition.clone(),
+            outcome: Outcome::Up,
+            exchange_ms: 101,
+            observed_mono_ms: 1,
+            bids: vec![Level {
+                price_micro: 490_000,
+                quantity_micro: 5_000_000,
+            }],
+            asks: vec![Level {
+                price_micro: 510_000,
+                quantity_micro: 7_000_000,
+            }],
+        })
+        .unwrap();
+        let before = core.snapshot();
+        assert_eq!(
+            core.level_quantity(&condition, Outcome::Up, BookSide::Bid, 490_000)
+                .unwrap(),
+            LevelQuantitySnapshot {
+                initialized: true,
+                present: true,
+                quantity_micro: Some(5_000_000)
+            }
+        );
+        assert_eq!(
+            core.level_quantity(&condition, Outcome::Up, BookSide::Ask, 510_000)
+                .unwrap()
+                .quantity_micro,
+            Some(7_000_000)
+        );
+        assert_eq!(
+            core.level_quantity(&condition, Outcome::Up, BookSide::Bid, 480_000)
+                .unwrap(),
+            LevelQuantitySnapshot {
+                initialized: true,
+                present: false,
+                quantity_micro: Some(0)
+            }
+        );
+        assert_eq!(
+            core.level_quantity(&condition, Outcome::Down, BookSide::Ask, 510_000)
+                .unwrap(),
+            unknown
+        );
+        assert!(
+            core.level_quantity(
+                &format!("0x{}", "b".repeat(64)),
+                Outcome::Up,
+                BookSide::Bid,
+                490_000
+            )
+            .is_err()
+        );
+        for price in [0, MICRO, u64::MAX] {
+            assert!(
+                core.level_quantity(&condition, Outcome::Up, BookSide::Ask, price)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            core.snapshot(),
+            before,
+            "read-only lookups must not change books, clocks or proposals"
+        );
+        core.apply(FeedEvent::Disconnect {
+            source: FeedSource::Clob,
+            reason: "controlled".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            core.level_quantity(&condition, Outcome::Up, BookSide::Bid, 490_000)
+                .unwrap(),
+            unknown
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +395,14 @@ pub struct BookSnapshot {
     pub best_ask_micro: Option<u64>,
     pub exchange_ms: Option<u64>,
     pub observed_mono_ms: Option<u64>,
+}
+/// Read-only exact native level evidence. An uninitialized book is unknown;
+/// an absent level in an initialized book has a known zero quantity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LevelQuantitySnapshot {
+    pub initialized: bool,
+    pub present: bool,
+    pub quantity_micro: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceSnapshot {
@@ -552,6 +671,43 @@ impl Core {
             previous_receive_ms: self.last_clob_mono_ms,
             book_exchange_ms: self.books.each_ref().map(|book| book.exchange_ms),
             tick_exchange_ms: self.books.each_ref().map(|book| book.tick_exchange_ms),
+        })
+    }
+    pub fn level_quantity(
+        &self,
+        condition_id: &str,
+        outcome: Outcome,
+        side: BookSide,
+        price_micro: u64,
+    ) -> Result<LevelQuantitySnapshot, String> {
+        if self
+            .market
+            .as_ref()
+            .is_none_or(|market| market.condition_id != condition_id)
+        {
+            return Err("level lookup market identity mismatch".into());
+        }
+        if price_micro == 0 || price_micro >= MICRO {
+            return Err("level lookup price out of range".into());
+        }
+        let book = &self.books[outcome.index()];
+        if book.exchange_ms.is_none() {
+            return Ok(LevelQuantitySnapshot {
+                initialized: false,
+                present: false,
+                quantity_micro: None,
+            });
+        }
+        let quantity = match side {
+            BookSide::Bid => &book.bids,
+            BookSide::Ask => &book.asks,
+        }
+        .get(&price_micro)
+        .copied();
+        Ok(LevelQuantitySnapshot {
+            initialized: true,
+            present: quantity.is_some(),
+            quantity_micro: Some(quantity.unwrap_or(0)),
         })
     }
     fn accept_clob_clock(

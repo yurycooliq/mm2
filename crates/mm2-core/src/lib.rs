@@ -506,30 +506,34 @@ impl Core {
         }
         Ok(actions)
     }
-    pub fn snapshot(&self) -> CoreSnapshot {
+    /// The identical account projection used by the full snapshot, without
+    /// cloning active orders, execution statistics or halt diagnostics.
+    pub fn account_snapshot(&self) -> AccountSnapshot {
         let reserved = self.reserved_pico();
         let budget = u128::from(self.limits.initial_cash_micros) * u128::from(SCALE);
         let available = budget.saturating_sub(self.spent_pico + reserved);
         let signed = i128::from(self.inventory[0]) - i128::from(self.inventory[1]);
+        AccountSnapshot {
+            initial_cash_micros: self.limits.initial_cash_micros,
+            spent_micros_ceil: (self.spent_pico.div_ceil(u128::from(SCALE))) as u64,
+            reserved_micros_ceil: (reserved.div_ceil(u128::from(SCALE))) as u64,
+            available_micros_floor: (available / u128::from(SCALE)) as u64,
+            spent_pico: self.spent_pico.to_string(),
+            outcome_spent_pico: self
+                .outcome_spent_pico
+                .map(|costs| costs.map(|c| c.to_string())),
+            reserved_pico: reserved.to_string(),
+            available_pico: available.to_string(),
+            up_inventory_micros: self.inventory[0],
+            down_inventory_micros: self.inventory[1],
+            worst_up_imbalance_micros: (signed + i128::from(self.commitments(Outcome::Up))) as i64,
+            worst_down_imbalance_micros: (-signed + i128::from(self.commitments(Outcome::Down)))
+                as i64,
+        }
+    }
+    pub fn snapshot(&self) -> CoreSnapshot {
         CoreSnapshot {
-            account: AccountSnapshot {
-                initial_cash_micros: self.limits.initial_cash_micros,
-                spent_micros_ceil: (self.spent_pico.div_ceil(u128::from(SCALE))) as u64,
-                reserved_micros_ceil: (reserved.div_ceil(u128::from(SCALE))) as u64,
-                available_micros_floor: (available / u128::from(SCALE)) as u64,
-                spent_pico: self.spent_pico.to_string(),
-                outcome_spent_pico: self
-                    .outcome_spent_pico
-                    .map(|costs| costs.map(|c| c.to_string())),
-                reserved_pico: reserved.to_string(),
-                available_pico: available.to_string(),
-                up_inventory_micros: self.inventory[0],
-                down_inventory_micros: self.inventory[1],
-                worst_up_imbalance_micros: (signed + i128::from(self.commitments(Outcome::Up)))
-                    as i64,
-                worst_down_imbalance_micros: (-signed + i128::from(self.commitments(Outcome::Down)))
-                    as i64,
-            },
+            account: self.account_snapshot(),
             orders: self.active_orders().cloned().collect(),
             stats: self.stats.clone(),
             halted: self.halted.clone(),

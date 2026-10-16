@@ -174,6 +174,8 @@ pub enum Gate {
     InventoryCost,
     LossBudget,
     DirectionalGuard,
+    PairedEntry,
+    MarketLossBudget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,6 +543,187 @@ pub fn decide_inventory_repair(
     if inventory_loss_bound(after, after_costs) >= inventory_loss_bound(quantities, costs) {
         return Ok(original);
     }
+    decision.quotes = vec![DesiredQuote {
+        slot: format!("{}:repair", if lagging == 0 { "up" } else { "down" }),
+        outcome: if lagging == 0 {
+            Outcome::Up
+        } else {
+            Outcome::Down
+        },
+        price_micros: price,
+        quantity_micros: quantity,
+    }];
+    Ok(decision)
+}
+
+/// Opt-in public-paper hypothesis. Pair margin is a quote constraint, not evidence
+/// that either independently filled leg has positive expected return.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaperPolicy {
+    pub paired_entry_only: bool,
+    pub market_loss_cap_micros: u64,
+    pub max_locked_loss_micros: u64,
+    pub min_pair_edge_micros: u64,
+    pub repair_after_ms: u64,
+    pub repair_close_ms: u64,
+    pub entry_close_guard_ms: u64,
+}
+
+impl Default for PaperPolicy {
+    fn default() -> Self {
+        Self {
+            paired_entry_only: true,
+            market_loss_cap_micros: 3 * SCALE,
+            max_locked_loss_micros: 250_000,
+            min_pair_edge_micros: 20_000,
+            repair_after_ms: 15_000,
+            repair_close_ms: 30_000,
+            entry_close_guard_ms: 60_000,
+        }
+    }
+}
+
+impl PaperPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if !self.paired_entry_only
+            || self.market_loss_cap_micros == 0
+            || self.market_loss_cap_micros > 10 * SCALE
+            || self.max_locked_loss_micros >= self.market_loss_cap_micros
+            || self.min_pair_edge_micros == 0
+            || self.min_pair_edge_micros >= SCALE
+            || self.repair_after_ms == 0
+            || self.repair_after_ms > 300_000
+            || self.repair_close_ms > 60_000
+            || self.entry_close_guard_ms < self.repair_close_ms
+            || self.entry_close_guard_ms > 300_000
+        {
+            return Err("invalid experimental public paper policy".into());
+        }
+        Ok(())
+    }
+}
+
+/// Caller supplies age since the first confirmed unmatched fill. Pending order
+/// commitments, market lifetime gross losses and global risk are enforced by the
+/// execution guard; this pure function never assumes simultaneous pair fills.
+pub fn decide_experimental(
+    rules: &Rules,
+    input: &Input,
+    outcome_spent_pico: Option<[u128; 2]>,
+    policy: &PaperPolicy,
+    inventory_age_ms: u64,
+) -> Result<Decision> {
+    policy.validate()?;
+    let mut effective = rules.clone();
+    effective.max_pair_edge_micros = effective
+        .max_pair_edge_micros
+        .max(policy.min_pair_edge_micros);
+    let mut decision = decide_inventory_aware(&effective, input, outcome_spent_pico)?;
+    let quantities = [input.inventory_up_micros, input.inventory_down_micros];
+    if quantities[0] == quantities[1] {
+        if input.now_ms
+            >= input
+                .market_end_ms
+                .saturating_sub(policy.entry_close_guard_ms)
+        {
+            return Ok(abstain(Gate::CloseGuard));
+        }
+        if decision.reason != Gate::Quote {
+            return Ok(decision);
+        }
+        decision.quotes.retain(|quote| quote.slot.ends_with(":lot"));
+        if decision.quotes.len() != 2
+            || decision.quotes[0].outcome == decision.quotes[1].outcome
+            || decision.quotes[0].quantity_micros != decision.quotes[1].quantity_micros
+            || decision.quotes.iter().map(|q| q.price_micros).sum::<u64>()
+                > SCALE - effective.max_pair_edge_micros
+        {
+            return Ok(abstain(Gate::PairedEntry));
+        }
+        return Ok(decision);
+    }
+    // Preserve all baseline book/time/input gates before changing a hedge price.
+    let healthy = decide(&effective, input)?;
+    if healthy.reason != Gate::Quote {
+        return Ok(decision);
+    }
+    let Some(costs) = outcome_spent_pico else {
+        return Ok(decision);
+    };
+    let owned = usize::from(quantities[1] > quantities[0]);
+    let lagging = 1 - owned;
+    let difference = quantities[owned] - quantities[lagging];
+    let reserved = [input.reserved_up_micros, input.reserved_down_micros][lagging];
+    let remaining = difference.saturating_sub(reserved);
+    let average = costs[owned].div_ceil(u128::from(quantities[owned]));
+    let cap = u128::from(SCALE - effective.max_pair_edge_micros).saturating_sub(average);
+    let ask = [input.up, input.down][lagging].ask_micros.unwrap_or(0);
+    let passive = ask.saturating_sub(1) / input.tick_micros * input.tick_micros;
+    let cap = (cap / u128::from(input.tick_micros)) as u64 * input.tick_micros;
+    let ordinary_price = passive.min(cap);
+    let affordable = if ordinary_price == 0 {
+        0
+    } else {
+        u64::try_from(
+            u128::from(input.available_cash_micros) * u128::from(SCALE)
+                / u128::from(ordinary_price),
+        )
+        .unwrap_or(u64::MAX)
+    };
+    let ordinary_quantity = remaining.min(affordable);
+    if ordinary_quantity >= input.min_order_micros && ordinary_price >= rules.min_price_micros {
+        decision = healthy.clone();
+        decision.quotes = vec![DesiredQuote {
+            slot: format!("{}:hedge", if lagging == 0 { "up" } else { "down" }),
+            outcome: if lagging == 0 {
+                Outcome::Up
+            } else {
+                Outcome::Down
+            },
+            price_micros: ordinary_price,
+            quantity_micros: ordinary_quantity,
+        }];
+    }
+    let close = input.market_end_ms.saturating_sub(input.now_ms) <= policy.repair_close_ms;
+    if inventory_age_ms < policy.repair_after_ms && !close {
+        return Ok(decision);
+    }
+    // No new overbuy while a complement is still possibly fillable. The ledger
+    // additionally retains cancel-in-flight commitments before any replacement.
+    if reserved > 0 {
+        return Ok(decision);
+    }
+    let quantity = difference.max(input.min_order_micros);
+    let bid = [input.up, input.down][lagging].bid_micros.unwrap_or(0);
+    let price = bid / input.tick_micros * input.tick_micros;
+    if (remaining >= input.min_order_micros && price <= cap) || price < rules.min_price_micros {
+        return Ok(decision);
+    }
+    let cost = u128::from(price) * u128::from(quantity);
+    if cost > u128::from(input.available_cash_micros) * u128::from(SCALE) {
+        return Ok(decision);
+    }
+    let mut after = quantities;
+    after[lagging] = after[lagging]
+        .checked_add(quantity)
+        .ok_or("repair quantity overflow")?;
+    if after[lagging] > MAX_QUANTITY || after[0].abs_diff(after[1]) > rules.max_imbalance_micros {
+        return Ok(decision);
+    }
+    let mut after_costs = costs;
+    after_costs[lagging] += cost;
+    let matched = after[0].min(after[1]);
+    let matched_cost = (0..2)
+        .map(|side| (after_costs[side] * u128::from(matched)).div_ceil(u128::from(after[side])))
+        .sum::<u128>();
+    let locked_loss = matched_cost.saturating_sub(u128::from(matched) * u128::from(SCALE));
+    if locked_loss > u128::from(policy.max_locked_loss_micros) * u128::from(SCALE)
+        || inventory_loss_bound(after, after_costs) >= inventory_loss_bound(quantities, costs)
+    {
+        return Ok(decision);
+    }
+    decision = healthy;
     decision.quotes = vec![DesiredQuote {
         slot: format!("{}:repair", if lagging == 0 { "up" } else { "down" }),
         outcome: if lagging == 0 {

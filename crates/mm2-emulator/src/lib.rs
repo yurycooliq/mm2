@@ -104,6 +104,9 @@ pub struct VenueOrder {
     pub remaining_micros: u64,
     pub external_queue_ahead_micros: u64,
     pub arrival_sequence: u64,
+    /// Emulator venue acceptance clock. Legacy states retain unknown timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posted_at_ms: Option<u64>,
     pub terminal: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +126,8 @@ pub struct VenueStats {
     pub external_consumed_micros: u64,
     pub dropped_notifications: u64,
     pub duplicate_notifications: u64,
+    #[serde(default)]
+    pub causality_excluded_prints: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -139,12 +144,31 @@ pub struct SessionSnapshot {
     pub audit_evicted: u64,
     pub fault: Option<String>,
 }
+
+/// Read-only telemetry cursor; never serialized into execution state or used to
+/// change decisions. Capturing this mark does not clone orders or audit history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressMark {
+    audit_sequence: u64,
+    causality_excluded_prints: u64,
+}
+
+/// Exactly the fill/partial/cause counters derived from the corresponding full
+/// SessionSnapshot pair. A market reset retains the historical reset semantics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProgressDelta {
+    pub fill_events: u64,
+    pub partial_fill_events: u64,
+    pub causality_excluded_prints: u64,
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradeResult {
     pub input_quantity_micros: u64,
     pub own_filled_micros: u64,
     pub external_consumed_micros: u64,
     pub unconsumed_micros: u64,
+    #[serde(default)]
+    pub causality_excluded_order_count: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Event {
@@ -344,7 +368,14 @@ impl PaperSession {
         worst_price_micros: u64,
         quantity_micros: u64,
     ) -> Result<TradeResult> {
-        self.trade_inner(now_ms, outcome, worst_price_micros, quantity_micros, false)
+        self.trade_inner(
+            now_ms,
+            outcome,
+            worst_price_micros,
+            quantity_micros,
+            false,
+            None,
+        )
     }
     /// A public print witnesses volume at one price, not a whole taker sweep.
     pub fn trade_at_price(
@@ -367,7 +398,37 @@ impl PaperSession {
                 ..TradeResult::default()
             });
         }
-        self.trade_inner(now_ms, outcome, price_micros, quantity_micros, true)
+        self.trade_inner(now_ms, outcome, price_micros, quantity_micros, true, None)
+    }
+    /// Versioned causal public-print model. A delayed print cannot fill an order
+    /// accepted at/after its exchange event. The clock conversion is a caller
+    /// witness, never an inference made by the deterministic emulator.
+    ///
+    /// If any matching order has uncertain/later arrival, skip the whole print:
+    /// consuming its external queue would otherwise give that new order free
+    /// priority. This can underfill old eligible orders and is not unbiased PnL.
+    pub fn trade_at_price_causal(
+        &mut self,
+        now_ms: u64,
+        exchange_event_mono_ms: u64,
+        outcome: Outcome,
+        price_micros: u64,
+        quantity_micros: u64,
+    ) -> Result<TradeResult> {
+        if exchange_event_mono_ms > now_ms {
+            return Err("public trade event clock is after receipt".into());
+        }
+        if price_micros == 0 || price_micros == SCALE {
+            return self.trade_at_price(now_ms, outcome, price_micros, quantity_micros);
+        }
+        self.trade_inner(
+            now_ms,
+            outcome,
+            price_micros,
+            quantity_micros,
+            true,
+            Some(exchange_event_mono_ms),
+        )
     }
     fn trade_inner(
         &mut self,
@@ -376,6 +437,7 @@ impl PaperSession {
         worst_price_micros: u64,
         quantity_micros: u64,
         exact_price: bool,
+        causal_event_ms: Option<u64>,
     ) -> Result<TradeResult> {
         if worst_price_micros == 0
             || worst_price_micros >= SCALE
@@ -385,6 +447,28 @@ impl PaperSession {
             return Err("invalid simulated taker trade".into());
         }
         self.advance(now_ms)?;
+        if let Some(event_ms) = causal_event_ms {
+            let excluded = self
+                .venue
+                .values()
+                .filter(|order| {
+                    !order.terminal
+                        && order.quote.outcome == outcome
+                        && order.quote.price_micros == worst_price_micros
+                        && order.posted_at_ms.is_none_or(|posted| posted >= event_ms)
+                })
+                .count() as u64;
+            if excluded > 0 {
+                self.venue_stats.causality_excluded_prints += 1;
+                self.record("causal_print_excluded", None, Some(quantity_micros));
+                return Ok(TradeResult {
+                    input_quantity_micros: quantity_micros,
+                    unconsumed_micros: quantity_micros,
+                    causality_excluded_order_count: excluded,
+                    ..TradeResult::default()
+                });
+            }
+        }
         let mut prices: std::collections::BTreeSet<u64> = self
             .books
             .get(&outcome)
@@ -620,6 +704,7 @@ impl PaperSession {
                         remaining_micros: order.quote.quantity_micros,
                         external_queue_ahead_micros: queue,
                         arrival_sequence: self.next_sequence,
+                        posted_at_ms: Some(self.now_ms),
                         terminal: false,
                     },
                 );
@@ -801,6 +886,46 @@ impl PaperSession {
         self.core.halt(reason);
         Err(reason.into())
     }
+    pub fn account_snapshot(&self) -> AccountSnapshot {
+        self.core.account_snapshot()
+    }
+    pub fn progress_mark(&self) -> ProgressMark {
+        ProgressMark {
+            audit_sequence: self.audit_sequence,
+            causality_excluded_prints: self.venue_stats.causality_excluded_prints,
+        }
+    }
+    pub fn progress_since(&self, before: ProgressMark) -> ProgressDelta {
+        let mut delta = ProgressDelta {
+            causality_excluded_prints: self
+                .venue_stats
+                .causality_excluded_prints
+                .saturating_sub(before.causality_excluded_prints),
+            ..ProgressDelta::default()
+        };
+        if self.audit_sequence > before.audit_sequence {
+            // The audit ring is bounded and unchanged. Reverse traversal avoids
+            // scanning old events on the common one-event/no-event operation.
+            for event in self
+                .audit
+                .iter()
+                .rev()
+                .take_while(|event| event.sequence > before.audit_sequence)
+            {
+                if event.kind == "venue_fill" {
+                    delta.fill_events += 1;
+                    if event
+                        .order_id
+                        .and_then(|id| self.venue.get(&id))
+                        .is_some_and(|order| !order.terminal && order.remaining_micros > 0)
+                    {
+                        delta.partial_fill_events += 1;
+                    }
+                }
+            }
+        }
+        delta
+    }
     pub fn snapshot(&self) -> SessionSnapshot {
         let core = self.core.snapshot();
         SessionSnapshot {
@@ -858,6 +983,7 @@ impl PaperSession {
                         o.quote.quantity_micros - o.cumulative_filled_micros
                     }
                 || o.external_queue_ahead_micros > 1_000_000_000 * SCALE
+                || o.posted_at_ms.is_some_and(|posted| posted > self.now_ms)
             {
                 return Err("invalid persisted venue order".into());
             }

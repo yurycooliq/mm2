@@ -711,14 +711,16 @@ pub fn parse_rest_book(
     ])
 }
 
-struct Recovery {
+/// The native frame filter used by public sockets. Replay may reuse it only
+/// with an explicitly known bootstrap baseline; zero means no REST seed proof.
+pub struct Recovery {
     baseline: [u64; 2],
     initialized: [bool; 2],
     latest_exchange: [u64; 2],
     latest_receive: u64,
 }
 impl Recovery {
-    fn new(baseline: [u64; 2]) -> Self {
+    pub fn new(baseline: [u64; 2]) -> Self {
         Self {
             baseline,
             initialized: [false; 2],
@@ -735,8 +737,12 @@ impl Recovery {
             latest_receive: 0,
         }
     }
-    fn ready(&self) -> bool {
+    pub fn ready(&self) -> bool {
         self.initialized.iter().all(|ready| *ready)
+    }
+    /// Read-only research evidence; never resets or advances native filter state.
+    pub fn exchange_watermarks(&self) -> [u64; 2] {
+        self.latest_exchange
     }
     fn advance_watermark(
         &mut self,
@@ -750,8 +756,7 @@ impl Recovery {
                 .store(self.latest_exchange[index], Ordering::Relaxed);
         }
     }
-    #[cfg(test)]
-    fn filter(&mut self, events: Vec<FeedEvent>) -> Vec<FeedEvent> {
+    pub fn filter(&mut self, events: Vec<FeedEvent>) -> Vec<FeedEvent> {
         self.filter_observed(events, None)
     }
     fn filter_observed(

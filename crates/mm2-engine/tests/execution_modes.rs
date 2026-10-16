@@ -141,6 +141,7 @@ fn config(path: &Path) -> Config {
         journal_max_bytes: 8_388_608,
         journal: None,
         strategy: Default::default(),
+        paper_policy: None,
         live: Some(settings()),
         command_capacity: 8,
         feed_capacity: 16,
