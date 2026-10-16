@@ -2,8 +2,8 @@
 
 ## October 16, 2026 - paired paper policy and accelerated common-input experiments
 
-Formatting, all-target Clippy with warnings denied and **367 Rust tests** pass,
-with zero ignored tests. The accepted complete run is `rust-validation-10.log` in
+Formatting, all-target Clippy with warnings denied and **370 Rust tests** pass,
+with zero ignored tests. The accepted complete run is `rust-validation-13.log` in
 `output/r18-accelerated-20261016`; earlier compile/fixture attempts remain there.
 Real-clock actor fixtures now use scoped test-only wall/monotonic clocks, retaining
 their freshness, cancellation, grid-change, journal replay and deadline checks.
@@ -22,12 +22,18 @@ snapshot recovery and valid-prefix admission. Three regressions cover both-book
 recovery, invalid suffix cutoff and obsolete validated snapshots. Missing REST
 bootstrap/refresh evidence and actor scheduling/fatal-latch parity remain explicit.
 
+The later capture-only patch adds bounded socket failure categories, close codes,
+capacity and processing/heartbeat timings without retaining peer/error text.
+Subscription-send failure now records one gap, advances the generation and takes
+the common reconnect backoff. Three new tests cover those diagnostic/retry cases.
+
 Python collects 520 tests: **495 pass, 25 platform/optional skips**, including 128
 console tests. Node passes **25 checks**: six strategy parity and nineteen
-execution/reference checks. The first `516108f` runtime image passes fourteen
-container integration checks and five explicit experimental-profile acceptance
-checks. Their receipts are separate under the same output root and apply to that
-image; the later shared-ingress image requires its own container receipts.
+execution/reference checks. Both the first `516108f` and shared-ingress `169523b`
+runtime images pass fourteen container integration checks and five explicit
+experimental-profile acceptance checks, with separate immutable-image receipts.
+The later recorder diagnostics do not change runtime/replay source or the retained
+capture; their source and future collector build remain separately bound.
 See [public experiments](PUBLIC_EXPERIMENTS.md).
 
 The full R17 terminal prefix was independently audited: 98,085 records, 167,787

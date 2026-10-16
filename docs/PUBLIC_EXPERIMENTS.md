@@ -19,6 +19,13 @@ wall/monotonic receipt clocks, reconnect gaps and input hashes remain explicit.
 The collector has finite duration, frame, line, market and byte limits. A valid
 hash chain proves retained-file integrity, not complete delivery by the venue.
 
+Collector failure records distinguish fixed transport/capacity/close categories,
+numeric close codes, generation, session age and processing/heartbeat delays.
+They omit nested error text and peer payloads. Every failed subscription also
+advances the source generation and takes the bounded reconnect backoff. These
+diagnostics explain future failures; they cannot reconstruct a missing cause
+from an older tape's generic disconnect reason.
+
 Replay is offline. Every candidate/latency combination owns a separate native
 emulator and finite portfolio. Capital, old positions, gross losses and drawdown
 survive rollovers and the training/holdout boundary. Queue position belongs to
