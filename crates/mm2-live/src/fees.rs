@@ -344,6 +344,19 @@ pub(crate) fn decode_receipt(
     Ok(result)
 }
 
+pub(crate) fn mismatched(
+    policies: &BTreeMap<String, FeePolicy>,
+    proofs: &BTreeMap<String, ExecutionFee>,
+) -> bool {
+    proofs.values().any(|proof| {
+        proof.actual_fee_micros != 0
+            || proof.taker
+            || !policies
+                .get(&proof.order_id)
+                .is_some_and(FeePolicy::maker_zero)
+    })
+}
+
 pub(crate) fn summary(
     orders: &BTreeMap<String, crate::LiveOrder>,
     policies: &BTreeMap<String, FeePolicy>,
@@ -351,15 +364,10 @@ pub(crate) fn summary(
 ) -> Value {
     let mut verified = 0u128;
     let mut actual = 0u128;
-    let mut mismatch = false;
+    let mismatch = mismatched(policies, proofs);
     for proof in proofs.values() {
         verified += u128::from(proof.quantity_micros);
         actual += u128::from(proof.actual_fee_micros);
-        mismatch |= proof.actual_fee_micros != 0
-            || proof.taker
-            || !policies
-                .get(&proof.order_id)
-                .is_some_and(FeePolicy::maker_zero);
     }
     let filled: u128 = orders
         .values()

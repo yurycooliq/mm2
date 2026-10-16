@@ -326,6 +326,7 @@ fn snapshot(
     let now = now_ms();
     let healthy = reconciled
         && !ledger.fees_pending()
+        && !ledger.fees_mismatched()
         && connected
         && account.is_some_and(|t| now.saturating_sub(t) < 5000)
         && heartbeat.is_some_and(|t| {
@@ -495,6 +496,7 @@ impl Actor {
     fn healthy(&self) -> bool {
         self.account_reconciled
             && !self.ledger.fees_pending()
+            && !self.ledger.fees_mismatched()
             && self.connected
             && self
                 .last_account
@@ -584,7 +586,7 @@ impl Actor {
         let mut next = self.ledger.clone();
         match action {
             ControlAction::Resume => {
-                if !self.publish.borrow().can_resume {
+                if self.ledger.fees_mismatched() || !self.publish.borrow().can_resume {
                     return Err(
                         "live resume prerequisites or cancellation reconciliation pending".into(),
                     );
@@ -598,6 +600,11 @@ impl Actor {
             }
             ControlAction::Kill => next.phase = LivePhase::Killed,
             ControlAction::Reset => {
+                if next.fees_mismatched() {
+                    return Err(
+                        "Reset cannot reconcile retained execution fee or role mismatch".into(),
+                    );
+                }
                 next.phase = LivePhase::Paused;
                 next.fault = None;
                 self.account_reconciled = false;

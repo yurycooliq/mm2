@@ -229,6 +229,15 @@ impl Default for Ledger {
     }
 }
 impl Ledger {
+    pub(crate) fn fees_mismatched(&self) -> bool {
+        crate::fees::mismatched(&self.fee_policies, &self.execution_fees)
+    }
+    fn latch_fee_mismatch(&mut self) {
+        if self.fees_mismatched() {
+            self.phase = LivePhase::Faulted;
+            self.fault = Some("execution fee or role mismatch; finalized evidence retained; owner reconciliation required".into());
+        }
+    }
     pub(crate) fn fees_pending(&self) -> bool {
         self.orders.values().any(|order| {
             self.fee_policies.contains_key(&order.order_id)
@@ -256,6 +265,7 @@ impl Ledger {
             if prior != &comparable {
                 return Err("finalized fee proof changed".into());
             }
+            self.latch_fee_mismatch();
             return Ok(());
         }
         if self.execution_fees.len() >= 1024 {
@@ -276,17 +286,8 @@ impl Ledger {
         {
             return Err("finalized fee quantity exceeds authoritative order fill".into());
         }
-        let mismatch = proof.taker
-            || proof.actual_fee_micros != 0
-            || !self
-                .fee_policies
-                .get(&proof.order_id)
-                .is_some_and(crate::fees::FeePolicy::maker_zero);
         self.execution_fees.insert(key, proof);
-        if mismatch {
-            self.phase = LivePhase::Faulted;
-            self.fault = Some("execution fee or role mismatch; finalized evidence retained; owner reconciliation required".into());
-        }
+        self.latch_fee_mismatch();
         Ok(())
     }
     pub fn reserved_pico(&self) -> u128 {
