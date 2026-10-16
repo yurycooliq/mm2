@@ -58,3 +58,5 @@ jobs:
       - run: docker build --build-arg MM2_SOURCE_REVISION=${{ github.sha }} -t mm2-engine:local -f Dockerfile .
       - run: docker build --build-arg MM2_SOURCE_REVISION=${{ github.sha }} -t mm2-console:local -f Dockerfile.console .
       - run: python3 -B scripts/verify_stack.py
+      - run: docker pull python:3.13-slim-bookworm@sha256:2325bb286ec344af3e5898cc224b5844e2707ac6e26b1632516fd3edc84a5e26
+      - run: python3 -B scripts/verify_patch_worker_cleanup.py
