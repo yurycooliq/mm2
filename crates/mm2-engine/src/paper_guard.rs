@@ -3,7 +3,7 @@ use mm2_core::Outcome;
 use std::collections::VecDeque;
 
 #[derive(Default)]
-pub(crate) struct ReferenceGuard {
+pub struct ReferenceGuard {
     samples: VecDeque<(u64, u64, u64)>, // exchange time, local receive time, price
 }
 impl ReferenceGuard {

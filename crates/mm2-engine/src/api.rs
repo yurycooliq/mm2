@@ -314,6 +314,7 @@ mod tests {
             journal_max_bytes: 1_048_576,
             journal: None,
             strategy: mm2_strategy::Rules::default(),
+            paper_policy: None,
             live: None,
             command_capacity: 8,
             feed_capacity: 16,

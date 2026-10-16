@@ -1,5 +1,34 @@
 # Validation evidence
 
+## October 16, 2026 - paired paper policy and accelerated common-input experiments
+
+Formatting, all-target Clippy with warnings denied and **364 Rust tests** pass,
+with zero ignored tests. The accepted complete run is `rust-validation-9.log` in
+`output/r18-accelerated-20261016`; earlier compile/fixture attempts remain there.
+Real-clock actor fixtures now use scoped test-only wall/monotonic clocks, retaining
+their freshness, cancellation, grid-change, journal replay and deadline checks.
+Production SystemTime/Instant behavior and the one-second freshness limit remain.
+
+The opt-in public-paper policy preserves paired entry admission, lifetime
+condition loss allocation, cost-capped ordinary hedges and staged bounded repair.
+Tests cover pending possible fills, retained partial order identity, legacy unknown
+allocations, immutable policy/strategy profiles and strict causal V3 public prints.
+Historical V2 execution remains replayable. Native common-input replay tests cover
+separate ledgers, unknown terminal value and training-only selection without
+substituting a different winner after observing holdout failure.
+
+Python collects 520 tests: **495 pass, 25 platform/optional skips**, including 128
+console tests. Node passes **25 checks**: six strategy parity and nineteen
+execution/reference checks. Runtime image and container acceptance receipts are
+separate under the same output root. See [public experiments](PUBLIC_EXPERIMENTS.md).
+
+The full R17 terminal prefix was independently audited: 98,085 records, 167,787
+execution operations, 68 filled virtual orders over 36 markets and no observed
+accounting discrepancy or risk breach. Its final model result is -$3.5044 with
+zero open cost. That result does not establish real profitability. New parameters
+and assumed execution latencies are experiments; no completed clean economic
+holdout or funded readiness is claimed. Existing global $10/$20 limits remain.
+
 ## October 15, 2026 - public-paper filter order and quote subset admission
 
 Fresh-source formatting, all-target Clippy with warnings denied and **341 Rust
@@ -19,7 +48,7 @@ drawdown caps, settlement accounting and funded behavior remain unchanged.
 See [R17 policy and replay limits](PAPER_STRATEGY_R17.md). This does not establish
 counterfactual profit, a completed holdout or funded readiness.
 
-## October 14, 2026 — experimental public-paper entry and inventory repair
+## October 14, 2026 â€” experimental public-paper entry and inventory repair
 
 Fresh-source validation passes **338 Rust tests**, formatting and all-target Clippy
 with warnings denied. Public-paper new entries use a bounded one-second/one-basis-point

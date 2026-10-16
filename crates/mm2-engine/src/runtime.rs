@@ -12,12 +12,27 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+#[cfg(test)]
+thread_local! {
+    // Current-thread actor tests supply time explicitly; production builds have
+    // neither this slot nor a clock override. Parallel tests use separate slots.
+    static TEST_CLOCK: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
 pub fn wall_ms() -> u64 {
+    #[cfg(test)]
+    if let Some((wall, _)) = TEST_CLOCK.with(std::cell::Cell::get) {
+        return wall;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis().try_into().unwrap_or(u64::MAX))
 }
 pub fn mono_ms(start: Instant) -> u64 {
+    #[cfg(test)]
+    if let Some((_, mono)) = TEST_CLOCK.with(std::cell::Cell::get) {
+        return mono;
+    }
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 fn valid_feed_prefix(core: &Core, batch: &[FeedEvent]) -> usize {
@@ -86,6 +101,30 @@ type Reply = Result<Value, Failure>;
 // One actor turn, not a lossy market-data merge. Commands/faults are checked
 // again between bounded turns; all trade inputs retain FIFO order in one sync.
 const FEED_BATCH_LIMIT: usize = 16;
+
+/// Start aging only after confirmed inventory becomes unmatched. A process
+/// restart starts conservatively at zero; posting an order never starts this clock.
+#[derive(Default)]
+struct InventoryAge {
+    since: Option<(String, bool, u64)>,
+}
+impl InventoryAge {
+    fn observe(&mut self, market: &str, up: u64, down: u64, now: u64) -> u64 {
+        if up == down {
+            self.since = None;
+            return 0;
+        }
+        let up_owned = up > down;
+        if self
+            .since
+            .as_ref()
+            .is_none_or(|(id, side, at)| id != market || *side != up_owned || *at > now)
+        {
+            self.since = Some((market.to_owned(), up_owned, now));
+        }
+        now.saturating_sub(self.since.as_ref().expect("unmatched inventory").2)
+    }
+}
 enum Operation {
     Command(Command, oneshot::Sender<Reply>),
     Mirror(Command),
@@ -254,6 +293,8 @@ pub struct Actor {
     simulation_condition: Option<String>,
     execution_mode: String,
     strategy: mm2_strategy::Rules,
+    paper_policy: Option<mm2_strategy::PaperPolicy>,
+    inventory_age: InventoryAge,
     desired_quotes: Vec<mm2_core::DesiredQuote>,
     strategy_gate: Option<mm2_strategy::Gate>,
     reference_guard: crate::paper_guard::ReferenceGuard,
@@ -303,6 +344,7 @@ struct Publication {
     desired_quotes: Vec<mm2_core::DesiredQuote>,
     strategy_gate: Option<mm2_strategy::Gate>,
     live: Option<Arc<mm2_live::LiveSnapshot>>,
+    paper_policy: Option<mm2_strategy::PaperPolicy>,
     journal_metrics: Option<crate::journal::JournalMetrics>,
     paper_portfolio: Option<mm2_portfolio::Snapshot>,
     paper_resolution: Option<Value>,
@@ -449,6 +491,8 @@ pub fn prepare(
         simulation_condition,
         execution_mode: config.mode.clone(),
         strategy: config.strategy.clone(),
+        paper_policy: config.paper_policy.clone(),
+        inventory_age: InventoryAge::default(),
         desired_quotes: Vec::new(),
         strategy_gate: None,
         reference_guard: Default::default(),
@@ -620,7 +664,17 @@ impl Actor {
                         .as_ref()
                         .and_then(|costs| Some([costs[0].parse().ok()?, costs[1].parse().ok()?]));
                     if self.source == "public" {
-                        mm2_strategy::decide_inventory_repair(&rules, &input, costs)
+                        if let Some(policy) = &self.paper_policy {
+                            let age = self.inventory_age.observe(
+                                &market.condition_id,
+                                input.inventory_up_micros,
+                                input.inventory_down_micros,
+                                now,
+                            );
+                            mm2_strategy::decide_experimental(&rules, &input, costs, policy, age)
+                        } else {
+                            mm2_strategy::decide_inventory_repair(&rules, &input, costs)
+                        }
                     } else {
                         mm2_strategy::decide_inventory_aware(&rules, &input, costs)
                     }
@@ -643,7 +697,13 @@ impl Actor {
                                 decision.reason = mm2_strategy::Gate::MissingSignal;
                             }
                             Some(Some(outcome)) => {
-                                decision.quotes.retain(|q| q.outcome != outcome);
+                                if self.paper_policy.is_some() {
+                                    // A directional veto invalidates the two-sided entry;
+                                    // it cannot silently become a singleton purchase.
+                                    decision.quotes.clear();
+                                } else {
+                                    decision.quotes.retain(|q| q.outcome != outcome);
+                                }
                                 if decision.quotes.is_empty() {
                                     decision.reason = mm2_strategy::Gate::DirectionalGuard;
                                 }
@@ -655,7 +715,15 @@ impl Actor {
                         && let Some(paper) = paper
                     {
                         if self.source == "public" {
-                            paper.guard_public_strategy_quotes(&rules, &mut decision)?;
+                            if let Some(policy) = &self.paper_policy {
+                                paper.guard_experimental_strategy_quotes(
+                                    &rules,
+                                    &mut decision,
+                                    policy,
+                                )?;
+                            } else {
+                                paper.guard_public_strategy_quotes(&rules, &mut decision)?;
+                            }
                         } else {
                             paper.guard_strategy_quotes(&rules, &mut decision)?;
                         }
@@ -859,6 +927,7 @@ impl Actor {
             desired_quotes: self.desired_quotes.clone(),
             strategy_gate: self.strategy_gate,
             live: self.live.as_ref().map(|handle| handle.snapshot()),
+            paper_policy: self.paper_policy.clone(),
             journal_metrics: self.journal.as_ref().map(|journal| journal.metrics()),
             paper_portfolio: self
                 .simulation
@@ -1547,7 +1616,24 @@ impl Actor {
                 continue;
             }
             let candidate = candidate.get_or_insert_with(|| session.clone());
-            let operation = if candidate.exact_execution_costs() {
+            let operation = if candidate.exact_execution_costs() && self.paper_policy.is_some() {
+                let now_ms = self.simulation_origin_ms.saturating_add(mono);
+                if candidate.now_ms() > now_ms {
+                    // A synthetic drain may lead real time. Do not move a public
+                    // print forward into a different prospective order's lifetime.
+                    continue;
+                }
+                SimulationOperation::ObservedTradeV3 {
+                    now_ms,
+                    exchange_event_mono_ms: now_ms.saturating_sub(wall - *exchange_ms),
+                    exchange_ms: *exchange_ms,
+                    received_wall_ms: wall,
+                    outcome: outcome_name(*outcome).into(),
+                    price_micros: *price_micro,
+                    quantity_micros: *quantity_micro,
+                    fingerprint: fingerprint.clone(),
+                }
+            } else if candidate.exact_execution_costs() {
                 SimulationOperation::ObservedTradeV2 {
                     now_ms: self
                         .simulation_origin_ms
@@ -2057,7 +2143,15 @@ impl Publication {
         publication["paper_strategy_policy"] = if self.execution_mode == "simulation"
             && self.source == "public"
         {
-            json!({"id":"r17-directional-admission-subsets-v1","experimental":true,"entry_guard_bps":1,"entry_guard_horizon_ms":1000,"entry_filter_before_risk":true,"quote_selection":"full_set_else_safe_strategy_priority_subset","repair":"passive_complement_strict_gross_risk_reduction","minimum_order_shares":5,"global_risk_limits_unchanged":true})
+            if let Some(policy) = self.paper_policy {
+                json!({"id":"r18-paired-market-budget-staged-repair-v1","experimental":true,
+                    "parameters":policy,"entry_guard_bps":1,"entry_guard_horizon_ms":1000,
+                    "quote_selection":"paired_entry_or_abstain","minimum_order_shares":5,
+                    "public_trade_model":"causal_v3_strictly_posted_before_exchange_print",
+                    "global_risk_limits_unchanged":true,"profitability":"unproven"})
+            } else {
+                json!({"id":"r17-directional-admission-subsets-v1","experimental":true,"entry_guard_bps":1,"entry_guard_horizon_ms":1000,"entry_filter_before_risk":true,"quote_selection":"full_set_else_safe_strategy_priority_subset","repair":"passive_complement_strict_gross_risk_reduction","minimum_order_shares":5,"global_risk_limits_unchanged":true})
+            }
         } else {
             Value::Null
         };
@@ -2143,6 +2237,66 @@ fn reason_name(reason: &StopReason) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod paper_venue_rules;
+
+    struct TestClock {
+        previous: Option<(u64, u64)>,
+    }
+    impl TestClock {
+        fn fixed(wall: u64, mono: u64) -> Self {
+            Self {
+                previous: TEST_CLOCK.with(|slot| slot.replace(Some((wall, mono)))),
+            }
+        }
+        fn advance(&self, milliseconds: u64) {
+            Self::advance_current(milliseconds);
+        }
+        fn advance_current(milliseconds: u64) {
+            TEST_CLOCK.with(|slot| {
+                let (wall, mono) = slot.get().expect("scoped clock is active");
+                slot.set(Some((wall + milliseconds, mono + milliseconds)));
+            });
+        }
+    }
+    impl Drop for TestClock {
+        fn drop(&mut self) {
+            TEST_CLOCK.with(|slot| slot.set(self.previous));
+        }
+    }
+
+    #[test]
+    fn test_clock_scope_restores_prior_clock_without_changing_production_tolerances() {
+        assert!(TEST_CLOCK.with(std::cell::Cell::get).is_none());
+        {
+            let clock = TestClock::fixed(10_000, 2_000);
+            assert_eq!(wall_ms(), 10_000);
+            assert_eq!(mono_ms(Instant::now()), 2_000);
+            clock.advance(3);
+            assert_eq!(wall_ms(), 10_003);
+            assert_eq!(mono_ms(Instant::now()), 2_003);
+            {
+                let _nested = TestClock::fixed(20_000, 4_000);
+                assert_eq!(wall_ms(), 20_000);
+            }
+            assert_eq!(wall_ms(), 10_003);
+        }
+        assert!(TEST_CLOCK.with(std::cell::Cell::get).is_none());
+    }
+
+    #[test]
+    fn repair_age_tracks_confirmed_residual_and_resets_on_flat_side_market_or_clock_change() {
+        let mut age = InventoryAge::default();
+        assert_eq!(age.observe("a", 0, 0, 10), 0);
+        assert_eq!(age.observe("a", 5, 0, 20), 0);
+        assert_eq!(age.observe("a", 5, 1, 30), 10);
+        assert_eq!(age.observe("a", 5, 1, 40), 20);
+        assert_eq!(age.observe("a", 5, 5, 50), 0);
+        assert_eq!(age.observe("a", 5, 6, 60), 0);
+        assert_eq!(age.observe("a", 5, 6, 70), 10);
+        assert_eq!(age.observe("a", 7, 6, 80), 0);
+        assert_eq!(age.observe("b", 7, 6, 90), 0);
+        assert_eq!(age.observe("b", 7, 6, 89), 0);
+    }
 
     #[tokio::test]
     async fn invalid_book_refresh_preserves_owner_and_portfolio_and_is_bounded() {
@@ -2233,8 +2387,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn split_delta_preserves_queued_native_recovery_and_source_clock_barrier() {
+        let clock = TestClock::fixed(1_800_000_000_000, 0);
         let directory = tempfile::tempdir().unwrap();
         let config = batch_config(directory.path());
         let (_tx, rx) = mpsc::channel(16);
@@ -2252,6 +2407,7 @@ mod tests {
             tick_micro: 10_000,
         };
         actor.select_market(market.clone()).await.unwrap();
+        clock.advance(3);
         actor.core.control(Action::Resume).unwrap();
         let finance = actor.simulation.as_ref().unwrap().portfolio_snapshot();
         let seed = |outcome, at| FeedEvent::Snapshot {
@@ -2342,6 +2498,7 @@ mod tests {
             valid_feed_prefix_with_recovery(&actor.core, &[invalid], None),
             0
         );
+        clock.advance(1);
         assert!(actor.apply_feed_event(crossed(4)));
         actor.native_snapshot_recovery.as_mut().unwrap().0 =
             Instant::now() - Duration::from_millis(config.limits.max_feed_age_ms + 1);
@@ -2366,6 +2523,7 @@ mod tests {
             journal_max_bytes: 1_048_576,
             journal: None,
             strategy: Default::default(),
+            paper_policy: None,
             live: None,
             command_capacity: 8,
             feed_capacity: 16,
@@ -2553,8 +2711,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn public_paper_entry_filter_blocks_adverse_side_and_missing_reference() {
+        let _clock = TestClock::fixed(1_800_000_000_000, 2_000);
         let directory = tempfile::tempdir().unwrap();
         let config = batch_config(directory.path());
         let mut actor = batch_actor(&config).await;
@@ -2724,6 +2883,138 @@ mod tests {
             Some(4)
         );
         assert_eq!(actor.limits, config.limits.canonical().unwrap());
+    }
+
+    fn seed_experimental_actor_inputs(actor: &mut Actor, latest_reference: u64) {
+        actor.start = Instant::now() - Duration::from_secs(2);
+        let now = wall_ms();
+        let mono = mono_ms(actor.start);
+        let market = actor.core.snapshot().market.unwrap();
+        let (_fees, rx) = watch::channel(Some(mm2_live::fees::FeePolicy {
+            condition_id: market.condition_id.clone(),
+            up_token: market.up_token,
+            down_token: market.down_token,
+            rate: "0.07".into(),
+            exponent: 1,
+            taker_only: true,
+            observed_at_ms: now,
+            response_sha256: "a".repeat(64),
+        }));
+        actor.fee_policy = rx;
+        for outcome in [Outcome::Up, Outcome::Down] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: market.condition_id.clone(),
+                    outcome,
+                    exchange_ms: now,
+                    observed_mono_ms: mono,
+                    bids: vec![crate::domain::Level {
+                        price_micro: 490_000,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: 510_000,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.reference_guard = Default::default();
+        actor
+            .reference_guard
+            .observe(now - 1_000, mono - 1_000, 100_000_000);
+        actor
+            .core
+            .apply(FeedEvent::Reference {
+                exchange_ms: now,
+                observed_mono_ms: mono,
+                price_micro: latest_reference,
+            })
+            .unwrap();
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn experimental_runtime_neutral_entry_is_paired_and_directional_veto_removes_both() {
+        let _clock = TestClock::fixed(1_800_000_000_000, 2_000);
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = batch_config(directory.path());
+        config.paper_policy = Some(mm2_strategy::PaperPolicy {
+            entry_close_guard_ms: 30_000,
+            ..Default::default()
+        });
+        let mut actor = batch_actor(&config).await;
+        seed_experimental_actor_inputs(&mut actor, 100_000_000);
+        assert_eq!(
+            actor.strategy_gate,
+            Some(mm2_strategy::Gate::Quote),
+            "stops={:?}",
+            actor.last_decision.stop_reasons
+        );
+        assert_eq!(actor.desired_quotes.len(), 2);
+        assert_ne!(
+            actor.desired_quotes[0].outcome,
+            actor.desired_quotes[1].outcome
+        );
+        assert!(
+            actor
+                .desired_quotes
+                .iter()
+                .all(|quote| quote.quantity_micros == 5_000_000)
+        );
+        for price in [100_020_000, 99_980_000] {
+            seed_experimental_actor_inputs(&mut actor, price);
+            assert_eq!(
+                actor.strategy_gate,
+                Some(mm2_strategy::Gate::DirectionalGuard)
+            );
+            assert!(actor.desired_quotes.is_empty());
+        }
+        assert_eq!(actor.paper_policy, config.paper_policy);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn experimental_runtime_global_and_market_budgets_cannot_reduce_entry_to_singleton() {
+        let _clock = TestClock::fixed(1_800_000_000_000, 2_000);
+        for prior_market_risk in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = batch_config(directory.path());
+            config.paper_policy = Some(mm2_strategy::PaperPolicy {
+                entry_close_guard_ms: 30_000,
+                market_loss_cap_micros: if prior_market_risk {
+                    3_000_000
+                } else {
+                    2_000_000
+                },
+                ..Default::default()
+            });
+            if prior_market_risk {
+                retained_windows_version(&config, 4, true); // One finite pool retains $8 of prior possible loss.
+            }
+            let mut actor = batch_actor(&config).await;
+            seed_experimental_actor_inputs(&mut actor, 100_000_000);
+            assert_eq!(
+                actor.strategy_gate,
+                Some(if prior_market_risk {
+                    mm2_strategy::Gate::LossBudget
+                } else {
+                    mm2_strategy::Gate::MarketLossBudget
+                })
+            );
+            assert!(actor.desired_quotes.is_empty());
+            assert_eq!(actor.paper_policy, config.paper_policy);
+            assert_eq!(
+                actor
+                    .simulation
+                    .as_ref()
+                    .unwrap()
+                    .portfolio_snapshot()
+                    .held_market_count,
+                Some(if prior_market_risk { 4 } else { 0 })
+            );
+        }
     }
 
     async fn batch_actor(config: &Config) -> Actor {
@@ -3302,6 +3593,7 @@ mod tests {
             journal_max_bytes: 1_048_576,
             journal: None,
             strategy: mm2_strategy::Rules::default(),
+            paper_policy: None,
             live: None,
             command_capacity: 8,
             feed_capacity: 16,
@@ -3366,6 +3658,7 @@ mod tests {
             journal_max_bytes: 1_048_576,
             journal: None,
             strategy: mm2_strategy::Rules::default(),
+            paper_policy: None,
             live: None,
             command_capacity: 8,
             feed_capacity: 16,
@@ -3422,6 +3715,7 @@ mod tests {
             journal_max_bytes: 1_048_576,
             journal: None,
             strategy: mm2_strategy::Rules::default(),
+            paper_policy: None,
             live: None,
             command_capacity: 8,
             feed_capacity: 16,
@@ -3467,6 +3761,7 @@ mod tests {
             journal_max_bytes: 1_048_576,
             journal: None,
             strategy: mm2_strategy::Rules::default(),
+            paper_policy: None,
             live: None,
             command_capacity: 8,
             feed_capacity: 16,

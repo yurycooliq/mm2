@@ -12,6 +12,9 @@ use std::{
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MultiMarketPaper {
     session: PaperSession,
+    /// Explicit experiment latency survives market rollover; old journals use the original default.
+    #[serde(default)]
+    latency: LatencyConfig,
     portfolio: mm2_portfolio::Portfolio,
     current_market: Option<String>,
     public_trades: VecDeque<String>,
@@ -101,7 +104,7 @@ impl MultiMarketPaper {
         rules: &mm2_strategy::Rules,
         decision: &mut mm2_strategy::Decision,
     ) -> Result<(), String> {
-        self.guard_strategy_quotes_inner(rules, decision, false)
+        self.guard_strategy_quotes_inner(rules, decision, false, false)
     }
     /// Public-paper selection only. Preserve the full decision when affordable;
     /// otherwise retain a safe subset in the strategy's existing priority order.
@@ -114,13 +117,149 @@ impl MultiMarketPaper {
         if decision.quotes.len() > mm2_strategy::MAX_QUOTES {
             return Err("unbounded public strategy decision".into());
         }
-        self.guard_strategy_quotes_inner(rules, decision, true)
+        self.guard_strategy_quotes_inner(rules, decision, true, false)
+    }
+    /// Opt-in maker hypothesis: affordability may cancel a pair, never turn it
+    /// into a directional lottery. Lifetime market losses survive closeouts.
+    pub fn guard_experimental_strategy_quotes(
+        &self,
+        rules: &mm2_strategy::Rules,
+        decision: &mut mm2_strategy::Decision,
+        policy: &mm2_strategy::PaperPolicy,
+    ) -> Result<(), String> {
+        policy.validate()?;
+        if decision.quotes.len() > mm2_strategy::MAX_QUOTES {
+            return Err("unbounded experimental strategy decision".into());
+        }
+        let current = self
+            .current_market
+            .as_deref()
+            .ok_or("missing strategy market")?;
+        let position = self
+            .portfolio
+            .market(current)
+            .ok_or("missing strategy inventory")?;
+        let snapshot = self.session.snapshot();
+        let overlaps_complement = decision
+            .quotes
+            .iter()
+            .filter(|quote| quote.slot.ends_with(":repair"))
+            .any(|quote| {
+                let retained = snapshot.orders.iter().any(|order| {
+                    order.quote.slot == quote.slot
+                        && order.quote.outcome == quote.outcome
+                        && order.quote.price_micros == quote.price_micros
+                        && order.requested_quantity_micros == quote.quantity_micros
+                        && order.reserved_quantity_micros > 0
+                });
+                !retained
+                    && snapshot.orders.iter().any(|order| {
+                        order.quote.outcome == quote.outcome && order.reserved_quantity_micros > 0
+                    })
+            });
+        if overlaps_complement {
+            // Cancel first and wait for terminal reconciliation before a new
+            // repair, including a minimum-size overbuy for partial inventory.
+            decision.quotes.clear();
+            decision.reason = mm2_strategy::Gate::InventoryCost;
+            return Ok(());
+        }
+        if position.up.quantity_micros == position.down.quantity_micros
+            && !decision.quotes.is_empty()
+            && (decision.quotes.len() != 2
+                || decision.quotes[0].outcome == decision.quotes[1].outcome
+                || decision.quotes[0].quantity_micros != decision.quotes[1].quantity_micros
+                || decision.quotes.iter().any(|q| !q.slot.ends_with(":lot"))
+                || decision.quotes.iter().map(|q| q.price_micros).sum::<u64>()
+                    > mm2_core::SCALE - policy.min_pair_edge_micros)
+        {
+            decision.quotes.clear();
+            decision.reason = mm2_strategy::Gate::PairedEntry;
+            return Ok(());
+        }
+        let mut effective = rules.clone();
+        effective.max_pair_edge_micros = effective
+            .max_pair_edge_micros
+            .max(policy.min_pair_edge_micros);
+        self.guard_strategy_quotes_inner(&effective, decision, false, true)?;
+        if decision.quotes.is_empty() {
+            return Ok(());
+        }
+        let Some(realized_loss) = position.realized_gross_loss_pico()? else {
+            decision.quotes.clear();
+            decision.reason = mm2_strategy::Gate::MarketLossBudget;
+            return Ok(());
+        };
+        let mut possible = [0_u64; 2];
+        let mut prices = [0_u64; 2];
+        for order in &snapshot.orders {
+            let side = usize::from(order.quote.outcome == Outcome::Down);
+            possible[side] = possible[side]
+                .checked_add(order.reserved_quantity_micros)
+                .ok_or("possible fill overflow")?;
+            prices[side] = prices[side].max(order.quote.price_micros);
+        }
+        for quote in &decision.quotes {
+            if !snapshot.orders.iter().any(|order| {
+                order.quote.slot == quote.slot
+                    && order.quote.outcome == quote.outcome
+                    && order.quote.price_micros == quote.price_micros
+                    && order.requested_quantity_micros == quote.quantity_micros
+            }) {
+                let side = usize::from(quote.outcome == Outcome::Down);
+                possible[side] = possible[side]
+                    .checked_add(quote.quantity_micros)
+                    .ok_or("new fill overflow")?;
+                prices[side] = prices[side].max(quote.price_micros);
+            }
+        }
+        let repair = decision
+            .quotes
+            .iter()
+            .any(|quote| quote.slot.ends_with(":repair"));
+        let mut worst = 0;
+        let mut worst_locked = 0;
+        for mask in 0..4 {
+            let mut quantities = [position.up.quantity_micros, position.down.quantity_micros];
+            let mut costs = [position.up.cost_pico, position.down.cost_pico];
+            for side in 0..2 {
+                if mask & (1 << side) != 0 {
+                    quantities[side] = quantities[side]
+                        .checked_add(possible[side])
+                        .ok_or("prospective inventory overflow")?;
+                    costs[side] += u128::from(possible[side]) * u128::from(prices[side]);
+                }
+            }
+            worst = worst.max(mm2_strategy::inventory_loss_bound(quantities, costs));
+            let matched = quantities[0].min(quantities[1]);
+            if matched > 0 {
+                let matched_cost = (0..2)
+                    .map(|side| {
+                        (costs[side] * u128::from(matched)).div_ceil(u128::from(quantities[side]))
+                    })
+                    .sum::<u128>();
+                worst_locked = worst_locked.max(
+                    matched_cost.saturating_sub(u128::from(matched) * u128::from(mm2_core::SCALE)),
+                );
+            }
+        }
+        if realized_loss + worst
+            >= u128::from(policy.market_loss_cap_micros) * u128::from(mm2_core::SCALE)
+            || (repair
+                && worst_locked
+                    > u128::from(policy.max_locked_loss_micros) * u128::from(mm2_core::SCALE))
+        {
+            decision.quotes.clear();
+            decision.reason = mm2_strategy::Gate::MarketLossBudget;
+        }
+        Ok(())
     }
     fn guard_strategy_quotes_inner(
         &self,
         rules: &mm2_strategy::Rules,
         decision: &mut mm2_strategy::Decision,
         select_subset: bool,
+        retained_repair_remaining: bool,
     ) -> Result<(), String> {
         if !self.exact_execution_costs {
             decision.quotes.clear();
@@ -175,13 +314,29 @@ impl MultiMarketPaper {
                 let quantities = [position.up.quantity_micros, position.down.quantity_micros];
                 let costs = [position.up.cost_pico, position.down.cost_pico];
                 let side = usize::from(quote.outcome == Outcome::Down);
+                let quantity = if retained_repair_remaining {
+                    self.session
+                        .snapshot()
+                        .orders
+                        .iter()
+                        .find(|order| {
+                            order.quote.slot == quote.slot
+                                && order.quote.outcome == quote.outcome
+                                && order.quote.price_micros == quote.price_micros
+                                && order.requested_quantity_micros == quote.quantity_micros
+                        })
+                        .map_or(quote.quantity_micros, |order| {
+                            order.reserved_quantity_micros
+                        })
+                } else {
+                    quote.quantity_micros
+                };
                 let mut after = quantities;
                 after[side] = after[side]
-                    .checked_add(quote.quantity_micros)
+                    .checked_add(quantity)
                     .ok_or("repair quantity overflow")?;
                 let mut after_costs = costs;
-                after_costs[side] +=
-                    u128::from(quote.quantity_micros) * u128::from(quote.price_micros);
+                after_costs[side] += u128::from(quantity) * u128::from(quote.price_micros);
                 if mm2_strategy::inventory_loss_bound(after, after_costs)
                     >= mm2_strategy::inventory_loss_bound(quantities, costs)
                 {
@@ -391,7 +546,7 @@ impl MultiMarketPaper {
                 return Err("finite paper portfolio collateral exhausted".into());
             }
             let now = self.session.now_ms();
-            self.session = PaperSession::new(limits, LatencyConfig::default())?;
+            self.session = PaperSession::new(limits, self.latency.clone())?;
             if self.exact_execution_costs {
                 self.session.defer_automatic_posts();
             }
@@ -481,6 +636,18 @@ pub enum Operation {
         quantity_micros: u64,
         fingerprint: String,
     },
+    /// Causal execution revision: original exchange clock and its caller-checked
+    /// normalization are persisted. V2 historical replay remains unchanged.
+    ObservedTradeV3 {
+        now_ms: u64,
+        received_wall_ms: u64,
+        exchange_event_mono_ms: u64,
+        exchange_ms: u64,
+        outcome: String,
+        price_micros: u64,
+        quantity_micros: u64,
+        fingerprint: String,
+    },
     VenueRules {
         now_ms: u64,
         tick_micros: u64,
@@ -532,6 +699,14 @@ pub fn risk(limits: &Limits) -> Result<RiskLimits, String> {
 }
 
 pub fn new(limits: &Limits) -> Result<MultiMarketPaper, String> {
+    new_with_latency(limits, LatencyConfig::default())
+}
+
+pub fn new_with_latency(
+    limits: &Limits,
+    latency: LatencyConfig,
+) -> Result<MultiMarketPaper, String> {
+    latency.validate()?;
     let initial = limits.core()?.initial_collateral_micro;
     let portfolio = mm2_portfolio::Portfolio::new(
         initial,
@@ -542,7 +717,8 @@ pub fn new(limits: &Limits) -> Result<MultiMarketPaper, String> {
         },
     )?;
     Ok(MultiMarketPaper {
-        session: PaperSession::new(risk(limits)?, LatencyConfig::default())?,
+        session: PaperSession::new(risk(limits)?, latency.clone())?,
+        latency,
         portfolio,
         current_market: None,
         public_trades: VecDeque::new(),
@@ -747,6 +923,43 @@ pub fn apply(session: &mut MultiMarketPaper, operation: &Operation) -> Result<()
             } else {
                 session.trade(*now_ms, outcome(name)?, *price_micros, *quantity_micros)?;
             }
+            if session.public_trades.len() == 8192 {
+                session.public_trades.pop_front();
+            }
+            session.public_trades.push_back(fingerprint.clone());
+            Ok(())
+        }
+        Operation::ObservedTradeV3 {
+            now_ms,
+            received_wall_ms,
+            exchange_event_mono_ms,
+            exchange_ms,
+            outcome: name,
+            price_micros,
+            quantity_micros,
+            fingerprint,
+        } => {
+            if !session.exact_execution_costs
+                || *exchange_ms == 0
+                || received_wall_ms.checked_sub(*exchange_ms)
+                    != now_ms.checked_sub(*exchange_event_mono_ms)
+                || *received_wall_ms < *exchange_ms
+                || *exchange_event_mono_ms > *now_ms
+                || fingerprint.len() != 64
+                || !fingerprint.bytes().all(|c| c.is_ascii_hexdigit())
+            {
+                return Err("invalid causal public trade witness".into());
+            }
+            if session.public_trades.contains(fingerprint) {
+                return Ok(());
+            }
+            session.trade_at_price_causal(
+                *now_ms,
+                *exchange_event_mono_ms,
+                outcome(name)?,
+                *price_micros,
+                *quantity_micros,
+            )?;
             if session.public_trades.len() == 8192 {
                 session.public_trades.pop_front();
             }
@@ -987,6 +1200,300 @@ mod tests {
             price_micros,
             quantity_micros: 5_000_000,
         }
+    }
+    fn experimental_paper() -> MultiMarketPaper {
+        let mut paper = new(&limits()).unwrap();
+        apply(&mut paper, &Operation::ExactAccounting {}).unwrap();
+        apply(
+            &mut paper,
+            &Operation::Market {
+                condition_id: id('a'),
+                start_ms: Some(0),
+                end_ms: Some(300_000),
+            },
+        )
+        .unwrap();
+        paper
+    }
+    #[test]
+    fn experimental_pair_never_falls_back_to_singleton() {
+        let paper = profitable_paper_with_two_dollars_remaining();
+        let rules = mm2_strategy::Rules::default();
+        let policy = mm2_strategy::PaperPolicy::default();
+        let mut d = decision(vec![lot(Outcome::Up, 300_000), lot(Outcome::Down, 600_000)]);
+        paper
+            .guard_experimental_strategy_quotes(&rules, &mut d, &policy)
+            .unwrap();
+        assert!(d.quotes.is_empty());
+        assert_eq!(d.reason, mm2_strategy::Gate::LossBudget);
+        let mut d = decision(vec![lot(Outcome::Down, 300_000)]);
+        paper
+            .guard_experimental_strategy_quotes(&rules, &mut d, &policy)
+            .unwrap();
+        assert!(d.quotes.is_empty());
+        assert_eq!(d.reason, mm2_strategy::Gate::PairedEntry);
+    }
+    #[test]
+    fn experimental_market_budget_includes_negative_merge_even_after_basis_is_zero() {
+        let mut paper = experimental_paper();
+        paper
+            .portfolio
+            .record_execution_outcome_totals(
+                &id('a'),
+                [3_000_000_000_000, 2_500_000_000_000],
+                [5_000_000, 5_000_000],
+            )
+            .unwrap();
+        paper
+            .portfolio
+            .merge_complete_sets(
+                mm2_portfolio::MergeReceipt {
+                    id: "loss-merge".into(),
+                    market_id: id('a'),
+                    quantity_micros: 5_000_000,
+                    fee_pico: 0,
+                    at_ms: 1,
+                    provenance: mm2_portfolio::Provenance::Synthetic,
+                },
+                true,
+            )
+            .unwrap();
+        let mut d = decision(vec![lot(Outcome::Up, 500_000), lot(Outcome::Down, 480_000)]);
+        paper
+            .guard_experimental_strategy_quotes(
+                &mm2_strategy::Rules::default(),
+                &mut d,
+                &mm2_strategy::PaperPolicy::default(),
+            )
+            .unwrap();
+        assert!(d.quotes.is_empty()); // $0.50 spent + $2.50 possible = strict $3 cap.
+        assert_eq!(d.reason, mm2_strategy::Gate::MarketLossBudget);
+        let mut d = decision(vec![lot(Outcome::Up, 490_000), lot(Outcome::Down, 490_000)]);
+        paper
+            .guard_experimental_strategy_quotes(
+                &mm2_strategy::Rules::default(),
+                &mut d,
+                &mm2_strategy::PaperPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(d.quotes.len(), 2); // $0.50 + $2.45 remains below the allocation.
+    }
+    #[test]
+    fn experimental_guard_retains_queue_but_counts_cancel_in_flight_replacements() {
+        let mut paper = experimental_paper();
+        for outcome in [Outcome::Up, Outcome::Down] {
+            paper
+                .set_book(
+                    0,
+                    outcome,
+                    Book {
+                        bid: Some(490_000),
+                        ask: Some(510_000),
+                        bid_levels: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        let quotes = vec![lot(Outcome::Up, 490_000), lot(Outcome::Down, 490_000)];
+        paper.quote(0, quotes.clone()).unwrap();
+        paper.advance(100).unwrap();
+        let mut d = decision(quotes);
+        paper
+            .guard_experimental_strategy_quotes(
+                &mm2_strategy::Rules::default(),
+                &mut d,
+                &mm2_strategy::PaperPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(d.quotes.len(), 2);
+        paper.cancel_all(100).unwrap();
+        let replacement = vec![lot(Outcome::Up, 500_000), lot(Outcome::Down, 480_000)];
+        let mut d = decision(replacement.clone());
+        paper
+            .guard_experimental_strategy_quotes(
+                &mm2_strategy::Rules::default(),
+                &mut d,
+                &mm2_strategy::PaperPolicy::default(),
+            )
+            .unwrap();
+        assert!(d.quotes.is_empty());
+        assert_eq!(d.reason, mm2_strategy::Gate::MarketLossBudget);
+        paper.advance(1000).unwrap();
+        let mut d = decision(replacement);
+        paper
+            .guard_experimental_strategy_quotes(
+                &mm2_strategy::Rules::default(),
+                &mut d,
+                &mm2_strategy::PaperPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(d.quotes.len(), 2);
+        paper.validate().unwrap();
+    }
+    #[test]
+    fn experimental_repair_waits_for_complement_cancel_and_retains_partial_order_identity() {
+        let mut paper = experimental_paper();
+        for (name, bid, ask) in [("up", 480_000, 500_000), ("down", 550_000, 560_000)] {
+            apply(
+                &mut paper,
+                &Operation::Book {
+                    now_ms: 0,
+                    outcome: name.into(),
+                    bid,
+                    ask,
+                    ahead_micros: 0,
+                },
+            )
+            .unwrap();
+        }
+        let mut entry = lot(Outcome::Up, 480_000);
+        entry.slot = "up:lot".into();
+        apply(
+            &mut paper,
+            &Operation::Quotes {
+                now_ms: 0,
+                quotes: from_core_quotes(&[entry]),
+            },
+        )
+        .unwrap();
+        apply(&mut paper, &Operation::Advance { now_ms: 100 }).unwrap();
+        apply(
+            &mut paper,
+            &Operation::Trade {
+                now_ms: 100,
+                outcome: "up".into(),
+                worst_price_micros: 480_000,
+                quantity_micros: 5_000_000,
+            },
+        )
+        .unwrap();
+        apply(&mut paper, &Operation::Advance { now_ms: 200 }).unwrap();
+        assert_eq!(
+            paper.portfolio.market(&id('a')).unwrap().up.quantity_micros,
+            5_000_000
+        );
+        let mut hedge = lot(Outcome::Down, 500_000);
+        hedge.slot = "down:hedge".into();
+        apply(
+            &mut paper,
+            &Operation::Quotes {
+                now_ms: 200,
+                quotes: from_core_quotes(&[hedge]),
+            },
+        )
+        .unwrap();
+        apply(&mut paper, &Operation::Advance { now_ms: 300 }).unwrap();
+        let mut repair = lot(Outcome::Down, 550_000);
+        repair.slot = "down:repair".into();
+        let mut d = decision(vec![repair.clone()]);
+        let rules = mm2_strategy::Rules::default();
+        let policy = mm2_strategy::PaperPolicy::default();
+        paper
+            .guard_experimental_strategy_quotes(&rules, &mut d, &policy)
+            .unwrap();
+        assert!(d.quotes.is_empty());
+        assert_eq!(d.reason, mm2_strategy::Gate::InventoryCost);
+        apply(&mut paper, &Operation::CancelAll { now_ms: 300 }).unwrap();
+        apply(&mut paper, &Operation::Advance { now_ms: 1000 }).unwrap();
+        let mut d = decision(vec![repair.clone()]);
+        paper
+            .guard_experimental_strategy_quotes(&rules, &mut d, &policy)
+            .unwrap();
+        assert_eq!(d.quotes, vec![repair.clone()]);
+        apply(
+            &mut paper,
+            &Operation::Quotes {
+                now_ms: 1000,
+                quotes: from_core_quotes(&[repair.clone()]),
+            },
+        )
+        .unwrap();
+        apply(&mut paper, &Operation::Advance { now_ms: 1100 }).unwrap();
+        apply(
+            &mut paper,
+            &Operation::Trade {
+                now_ms: 1100,
+                outcome: "down".into(),
+                worst_price_micros: 550_000,
+                quantity_micros: 2_000_000,
+            },
+        )
+        .unwrap();
+        apply(&mut paper, &Operation::Advance { now_ms: 1200 }).unwrap();
+        assert_eq!(
+            paper
+                .portfolio
+                .market(&id('a'))
+                .unwrap()
+                .down
+                .quantity_micros,
+            2_000_000
+        );
+        let mut d = decision(vec![repair.clone()]);
+        paper
+            .guard_experimental_strategy_quotes(&rules, &mut d, &policy)
+            .unwrap();
+        assert_eq!(d.quotes, vec![repair]); // original five-share identity; three still possible.
+        paper.validate().unwrap();
+    }
+    #[test]
+    fn causal_public_trade_clock_witness_and_duplicate_identity_are_replayable() {
+        let mut paper = experimental_paper();
+        apply(
+            &mut paper,
+            &Operation::Book {
+                now_ms: 0,
+                outcome: "up".into(),
+                bid: 490_000,
+                ask: 510_000,
+                ahead_micros: 0,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut paper,
+            &Operation::Quotes {
+                now_ms: 0,
+                quotes: from_core_quotes(&[lot(Outcome::Up, 490_000)]),
+            },
+        )
+        .unwrap();
+        apply(&mut paper, &Operation::Advance { now_ms: 100 }).unwrap();
+        let before = serde_json::to_value(&paper).unwrap();
+        let mut op = Operation::ObservedTradeV3 {
+            now_ms: 100,
+            received_wall_ms: 1100,
+            exchange_event_mono_ms: 49,
+            exchange_ms: 1050,
+            outcome: "up".into(),
+            price_micros: 490_000,
+            quantity_micros: 1_000_000,
+            fingerprint: "a".repeat(64),
+        };
+        assert!(apply(&mut paper, &op).is_err());
+        assert_eq!(before, serde_json::to_value(&paper).unwrap());
+        if let Operation::ObservedTradeV3 {
+            exchange_event_mono_ms,
+            ..
+        } = &mut op
+        {
+            *exchange_event_mono_ms = 50;
+        }
+        apply(&mut paper, &op).unwrap();
+        apply(&mut paper, &Operation::Advance { now_ms: 200 }).unwrap();
+        assert_eq!(paper.snapshot().account.up_inventory_micros, 1_000_000);
+        if let Operation::ObservedTradeV3 {
+            now_ms,
+            received_wall_ms,
+            ..
+        } = &mut op
+        {
+            *now_ms = 200;
+            *received_wall_ms = 1200;
+        }
+        apply(&mut paper, &op).unwrap();
+        assert_eq!(paper.snapshot().account.up_inventory_micros, 1_000_000);
+        paper.validate().unwrap();
     }
     #[test]
     fn public_selection_keeps_affordable_side_symmetrically_without_replenishing_gross_budget() {
