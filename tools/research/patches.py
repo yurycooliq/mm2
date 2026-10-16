@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import uuid
 from .experiments import git_sha
 from .github import DEFAULT_REPOSITORY
 from .jobs import sha
@@ -211,6 +212,7 @@ def docker_command(image, candidate, trusted, command):
     if any(any(character in str(path) for character in (",", "\n", "\r", "\0")) for path in (candidate, trusted)):
         raise ResearchError("snapshot mount path contains Docker option delimiters")
     return ["docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
+            "--log-driver", "none", "--no-healthcheck",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65532:65532",
             "--cpus", "1", "--memory", "768m", "--pids-limit", "128",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,uid=65532,gid=65532",
@@ -222,6 +224,53 @@ def docker_command(image, candidate, trusted, command):
             "--mount", f"type=bind,source={trusted},target=/trusted,readonly",
             "--workdir", "/trusted/output", "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "PYTHONPATH=/candidate",
             "--env", "HOME=/tmp", image, *command]
+
+
+def cleanup_validation_worker(name, owner, expected_id=None):
+    """Reconcile daemon state, then remove only our immutable container identity."""
+    rows = run_bounded(["docker", "container", "ls", "--all", "--no-trunc", "--filter",
+                        f"name=^/{name}$", "--format", '{{.ID}} {{.Label "mm2.patch-validation"}}'],
+                       timeout=10, maximum=1024).decode("ascii").splitlines()
+    if not rows:
+        return
+    fields = rows[0].split()
+    if (len(rows) != 1 or len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{64}", fields[0])
+            or fields[1] != owner or (expected_id is not None and fields[0] != expected_id)):
+        raise ResearchError("validation worker ownership mismatch; no container removed")
+    container_id = fields[0]
+    try:
+        run_bounded(["docker", "container", "rm", "--force", container_id], timeout=10, maximum=1024)
+    except ResearchError:
+        # The worker may have exited/been removed concurrently. A failed rm alone
+        # is not an absence proof; reconcile by the immutable ID, not its name.
+        pass
+    remaining = run_bounded(["docker", "container", "ls", "--all", "--no-trunc", "--filter",
+                             f"id={container_id}", "--format", "{{.ID}}"], timeout=10, maximum=1024)
+    if remaining.strip():
+        raise ResearchError("validation worker cleanup failed; owned container remains")
+
+
+def run_validation_worker(image, candidate, trusted, command, timeout):
+    """Create before start so a killed attach client cannot orphan a running worker."""
+    owner = uuid.uuid4().hex
+    name = "mm2-patch-validation-" + owner
+    args = docker_command(image, candidate, trusted, command)
+    # No --rm: lifecycle is owned here and confirmed after success and failure.
+    create = ["docker", "create", "--name", name, "--label", "mm2.patch-validation=" + owner, *args[3:]]
+    container_id = None
+    try:
+        reply = run_bounded(create, timeout=30, maximum=1024)
+        container_id = reply.decode("ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ResearchError("validation worker creation identity unavailable")
+        return run_bounded(["docker", "start", "--attach", container_id], timeout=timeout)
+    finally:
+        try:
+            cleanup_validation_worker(name, owner, container_id)
+        except (ResearchError, OSError, UnicodeError) as exc:
+            # Never issue a PASS receipt when cleanup is unknown. Do not forward
+            # arbitrary Docker diagnostics; the owned name is safe to reconcile.
+            raise ResearchError("validation worker cleanup unconfirmed: " + name) from exc
 
 
 DENIAL_PROBE = """import json,os,socket
@@ -278,8 +327,8 @@ def validate(repo, prepared, snapshot_root, image, timeout=180):
     (trusted / "output").mkdir(exist_ok=True)
     # Only clean tracked snapshots are mounted. No ignored output/private.env,
     # .git common directory, owner home, credentials or Docker socket exist here.
-    probe = run_bounded(docker_command(image, candidate, trusted, ["python", "-B", "-c", DENIAL_PROBE]), timeout=30)
-    tests = run_bounded(docker_command(image, candidate, trusted, ["python", "-B", "-c", TRUSTED_TEST_RUNNER]), timeout=timeout)
+    probe = run_validation_worker(image, candidate, trusted, ["python", "-B", "-c", DENIAL_PROBE], timeout=30)
+    tests = run_validation_worker(image, candidate, trusted, ["python", "-B", "-c", TRUSTED_TEST_RUNNER], timeout=timeout)
     body = {"schema_version": 1, "status": "PASS", "candidate_sha": head,
             "baseline_sha": prepared["proposal"]["baseline_sha"], "proposal_id": prepared["proposal"]["proposal_id"],
             "baseline_branch": prepared["proposal"].get("baseline_branch"),

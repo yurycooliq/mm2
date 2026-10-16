@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 import posixpath
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -47,6 +48,7 @@ class PatchBoundaryTest(unittest.TestCase):
             index = args.index(pair[0])
             self.assertEqual(args[index + 1], pair[1])
         self.assertIn("--read-only", args)
+        self.assertEqual(args[args.index("--log-driver") + 1], "none")
         self.assertEqual(args[args.index("--workdir") + 1], "/trusted/output")
         self.assertEqual(args[args.index("--memory") + 1], "768m")
         mounts = [args[i + 1] for i, value in enumerate(args) if value == "--mount"]
@@ -57,6 +59,78 @@ class PatchBoundaryTest(unittest.TestCase):
             patches.docker_command("python:latest", "/a", "/b", ["python"])
         with self.assertRaises(ResearchError):
             patches.docker_command(patches.VALIDATION_IMAGE, "/a,target=/host", "/b", ["python"])
+
+    def validation_run(self, failure=None, owner_mismatch=False, cleanup_fails=False, create_failure=False):
+        owner, container_id = "b" * 32, "a" * 64
+        removed = []
+        def command(args, **kwargs):
+            if args[1] == "create":
+                self.assertIn("--network", args)
+                self.assertNotIn("--rm", args)
+                self.assertEqual(args[args.index("--label") + 1], "mm2.patch-validation=" + owner)
+                if create_failure:
+                    raise OSError("launch failed")
+                return container_id.encode()
+            if args[1] == "start":
+                self.assertEqual(args, ["docker", "start", "--attach", container_id])
+                if failure:
+                    raise ResearchError(failure)
+                return b"finished"
+            if args[2] == "rm":
+                self.assertEqual(args[-1], container_id)
+                if cleanup_fails:
+                    raise ResearchError("rm unavailable")
+                removed.append(container_id)
+                return container_id.encode()
+            self.assertEqual(args[2], "ls")
+            if create_failure:
+                return b""
+            if "id=" + container_id in args:
+                return container_id.encode() if cleanup_fails else b""
+            return (container_id + " " + ("c" * 32 if owner_mismatch else owner)).encode()
+        return owner, removed, command
+
+    def test_validation_worker_cleanup_after_success_timeout_and_output_limit(self):
+        for failure in (None, "bounded broker process time quota exceeded", "bounded broker process output quota exceeded"):
+            owner, removed, command = self.validation_run(failure=failure)
+            with self.subTest(failure=failure), patch.object(patches.uuid, "uuid4", return_value=SimpleNamespace(hex=owner)), \
+                    patch.object(patches, "run_bounded", side_effect=command):
+                if failure:
+                    with self.assertRaisesRegex(ResearchError, failure):
+                        patches.run_validation_worker(patches.VALIDATION_IMAGE, "/candidate", "/trusted", ["python"], 1)
+                else:
+                    self.assertEqual(patches.run_validation_worker(patches.VALIDATION_IMAGE, "/candidate", "/trusted", ["python"], 1), b"finished")
+            self.assertEqual(removed, ["a" * 64])
+
+    def test_validation_worker_never_removes_another_owner_or_reports_unknown_cleanup_as_pass(self):
+        for options in ({"owner_mismatch": True}, {"cleanup_fails": True}):
+            owner, removed, command = self.validation_run(**options)
+            with self.subTest(options=options), patch.object(patches.uuid, "uuid4", return_value=SimpleNamespace(hex=owner)), \
+                    patch.object(patches, "run_bounded", side_effect=command):
+                with self.assertRaisesRegex(ResearchError, "cleanup unconfirmed"):
+                    patches.run_validation_worker(patches.VALIDATION_IMAGE, "/candidate", "/trusted", ["python"], 1)
+            self.assertEqual(removed, [])
+
+    def test_validation_creation_failure_is_reconciled_without_start_or_arbitrary_removal(self):
+        owner, removed, command = self.validation_run(create_failure=True)
+        with patch.object(patches.uuid, "uuid4", return_value=SimpleNamespace(hex=owner)), \
+                patch.object(patches, "run_bounded", side_effect=command) as run:
+            with self.assertRaisesRegex(OSError, "launch failed"):
+                patches.run_validation_worker(patches.VALIDATION_IMAGE, "/candidate", "/trusted", ["python"], 1)
+            self.assertFalse(any(call.args[0][1] == "start" for call in run.call_args_list))
+        self.assertEqual(removed, [])
+
+    def test_validation_already_removed_container_and_rm_race_are_confirmed(self):
+        for replies in ([b""], [("a" * 64 + " " + "b" * 32).encode(), ResearchError("rm raced"), b""]):
+            with self.subTest(replies=replies), patch.object(patches, "run_bounded", side_effect=replies):
+                patches.cleanup_validation_worker("mm2-test", "b" * 32, "a" * 64)
+
+    def test_validation_mismatched_id_and_unavailable_daemon_do_not_remove_anything(self):
+        for reply in (("c" * 64 + " " + "b" * 32).encode(), ResearchError("daemon unavailable")):
+            with self.subTest(reply=reply), patch.object(patches, "run_bounded", side_effect=[reply]) as run:
+                with self.assertRaises(ResearchError):
+                    patches.cleanup_validation_worker("mm2-test", "b" * 32, "a" * 64)
+                self.assertEqual(run.call_count, 1)
 
     def test_trusted_runner_relocates_only_exact_fixture_roots(self):
         namespace = {}

@@ -313,3 +313,17 @@ Root verified the integrated local UI in the Codex in-app browser. Desktop/mobil
 The [ten-point comparison ledger](DASHBOARD_DESIGN.md) records layout, palette, typography, controls, metrics, tables, copy and intentional differences: illustrative $1,000 values were replaced by observed API values, and required stop/age/recovery information was added. [Desktop](design/desktop-integrated-qa.jpg) and [mobile](design/mobile-integrated-qa.jpg) artifacts contain simulated QA data.
 
 The [checks workflow](https://github.com/yurycooliq/mm2/actions/workflows/checks.yml) reproduces Rust, Python, reference/dashboard and production-container checks on push. External Telegram delivery, Mini App embedding in actual Telegram clients and funded order execution remain unverified.
+
+## Integration review repair, 2026-10-16
+
+Independent source review found that killing the Docker attach client could leave
+an offline patch-validation worker running. Validation now creates a uniquely
+labelled container before starting it, removes only its verified immutable ID in
+every outcome, and confirms absence before issuing a successful receipt. Docker
+logging is disabled. Unknown cleanup fails closed and retains the safe owned
+container name for reconciliation. Pure regressions cover timeout, output quota,
+creation failure, ownership/ID mismatch, daemon failure and removal races. The
+container CI job also exercises real timeout and excessive-output workers with
+no network, credentials, source mounts or Docker socket inside the worker.
+Local verification passed all 18 patch-broker unit tests and both real Docker
+failure cases. Those workers were confirmed absent after cleanup.
