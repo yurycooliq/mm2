@@ -62,6 +62,16 @@ replay waits for an actually observed source generation rather than inventing
 successful recovery. Exact production scheduling and ingestion parity remain
 unproven; a shared parser alone does not establish them.
 
+For a retained tape with fatal ingress errors, an optional final CLI argument
+`--diagnostic-ingress` produces a separate diagnostic report. It retains at most
+32 sanitized witnesses from actual rejected events, with record/frame hashes,
+source generation, event clocks and available state immediately before rejection.
+Raw payloads and arbitrary error text are excluded. A witness with unavailable
+pre-error state says so explicitly. The default report remains unchanged.
+Diagnostic mode preserves execution and accounting, disables candidate selection
+and cannot promote a strategy or erase faults. Reuse the original frozen tape and
+plan with a new report path; a second analysis is not a new economic holdout.
+
 Freeze candidate parameters and retain their exact plan hash before collection.
 The plan declares complete chronological training markets, an embargo for final
 outcomes, later holdout markets, costs and minimum activity. Selection uses only

@@ -1,5 +1,20 @@
 # Validation evidence
 
+## October 16, 2026 - opt-in fatal-ingress witnesses
+
+Formatting, all-target Clippy with warnings denied and **383 Rust tests** pass,
+with zero ignored tests (`rust-validation-4.log` in
+`output/r18-stream-recovery-20261016`). Three regressions cover pre-rejection
+CLOB clocks, Reference watermark resets and bounded sanitized error witnesses.
+The native replay fixture checks full-report noninterference after restoring only
+the explicitly disabled diagnostic selection fields.
+
+The optional `--diagnostic-ingress` mode records up to 32 actual ingress failures
+with hashes, source generation and available pre-error state. It preserves
+execution/accounting and disables selection; the default report has no diagnostic
+fields or frame hashing. Opt-in frame hashing adds linear processing cost. A
+diagnostic rerun of a retained tape is not a new holdout or proof of income.
+
 ## October 16, 2026 - bounded capture writes and explicit recovered-input quality
 
 Formatting, all-target Clippy with warnings denied and **380 Rust tests** pass,

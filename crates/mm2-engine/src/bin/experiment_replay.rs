@@ -58,6 +58,137 @@ impl QualityProtocol {
 fn default_embargo() -> usize {
     1
 }
+const MAX_INGRESS_WITNESSES: usize = 32;
+
+#[derive(Serialize)]
+struct FaultOrigin {
+    record_sequence: u64,
+    record_hash: String,
+    frame_sha256: String,
+    source_feed: String,
+    source_generation: u64,
+    record_wall_ms: u64,
+    record_mono_ms: u64,
+}
+#[derive(Default)]
+struct IngressDiagnostics {
+    total_faults: u64,
+    witnesses: Vec<Value>,
+}
+impl IngressDiagnostics {
+    fn has_room(&self) -> bool {
+        self.witnesses.len() < MAX_INGRESS_WITNESSES
+    }
+    fn record(&mut self, origin: &FaultOrigin, metadata: Value, error: &str) {
+        self.total_faults += 1;
+        if self.has_room() {
+            self.witnesses.push(
+                json!({"origin":origin,"error_class":native_error_class(error),"context":metadata}),
+            );
+        }
+    }
+    fn report(self) -> Value {
+        json!({"mode":"diagnostic_only_not_for_selection","max_witnesses":MAX_INGRESS_WITNESSES,
+            "total_faults":self.total_faults,"omitted_witnesses":self.total_faults-self.witnesses.len() as u64,
+            "witnesses":self.witnesses,"raw_payloads_or_error_text_retained":false,
+            "pre_error_summary_scope":"Known preflight fault or predicted Reference zero/regression only; no ordinary-frame snapshots.",
+            "watermark_scope":"Core accepted book/tick/receive clocks; private feed-filter internals are not inferred."})
+    }
+}
+struct DiagnosticContext<'a> {
+    log: &'a mut IngressDiagnostics,
+    origin: &'a FaultOrigin,
+    admitted_event_index: usize,
+    preflight_fault: bool,
+}
+fn native_error_class(error: &str) -> &'static str {
+    match error {
+        "event market identity mismatch" => "event_market_identity_mismatch",
+        "CLOB receive clock regressed" => "clob_receive_clock_regressed",
+        "CLOB exchange clock regressed" => "clob_exchange_clock_regressed",
+        "invalid or regressed reference input" => "invalid_or_regressed_reference_input",
+        "book depth exceeds bound" => "book_depth_exceeds_bound",
+        "invalid or duplicate book level" => "invalid_or_duplicate_book_level",
+        "crossed or oversized book" => "crossed_or_oversized_book",
+        "empty or oversized delta batch" => "empty_or_oversized_delta_batch",
+        "delta before snapshot or invalid price" => "delta_before_snapshot_or_invalid_price",
+        "crossed or oversized batch result" => "crossed_or_oversized_batch_result",
+        "invalid or incompatible tick transition" => "invalid_or_incompatible_tick_transition",
+        _ => "unclassified_native_error",
+    }
+}
+fn book_summary(book: &domain::BookSnapshot) -> Value {
+    json!({"initialized":book.initialized,"tick_micro":book.tick_micro,
+        "best_bid_micro":book.best_bid_micro,"best_ask_micro":book.best_ask_micro,
+        "exchange_ms":book.exchange_ms,"observed_mono_ms":book.observed_mono_ms})
+}
+fn event_summary(event: &FeedEvent) -> Value {
+    let outcome = |outcome: domain::Outcome| {
+        if outcome == domain::Outcome::Up {
+            "up"
+        } else {
+            "down"
+        }
+    };
+    match event {
+        FeedEvent::Snapshot {
+            outcome: side,
+            exchange_ms,
+            observed_mono_ms,
+            bids,
+            asks,
+            ..
+        } => {
+            json!({"kind":"snapshot","outcome":outcome(*side),"exchange_ms":exchange_ms,"observed_mono_ms":observed_mono_ms,
+                "bid_levels":bids.len(),"ask_levels":asks.len(),"best_bid_micro":bids.iter().map(|level|level.price_micro).max(),
+                "best_ask_micro":asks.iter().map(|level|level.price_micro).min()})
+        }
+        FeedEvent::Delta {
+            exchange_ms,
+            observed_mono_ms,
+            changes,
+            ..
+        } => {
+            json!({"kind":"delta","exchange_ms":exchange_ms,"observed_mono_ms":observed_mono_ms,"changes":changes.len(),
+                "invalid_price_changes":changes.iter().filter(|change|change.level.price_micro==0 || change.level.price_micro>=1_000_000).count(),
+                "first_changes":changes.iter().take(4).map(|change|json!({"outcome":outcome(change.outcome),
+                    "side":if change.side==domain::BookSide::Bid {"bid"} else {"ask"},
+                    "price_micro":change.level.price_micro,"quantity_micro":change.level.quantity_micro})).collect::<Vec<_>>()})
+        }
+        FeedEvent::Tick {
+            outcome: side,
+            exchange_ms,
+            observed_mono_ms,
+            old_tick_micro,
+            new_tick_micro,
+            ..
+        } => {
+            json!({"kind":"tick","outcome":outcome(*side),"exchange_ms":exchange_ms,"observed_mono_ms":observed_mono_ms,
+                "old_tick_micro":old_tick_micro,"new_tick_micro":new_tick_micro})
+        }
+        FeedEvent::Reference {
+            exchange_ms,
+            observed_mono_ms,
+            price_micro,
+        } => {
+            json!({"kind":"reference","exchange_ms":exchange_ms,"observed_mono_ms":observed_mono_ms,"price_micro":price_micro})
+        }
+        FeedEvent::Trade {
+            outcome: side,
+            exchange_ms,
+            observed_mono_ms,
+            price_micro,
+            quantity_micro,
+            ..
+        } => {
+            json!({"kind":"trade","outcome":outcome(*side),"exchange_ms":exchange_ms,"observed_mono_ms":observed_mono_ms,
+                "price_micro":price_micro,"quantity_micro":quantity_micro})
+        }
+        FeedEvent::Disconnect { source, .. } => {
+            json!({"kind":"disconnect","source":if *source==FeedSource::Clob {"clob"} else {"binance"}})
+        }
+    }
+}
 struct MarketState {
     market: Market,
     core: Core,
@@ -82,6 +213,7 @@ struct MarketState {
     fee_errors: u64,
     fatal_ingress_errors: u64,
     recovery_timeouts: u64,
+    diagnostic_reference: Option<(u64, u64, u64)>,
 }
 impl MarketState {
     fn fatal_invalid_inputs(&self) -> u64 {
@@ -140,7 +272,63 @@ impl MarketState {
         }
     }
     fn apply_public(&mut self, event: FeedEvent, wall: u64, mono: u64) -> bool {
+        self.apply_public_diagnostic(event, wall, mono, None)
+    }
+    fn apply_public_diagnostic(
+        &mut self,
+        event: FeedEvent,
+        wall: u64,
+        mono: u64,
+        diagnostic: Option<DiagnosticContext<'_>>,
+    ) -> bool {
         let prior = self.native_snapshots;
+        let next_reference = if diagnostic.is_some() || self.diagnostic_reference.is_some() {
+            match &event {
+                FeedEvent::Reference {
+                    exchange_ms,
+                    observed_mono_ms,
+                    price_micro,
+                } => Some(Some((*exchange_ms, *observed_mono_ms, *price_micro))),
+                FeedEvent::Disconnect {
+                    source: FeedSource::Binance,
+                    ..
+                } => Some(None),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let reference_fault = diagnostic.as_ref().is_some_and(|d| d.log.has_room())
+            && next_reference
+                .flatten()
+                .is_some_and(|(exchange, received, price)| {
+                    price == 0
+                        || self.diagnostic_reference.is_some_and(
+                            |(old_exchange, old_received, _)| {
+                                exchange < old_exchange || received < old_received
+                            },
+                        )
+                });
+        let input_kind = match &event {
+            FeedEvent::Snapshot { .. } => "snapshot",
+            FeedEvent::Delta { .. } => "delta",
+            FeedEvent::Tick { .. } => "tick",
+            FeedEvent::Reference { .. } => "reference",
+            FeedEvent::Trade { .. } => "trade",
+            FeedEvent::Disconnect { .. } => "disconnect",
+        };
+        let pre_error = diagnostic.as_ref().filter(|d|d.log.has_room() && (d.preflight_fault || reference_fault)).map(|d| {
+            let snapshot = self.core.snapshot();
+            json!({"admitted_event_index":d.admitted_event_index,"event":event_summary(&event),"pre_error_summary_available":true,
+                "accepted_clock_watermarks":self.core.feed_clock_context(&event),
+                "pre_error_books":{"up":book_summary(&snapshot.up_book),"down":book_summary(&snapshot.down_book)},
+                "pre_error_reference":snapshot.reference.as_ref().map(|r|json!({"exchange_ms":r.exchange_ms,"observed_mono_ms":r.observed_mono_ms,"price_micro":r.price_micro})),
+                "native_recovery_started_mono_ms":prior.map(|(at,_)|at),"native_recovery_snapshots_seen":prior.map(|(_,seen)|seen),
+                "awaiting_observed_source_generation":self.awaiting_generation,
+                "active_clob_source_generation":self.source_generation,
+                "market_window_start_ms":self.market.window_start_ms,"market_window_end_ms":self.market.window_end_ms,
+                "market_slug":self.market.slug,"before_market_close":wall<self.market.window_end_ms})
+        });
         let mut seen = prior.map(|(_, seen)| seen);
         let snapshot = if let FeedEvent::Snapshot { outcome, .. } = &event {
             Some(usize::from(*outcome == domain::Outcome::Down))
@@ -161,6 +349,9 @@ impl MarketState {
                 true
             }
             Ok(applied) => {
+                if let Some(reference) = next_reference {
+                    self.diagnostic_reference = reference;
+                }
                 if applied == ingress::Applied::SnapshotRecoveryCompleted {
                     self.completed_snapshot_recoveries += 1;
                     if self.recovery_started_for_quality
@@ -181,7 +372,21 @@ impl MarketState {
                 }
                 true
             }
-            Err(_) => {
+            Err(error) => {
+                if next_reference.is_some() {
+                    self.diagnostic_reference = None;
+                }
+                if let Some(diagnostic) = diagnostic {
+                    if diagnostic.log.has_room() {
+                        diagnostic.log.record(diagnostic.origin, pre_error.unwrap_or_else(||json!({
+                        "admitted_event_index":diagnostic.admitted_event_index,"pre_error_summary_available":false,
+                        "event_kind":input_kind,
+                        "market_slug":self.market.slug,"before_market_close":wall<self.market.window_end_ms,
+                        "active_clob_source_generation":self.source_generation})), &error);
+                    } else {
+                        diagnostic.log.total_faults += 1;
+                    }
+                }
                 if wall < self.market.window_end_ms {
                     self.invalid += 1;
                     self.fatal_ingress_errors += 1;
@@ -554,6 +759,13 @@ fn select_training(rows: &[Value], latencies: &[u64]) -> Vec<Value> {
     }).collect()
 }
 fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error::Error>> {
+    evaluate_mode(tape_path, bytes, false)
+}
+fn evaluate_mode(
+    tape_path: &Path,
+    bytes: &[u8],
+    diagnostic_ingress: bool,
+) -> Result<Value, Box<dyn std::error::Error>> {
     if bytes.len() > 65536 {
         return Err("plan exceeds 64KiB".into());
     }
@@ -645,6 +857,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
     let mut clock_steps = 0;
     let mut clock_step_times = Vec::new();
     let mut deferred = Vec::new();
+    let mut diagnostics = diagnostic_ingress.then(IngressDiagnostics::default);
     let receipt = tape::visit(tape_path, plan.max_input_bytes, |record| {
         if previous_wall > 0
             && record
@@ -717,6 +930,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                         fee_errors: 0,
                         fatal_ingress_errors: 0,
                         recovery_timeouts: 0,
+                        diagnostic_reference: None,
                     },
                 );
             }
@@ -753,6 +967,15 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                 text,
                 generation,
             } => {
+                let origin = diagnostics.as_ref().map(|_| FaultOrigin {
+                    record_sequence: record.sequence,
+                    record_hash: record.hash.clone(),
+                    frame_sha256: format!("{:x}", sha2::Sha256::digest(text.as_bytes())),
+                    source_feed: feed.clone(),
+                    source_generation: generation,
+                    record_wall_ms: record.wall_ms,
+                    record_mono_ms: record.mono_ms,
+                });
                 if feed == "binance" {
                     match feeds::parse_binance(&text, record.mono_ms) {
                         Ok(events) => {
@@ -760,8 +983,21 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                                 .values_mut()
                                 .filter(|s| record.wall_ms < s.market.window_end_ms)
                             {
-                                for e in &events {
-                                    state.apply_public(e.clone(), record.wall_ms, record.mono_ms);
+                                for (index, e) in events.iter().enumerate() {
+                                    let context = diagnostics.as_mut().zip(origin.as_ref()).map(
+                                        |(log, origin)| DiagnosticContext {
+                                            log,
+                                            origin,
+                                            admitted_event_index: index,
+                                            preflight_fault: false,
+                                        },
+                                    );
+                                    state.apply_public_diagnostic(
+                                        e.clone(),
+                                        record.wall_ms,
+                                        record.mono_ms,
+                                        context,
+                                    );
                                 }
                             }
                         }
@@ -773,6 +1009,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                             {
                                 state.gaps += 1;
                                 state.parse_errors += 1;
+                                state.diagnostic_reference = None;
                                 let _ = state.core.apply(FeedEvent::Disconnect {
                                     source: FeedSource::Binance,
                                     reason: "invalid_reference".into(),
@@ -798,7 +1035,7 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                                 state.discarded_native_events += (count - events.len()) as u64;
                                 // The actor consumes at most sixteen admitted events per turn.
                                 // Cross-frame queue coalescing remains unobserved on this tape.
-                                'frame: for batch in events.chunks(16) {
+                                'frame: for (batch_index, batch) in events.chunks(16).enumerate() {
                                     let valid = ingress::valid_prefix(
                                         &state.core,
                                         batch,
@@ -815,11 +1052,21 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
                                             );
                                         }
                                     }
-                                    for event in batch {
-                                        if !state.apply_public(
+                                    for (index, event) in batch.iter().enumerate() {
+                                        let context = diagnostics
+                                            .as_mut()
+                                            .zip(origin.as_ref())
+                                            .map(|(log, origin)| DiagnosticContext {
+                                                log,
+                                                origin,
+                                                admitted_event_index: batch_index * 16 + index,
+                                                preflight_fault: index == valid,
+                                            });
+                                        if !state.apply_public_diagnostic(
                                             event.clone(),
                                             record.wall_ms,
                                             record.mono_ms,
+                                            context,
                                         ) {
                                             break 'frame;
                                         }
@@ -1101,16 +1348,35 @@ fn evaluate(tape_path: &Path, bytes: &[u8]) -> Result<Value, Box<dyn std::error:
     } else {
         report
     };
+    let report = if let Some(diagnostics) = diagnostics {
+        let mut report = report;
+        report["ingress_diagnostics"] = diagnostics.report();
+        report["training_only_selection"] = json!([]);
+        report["selection_or_promotion_authorized"] = json!(false);
+        for row in report["rows"].as_array_mut().expect("report rows") {
+            row["training_selection_eligible"] = json!(false);
+            row["holdout_eligible"] = json!(false);
+            row["status"] = json!("DIAGNOSTIC_ONLY_NOT_FOR_SELECTION");
+        }
+        report
+    } else {
+        report
+    };
     Ok(report)
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 4 {
-        return Err("usage: experiment_replay TAPE.jsonl FROZEN_PLAN.json NEW_REPORT.json".into());
+    let diagnostic_ingress = args.len() == 5 && args[4] == "--diagnostic-ingress";
+    if args.len() != 4 && !diagnostic_ingress {
+        return Err("usage: experiment_replay TAPE.jsonl FROZEN_PLAN.json NEW_REPORT.json [--diagnostic-ingress]".into());
     }
     let mut bytes = Vec::new();
     File::open(&args[2])?.take(65537).read_to_end(&mut bytes)?;
-    let report = evaluate(Path::new(&args[1]), &bytes)?;
+    let report = if diagnostic_ingress {
+        evaluate_mode(Path::new(&args[1]), &bytes, true)?
+    } else {
+        evaluate(Path::new(&args[1]), &bytes)?
+    };
     let mut out = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1200,6 +1466,7 @@ mod tests {
             fee_errors: 0,
             fatal_ingress_errors: 0,
             recovery_timeouts: 0,
+            diagnostic_reference: None,
         };
         for outcome in [domain::Outcome::Up, domain::Outcome::Down] {
             let event = quality_snapshot(&state.market.condition_id, outcome, 999, 1);
@@ -1235,6 +1502,175 @@ mod tests {
             );
             assert!(state.apply_public(event, wall + offset as u64, mono + offset as u64));
         }
+    }
+    fn diagnostic_origin(feed: &str) -> FaultOrigin {
+        FaultOrigin {
+            record_sequence: 7,
+            record_hash: "a".repeat(64),
+            frame_sha256: format!("{:x}", sha2::Sha256::digest(b"public fixture")),
+            source_feed: feed.into(),
+            source_generation: 2,
+            record_wall_ms: 1002,
+            record_mono_ms: 4,
+        }
+    }
+    #[test]
+    fn ingress_diagnostic_keeps_pre_error_book_clocks_without_changing_failure() {
+        let mut observed = quality_state();
+        let mut ordinary = quality_state();
+        let event = quality_snapshot(&observed.market.condition_id, domain::Outcome::Up, 998, 2);
+        assert_eq!(
+            ingress::valid_prefix(&observed.core, std::slice::from_ref(&event), None),
+            0
+        );
+        let origin = diagnostic_origin("clob");
+        let mut log = IngressDiagnostics::default();
+        assert!(!observed.apply_public_diagnostic(
+            event.clone(),
+            1002,
+            2,
+            Some(DiagnosticContext {
+                log: &mut log,
+                origin: &origin,
+                admitted_event_index: 0,
+                preflight_fault: true,
+            })
+        ));
+        assert!(!ordinary.apply_public(event, 1002, 2));
+        assert_eq!(observed.core.snapshot(), ordinary.core.snapshot());
+        assert_eq!(observed.fatal_ingress_errors, ordinary.fatal_ingress_errors);
+        assert_eq!(observed.awaiting_generation, ordinary.awaiting_generation);
+        assert_eq!(
+            log.witnesses[0]["error_class"],
+            "clob_exchange_clock_regressed"
+        );
+        assert_eq!(
+            log.witnesses[0]["context"]["pre_error_books"]["up"]["exchange_ms"],
+            999
+        );
+        assert_eq!(
+            log.witnesses[0]["context"]["accepted_clock_watermarks"]["previous_receive_ms"],
+            1
+        );
+        assert_eq!(log.witnesses[0]["origin"]["record_sequence"], 7);
+        assert_eq!(log.witnesses[0]["origin"]["record_hash"], "a".repeat(64));
+        assert_eq!(
+            log.witnesses[0]["origin"]["frame_sha256"],
+            format!("{:x}", sha2::Sha256::digest(b"public fixture"))
+        );
+    }
+    #[test]
+    fn ingress_diagnostic_reference_watermark_resets_with_disconnect_and_actual_failure() {
+        let mut state = quality_state();
+        let mut log = IngressDiagnostics::default();
+        let origin = diagnostic_origin("binance");
+        let reference = |exchange, received, price| FeedEvent::Reference {
+            exchange_ms: exchange,
+            observed_mono_ms: received,
+            price_micro: price,
+        };
+        assert!(state.apply_public_diagnostic(
+            reference(1001, 3, 80_000_000_000),
+            1001,
+            3,
+            Some(DiagnosticContext {
+                log: &mut log,
+                origin: &origin,
+                admitted_event_index: 0,
+                preflight_fault: false,
+            })
+        ));
+        assert!(log.witnesses.is_empty());
+        assert!(state.apply_public(
+            FeedEvent::Disconnect {
+                source: FeedSource::Binance,
+                reason: "controlled".into()
+            },
+            1002,
+            4
+        ));
+        assert!(state.diagnostic_reference.is_none());
+        assert!(state.core.snapshot().reference.is_none());
+        // An earlier exchange clock after a real disconnect is accepted by Core;
+        // the diagnostic mirror must not invent the old watermark or a fault.
+        assert!(state.apply_public_diagnostic(
+            reference(1000, 5, 80_000_000_000),
+            1003,
+            5,
+            Some(DiagnosticContext {
+                log: &mut log,
+                origin: &origin,
+                admitted_event_index: 0,
+                preflight_fault: false,
+            })
+        ));
+        assert!(log.witnesses.is_empty());
+        assert!(!state.apply_public_diagnostic(
+            reference(999, 6, 80_000_000_000),
+            1004,
+            6,
+            Some(DiagnosticContext {
+                log: &mut log,
+                origin: &origin,
+                admitted_event_index: 0,
+                preflight_fault: false,
+            })
+        ));
+        assert_eq!(
+            log.witnesses[0]["error_class"],
+            "invalid_or_regressed_reference_input"
+        );
+        assert_eq!(log.witnesses[0]["origin"]["source_feed"], "binance");
+        assert_eq!(
+            log.witnesses[0]["context"]["pre_error_reference"]["exchange_ms"],
+            1000
+        );
+        assert_eq!(log.witnesses[0]["context"]["event"]["exchange_ms"], 999);
+        assert!(state.diagnostic_reference.is_none());
+        assert!(state.core.snapshot().reference.is_none());
+        assert!(state.apply_public_diagnostic(
+            reference(998, 7, 80_000_000_000),
+            1005,
+            7,
+            Some(DiagnosticContext {
+                log: &mut log,
+                origin: &origin,
+                admitted_event_index: 0,
+                preflight_fault: false,
+            })
+        ));
+        assert_eq!(log.witnesses.len(), 1);
+        let mut default = quality_state();
+        assert!(default.apply_public(reference(1001, 3, 80_000_000_000), 1001, 3));
+        assert!(
+            default.diagnostic_reference.is_none(),
+            "default has no diagnostic cache maintenance"
+        );
+    }
+    #[test]
+    fn ingress_diagnostic_caps_witnesses_and_suppresses_unrecognized_error_text() {
+        let origin = diagnostic_origin("binance");
+        let mut log = IngressDiagnostics::default();
+        for _ in 0..37 {
+            log.record(
+                &origin,
+                json!({"pre_error_summary_available":false}),
+                "private-token=NEVER-RETAIN",
+            );
+        }
+        let report = log.report();
+        assert_eq!(report["total_faults"], 37);
+        assert_eq!(report["omitted_witnesses"], 5);
+        assert_eq!(report["witnesses"].as_array().unwrap().len(), 32);
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("private-token") && !encoded.contains("NEVER-RETAIN"));
+        assert!(
+            report["witnesses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|w| w["error_class"] == "unclassified_native_error")
+        );
     }
     #[test]
     fn recovered_quality_requires_both_actual_valid_snapshots_and_preserves_strict_counts() {
@@ -1489,7 +1925,45 @@ mod tests {
         for c in raw["candidates"].as_array_mut().unwrap() {
             c["rules"] = json!({});
         }
-        let report = evaluate(&path, &serde_json::to_vec(&raw).unwrap()).unwrap();
+        let plan_bytes = serde_json::to_vec(&raw).unwrap();
+        let report = evaluate(&path, &plan_bytes).unwrap();
+        let mut diagnostic_report = evaluate_mode(&path, &plan_bytes, true).unwrap();
+        assert_eq!(
+            diagnostic_report["ingress_diagnostics"]["mode"],
+            "diagnostic_only_not_for_selection"
+        );
+        assert_eq!(
+            diagnostic_report["selection_or_promotion_authorized"],
+            false
+        );
+        assert_eq!(diagnostic_report["training_only_selection"], json!([]));
+        for (ordinary, diagnostic) in report["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(diagnostic_report["rows"].as_array_mut().unwrap())
+        {
+            assert_eq!(diagnostic["training_selection_eligible"], false);
+            assert_eq!(diagnostic["holdout_eligible"], false);
+            assert_eq!(diagnostic["status"], "DIAGNOSTIC_ONLY_NOT_FOR_SELECTION");
+            for field in ["training_selection_eligible", "holdout_eligible", "status"] {
+                diagnostic[field] = ordinary[field].clone();
+            }
+        }
+        diagnostic_report
+            .as_object_mut()
+            .unwrap()
+            .remove("ingress_diagnostics");
+        diagnostic_report
+            .as_object_mut()
+            .unwrap()
+            .remove("selection_or_promotion_authorized");
+        diagnostic_report["training_only_selection"] = report["training_only_selection"].clone();
+        assert_eq!(
+            serde_json::to_vec(&diagnostic_report).unwrap(),
+            serde_json::to_vec(&report).unwrap(),
+            "diagnostic mode must preserve every non-diagnostic/non-selection report byte"
+        );
         let rows = report["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(report["orders_submitted"], 0);
