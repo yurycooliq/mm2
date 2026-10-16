@@ -37,6 +37,154 @@ fn resolution(outcome: Outcome) -> ResolutionReceipt {
 }
 
 #[test]
+fn prospective_loss_keeps_unresolved_risk_and_never_nets_opposite_possible_fills() {
+    let mut p = portfolio();
+    p.record_execution_totals("btc-5m-0", 8_000_000_000_000, 10 * SCALE, 0, 0)
+        .unwrap();
+    p.register_market(Market {
+        id: "next".into(),
+        start_ms: 300_000,
+        end_ms: 600_000,
+    })
+    .unwrap();
+    let before = p.clone();
+    assert!(
+        !p.permits_execution_risk("next", [5 * SCALE, 5 * SCALE], 600_000)
+            .unwrap()
+    );
+    assert!(
+        p.permits_execution_risk("next", [5 * SCALE, 5 * SCALE], 390_000)
+            .unwrap()
+    );
+    assert_eq!(p, before);
+    assert_eq!(p.policy().max_daily_loss_micros, 10 * SCALE);
+    assert_eq!(p.policy().max_drawdown_micros, 20 * SCALE);
+}
+
+#[test]
+fn prospective_loss_uses_gross_realized_history_and_strict_original_threshold() {
+    let mut p = portfolio();
+    p.apply_fill(fill("lost", Outcome::Up, 500_000, 10 * SCALE, 0), 1)
+        .unwrap();
+    p.redeem(resolution(Outcome::Down), true).unwrap();
+    p.register_market(Market {
+        id: "next".into(),
+        start_ms: 300_000,
+        end_ms: 600_000,
+    })
+    .unwrap();
+    assert_eq!(p.snapshot().daily_loss_pico, "5000000000000");
+    assert!(
+        !p.permits_execution_risk("next", [10 * SCALE, 10 * SCALE], 500_000)
+            .unwrap()
+    );
+    assert!(
+        p.permits_execution_risk("next", [5 * SCALE, 5 * SCALE], 500_000)
+            .unwrap()
+    );
+    assert!(
+        p.permits_execution_risk("next", [5 * SCALE, 0], SCALE)
+            .is_err()
+    );
+    assert!(p.permits_execution_risk("missing", [0, 0], 0).is_err());
+}
+
+#[test]
+fn complete_set_profit_is_not_charged_as_unpaired_risk_and_drawdown_is_independent() {
+    let mut p = portfolio();
+    p.record_execution_totals("btc-5m-0", 80_000_000_000_000, 100 * SCALE, 100 * SCALE, 0)
+        .unwrap();
+    assert!(
+        p.permits_execution_risk("btc-5m-0", [5 * SCALE, 5 * SCALE], 500_000)
+            .unwrap()
+    );
+    let mut limited = Portfolio::new(
+        100 * SCALE,
+        RiskPolicy {
+            max_drawdown_micros: SCALE,
+            ..RiskPolicy::default()
+        },
+    )
+    .unwrap();
+    limited
+        .register_market(Market {
+            id: "empty".into(),
+            start_ms: 0,
+            end_ms: 300_000,
+        })
+        .unwrap();
+    assert!(
+        !limited
+            .permits_execution_risk("empty", [5 * SCALE, 5 * SCALE], 300_000)
+            .unwrap()
+    );
+}
+
+#[test]
+fn admitted_partial_fill_batches_stay_below_loss_guard_for_either_final_outcome() {
+    let mut checked = 0;
+    for up in [0, 5, 10] {
+        for down in [0, 5, 10] {
+            for initial_price in [200_000_u64, 800_000] {
+                for max_price in [100_000_u64, 400_000, 900_000] {
+                    let mut base = portfolio();
+                    let cost = u128::from(initial_price) * u128::from((up + down) * SCALE);
+                    base.record_execution_totals("btc-5m-0", cost, up * SCALE, down * SCALE, 0)
+                        .unwrap();
+                    if !base
+                        .permits_execution_risk("btc-5m-0", [5 * SCALE, 5 * SCALE], max_price)
+                        .unwrap()
+                    {
+                        continue;
+                    }
+                    for x in [0, 1, 3, 5] {
+                        for y in [0, 1, 3, 5] {
+                            for winner in [Outcome::Up, Outcome::Down] {
+                                let mut p = base.clone();
+                                let added = u128::from(x * SCALE) * u128::from(max_price)
+                                    + u128::from(y * SCALE) * u128::from(max_price / 2);
+                                p.record_execution_totals(
+                                    "btc-5m-0",
+                                    cost + added,
+                                    (up + x) * SCALE,
+                                    (down + y) * SCALE,
+                                    0,
+                                )
+                                .unwrap();
+                                let matched = (up + x).min(down + y) * SCALE;
+                                if matched > 0 {
+                                    p.merge_complete_sets(
+                                        MergeReceipt {
+                                            id: "merge".into(),
+                                            market_id: "btc-5m-0".into(),
+                                            quantity_micros: matched,
+                                            fee_pico: 0,
+                                            at_ms: 300_000,
+                                            provenance: Provenance::Synthetic,
+                                        },
+                                        true,
+                                    )
+                                    .unwrap();
+                                }
+                                p.redeem(resolution(winner), true).unwrap();
+                                assert!(
+                                    p.snapshot().daily_loss_pico.parse::<u128>().unwrap()
+                                        < 10_000_000_000_000
+                                );
+                                assert!(p.halt_reason().is_none());
+                                p.validate().unwrap();
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 1000);
+}
+
+#[test]
 fn distinct_markets_never_transfer_inventory_or_replenish_cash() {
     let mut p = portfolio();
     p.record_execution_totals("btc-5m-0", 2_000_000_000_003, 5 * SCALE, 0, 3)

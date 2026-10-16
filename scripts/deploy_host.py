@@ -24,7 +24,7 @@ PRIVATE_KEYS = {"MM2_ENGINE_API_TOKEN", "MM2_CONSOLE_TOKEN", "MM2_DOMAIN", "MM2_
                 "MM2_POLY_API_SECRET", "MM2_POLY_API_PASSPHRASE", "MM2_POLYGON_RPC_URL",
                 "MM2_POLY_RELAYER_API_KEY", "MM2_POLY_RELAYER_API_KEY_ADDRESS",
                 "MM2_POLY_BUILDER_API_KEY", "MM2_POLY_BUILDER_API_SECRET", "MM2_POLY_BUILDER_API_PASSPHRASE",
-                "MM2_TELEGRAM_BOT_TOKEN", "MM2_TELEGRAM_OWNER_ID"}
+                "MM2_TELEGRAM_BOT_TOKEN", "MM2_TELEGRAM_OWNER_ID", "MM2_TELEGRAM_ALLOWED_IDS"}
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 MODES = {"simulation": "simulation", "trading": "trading", "both": "both", "shadow": "public", "demo": "demo"}
 BUILDER_KEYS = ("MM2_POLY_BUILDER_API_KEY", "MM2_POLY_BUILDER_API_SECRET", "MM2_POLY_BUILDER_API_PASSPHRASE")
@@ -83,6 +83,12 @@ def private_environment(path):
         raise ValueError("independent private owner and engine tokens are required")
     if bool(result.get("MM2_TELEGRAM_BOT_TOKEN")) != bool(result.get("MM2_TELEGRAM_OWNER_ID")):
         raise ValueError("Telegram token and owner ID must be configured together")
+    additional = result.get("MM2_TELEGRAM_ALLOWED_IDS", "")
+    if additional and (not result.get("MM2_TELEGRAM_OWNER_ID") or len(additional) > 272
+                       or len(additional.split(",")) > 16
+                       or any(not re.fullmatch(r"[1-9][0-9]{0,15}", item) or int(item) >= 2**52
+                              for item in additional.split(","))):
+        raise ValueError("invalid additional Telegram access IDs")
     relayer_authentication(result)
     return result
 

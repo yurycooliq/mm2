@@ -127,6 +127,21 @@ class TelegramHttpTests(unittest.TestCase):
             self.assertNotIn(secret, encoded)
         self.assertFalse(self.engine.calls)
 
+    def test_additional_operator_authenticates_without_displacing_owner_or_admitting_stranger(self):
+        additional = 1401626578
+        self.app.config = replace(self.app.config, telegram_allowed_ids=frozenset({additional}))
+        owner_cookie = self.owner_cookie(signed(query_id="primary-owner"))
+        extra_data = signed(user_id=additional, query_id="additional-operator")
+        extra_cookie = self.owner_cookie(extra_data)
+        self.assertNotEqual(owner_cookie, extra_cookie)
+        for cookie in (owner_cookie, extra_cookie):
+            self.assertEqual(self.request("GET", "/api/state", cookie=cookie)[0], 200)
+        self.assert_hidden(self.authenticate(signed(user_id=additional + 1)))
+        self.assert_hidden(self.authenticate(extra_data))
+        self.assertEqual(self.authenticate(extra_data, extra_cookie)[0], 200)
+        self.assertEqual(self.request("GET", "/api/state", cookie=owner_cookie)[0], 200)
+        self.assertFalse(self.engine.calls)
+
     def test_https_termination_uses_secure_httponly_cookie_for_telegram_embedding(self):
         status, headers, _ = self.authenticate(origin="https://mm2.vstage.site", host="mm2.vstage.site")
         self.assertEqual(status, 200)

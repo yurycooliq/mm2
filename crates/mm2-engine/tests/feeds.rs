@@ -99,6 +99,134 @@ fn complete_delta_is_atomic_and_zero_is_a_level_removal() {
 }
 
 #[test]
+fn optional_native_quotes_are_absent_metadata_and_do_not_replace_depth() {
+    let selected = market();
+    for absent in [json!(""), serde_json::Value::Null] {
+        let mut update = change(&selected);
+        update["price_changes"][0]["best_bid"] = absent.clone();
+        update["price_changes"][0]["best_ask"] = absent;
+        let events = parse_clob(&update.to_string(), &selected, 18).unwrap();
+        let FeedEvent::Delta { changes, .. } = &events[0] else {
+            panic!("atomic delta expected");
+        };
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].level.price_micro, 400000);
+        assert_eq!(changes[0].level.quantity_micro, 0);
+        assert_eq!(changes[1].level.quantity_micro, 2500000);
+    }
+}
+
+#[test]
+fn optional_quote_support_keeps_bad_required_members_atomic() {
+    let selected = market();
+    for (field, invalid) in [
+        ("price", json!("")),
+        ("price", json!("1.1")),
+        ("size", serde_json::Value::Null),
+        ("size", json!("-1")),
+        ("side", json!("OTHER")),
+        ("best_bid", json!(0.4)),
+        ("best_ask", json!("garbage")),
+    ] {
+        let mut update = change(&selected);
+        update["price_changes"][0]["best_bid"] = json!("");
+        update["price_changes"][1][field] = invalid;
+        assert!(
+            parse_clob(
+                &json!([snapshot(&selected), update]).to_string(),
+                &selected,
+                1
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn indicative_bbo_absence_never_creates_a_book_or_trade() {
+    let selected = market();
+    for absent in [json!(""), serde_json::Value::Null] {
+        let event = json!({"event_type":"best_bid_ask","market":selected.condition_id,
+            "asset_id":selected.up_token,"timestamp":"1790856000125",
+            "best_bid":absent,"best_ask":"0.6","spread":absent});
+        assert!(
+            parse_clob(&event.to_string(), &selected, 1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let event = json!({"event_type":"best_bid_ask","market":selected.condition_id,
+        "asset_id":selected.up_token,"timestamp":"1790856000125"});
+    assert!(
+        parse_clob(&event.to_string(), &selected, 1)
+            .unwrap()
+            .is_empty()
+    );
+    let inconsistent = json!({"event_type":"best_bid_ask","market":selected.condition_id,
+        "asset_id":selected.up_token,"timestamp":"1790856000125",
+        "best_bid":"0.4","best_ask":"0.6","spread":"0.1"});
+    assert!(parse_clob(&inconsistent.to_string(), &selected, 1).is_err());
+}
+
+#[test]
+fn optional_trade_fee_does_not_change_volume_and_missing_volume_cannot_fill() {
+    let selected = market();
+    let original = json!({"event_type":"last_trade_price","market":selected.condition_id,
+        "asset_id":selected.up_token,"timestamp":"1790856000125","price":"0.5",
+        "size":"2.5","side":"SELL","fee_rate_bps":""});
+    for absent in [json!(""), serde_json::Value::Null] {
+        let mut event = original.clone();
+        event["fee_rate_bps"] = absent.clone();
+        let events = parse_clob(&event.to_string(), &selected, 17).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [FeedEvent::Trade {
+                quantity_micro: 2500000,
+                price_micro: 500000,
+                ..
+            }]
+        ));
+        event["size"] = absent;
+        assert!(
+            parse_clob(&event.to_string(), &selected, 18)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let mut missing = original.clone();
+    missing.as_object_mut().unwrap().remove("size");
+    assert!(
+        parse_clob(&missing.to_string(), &selected, 18)
+            .unwrap()
+            .is_empty()
+    );
+    for invalid in [json!(0), json!("0"), json!("-1"), json!("0.0000001")] {
+        let mut event = original.clone();
+        event["size"] = invalid;
+        assert!(parse_clob(&event.to_string(), &selected, 18).is_err());
+    }
+}
+
+#[test]
+fn optional_old_tick_keeps_the_authoritative_new_tick_and_identity() {
+    let selected = market();
+    let mut event = json!({"event_type":"tick_size_change","market":selected.condition_id,
+        "asset_id":selected.down_token,"timestamp":"1790856000126","old_tick_size":"",
+        "new_tick_size":"0.001"});
+    let events = parse_clob(&event.to_string(), &selected, 1).unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [FeedEvent::Tick {
+            old_tick_micro: None,
+            new_tick_micro: 1000,
+            ..
+        }]
+    ));
+    event["new_tick_size"] = json!("");
+    assert!(parse_clob(&event.to_string(), &selected, 1).is_err());
+}
+
+#[test]
 fn foreign_tokens_are_filtered_and_wrong_selected_mapping_fails() {
     let selected = market();
     let mut other = snapshot(&selected);

@@ -1,5 +1,264 @@
 # Validation evidence
 
+## October 13, 2026 — join the complete source generation
+
+The fee refresher could finish shutdown before the CLOB/Binance futures. Selecting
+that first completion dropped their enclosing JoinSet, which requests cancellation
+without joining the nested workers. A deterministic regression confirms that the
+previous coordinator acknowledged shutdown before its socket worker completed.
+This permits an overlap during source refresh; it does not establish which clock
+failed in the historical R12 frames, which were not retained.
+
+The coordinator now cancels the remaining future and joins both before returning,
+preserving the first failure. The existing six-second owner deadline still stops
+an unresponsive generation and prevents a new generation from starting. No risk,
+feed-age, backpressure or journal bound is increased. The FIFO recovery and public
+clock diagnostics from the preceding patch remain included.
+
+The final check passes **329 Rust tests**, formatting and all-target Clippy with
+warnings denied. The premature-acknowledgement regression fails with the previous
+select-first coordinator. The healthy R13 installation was never resumed: its
+15-minute selected-host check passed 181 sampled observations through four markets
+with zero costs and owner commands. Its complete preparation is preserved when
+replaced; it is not a daily experiment. Exact images, preserved R12 recovery and
+the actual new run are bound by `output/feed-generation-fix-20261013-r14` receipts.
+
+## October 13, 2026 — preserve queued native recovery
+
+R12 stopped after about 29 minutes with a confirmed protective Pause; it did not
+complete a day. Its original failure sequence contained a native snapshot timeout
+and two clock validation failures. The rejected frames and exact clock subtype
+were not retained. A new isolated Paused public probe reproduced a native timeout;
+it subsequently stopped on bounded feed backpressure while local checks were
+running. That observation does not identify the old clock subtype.
+
+A deterministic regression exposes a concrete recovery defect: the first split
+crossed delta stopped the bounded batch, discarding already queued native books.
+Its processing-time barrier also discarded valid later inputs from the same
+source generation. The repair keeps that FIFO batch and independent trade
+witnesses, skips intermediate deltas, and inhibits new quotes until both native
+books are validated. Genuine invalid input still cuts its suffix; the original
+source-generation barrier, 1,000 ms native deadline and three-failure guard remain.
+Clock failures now retain distinct fixed public receive/exchange details and
+bounded prior clock values, without raw provider content or credentials.
+
+The old source fails the new queued-recovery regression. The repaired source
+passes **327 Rust tests**, formatting and all-target Clippy with warnings denied,
+including trade-witness retention during recovery. Exact image, stopped-copy
+replay, selected-host installation and the new daily run have separate receipts
+under `output/feed-recovery-fix-20261013-r13`; this check is not a completed day.
+Strategy, capital, loss, drawdown, feed-age and journal limits are unchanged.
+
+## October 13, 2026 — native snapshots after split public updates
+
+The first R11 installation remained Paused and failed its pre-Resume acceptance:
+no Resume was sent, no daily run began, and all costs/returns/reserves remained zero.
+Its complete journal and original failed-command receipts are retained separately.
+A public-only domain probe observed 17,798 events, including nine transient crossed
+updates and ten subsequent deltas after book invalidation. Those are input events,
+not fills. Normalized rejected events are retained; the full accepted tape and the
+first primary rejected frame were not captured.
+
+Split deltas are never treated as a trusted complete book. After a crossed delta,
+new quotes are inhibited until full native snapshots have re-established both books.
+Intervening deltas cannot initialize the cleared books. Actual public trade witnesses
+and possible-fill reservations retain their separate processing. The native wait is
+bounded by the unchanged 1,000 ms feed-age policy; timeout escalates to the existing
+source-generation recovery, whose repeated failures still latch a fault. Full
+snapshots remain subject to identity, clock, depth, spread and freshness admission.
+An idempotent repeat of an already-confirmed tick cannot refresh book timestamps;
+unsupported ticks, incompatible changes and regressed clocks remain errors.
+Only fixed public failure categories/details are logged.
+
+The final offline Rust check passed **326 tests**, formatting and all-target Clippy
+with warnings denied. Its source binding and subsequent exact-image/container and
+selected-host receipts belong to `output/audit-fixes-20261013-r12`. The 520 Linux
+Python checks and six TypeScript parity cases from the previous candidate cover
+unchanged Python/TypeScript source; image integration is verified again for the
+final images. A daily test exists only after its original Resume receipt and run
+identity are confirmed. Risk, capital, feed-age and journal quotas are unchanged;
+public observation and synthetic execution do not establish real profitability.
+
+## October 13, 2026 — exact paper costs, feed recovery and observed queues
+
+New paper histories persist an `exact_accounting` version at a zero-spend
+baseline. Exact cumulative outcome costs replace proportional allocation before
+merge/redemption and prospective risk admission. Legacy operations retain their
+historical accounting; legacy cost uncertainty blocks new quotes and cannot be
+silently upgraded. The retained 34-operation R10 regression still reproduces the
+original legacy result. With the new version its residual basis is $0.80 and the
+additional lot is rejected by the unchanged $10 gross-loss policy.
+Automatic refill is also deferred until an explicit new quote operation has
+passed admission on the updated position. Legacy refill semantics remain intact.
+
+Optional informational timestamps/assets and normalized BUY/SELL casing are
+handled separately from required execution witnesses. Semantic trade fingerprints
+deduplicate spelling differences. Required input and full-frame atomicity checks
+remain strict. Core validation failures request a source-generation refresh without
+owner commands, risk resets or released possible fills; three failures within one
+minute latch a fault. Only fixed public failure classes are logged.
+
+Versioned public inputs persist observed depth at the best bid and relevant order
+prices. Queue decreases are credited only from witnessed prints, and a print is
+applied only at its own price. This is a conservative synthetic queue model, not
+calibrated venue execution. Sub-minimum residuals may retain an already-live legal
+complement at its immutable price/size when pair cost and risk permit; they never
+create a new undersized lot or recover queue priority. Telegram status explains
+waiting, working virtual orders and the remaining gross-loss budget before open risk.
+
+Offline Rust formatting, all-target Clippy and regression tests, console checks,
+image integration, historical ledger recovery and selected-host deployment have
+separate receipts under `output/audit-fixes-20261013-r11`. Deployment and a completed
+day must be confirmed there; this source description does not establish either or
+real profitability. The final local checks passed **324 Rust tests**, formatting
+and Clippy with warnings denied; **520 Python tests** passed in Linux without skips
+(128 console, 157 operations, 21 data, 34 latency and 180 research). The bounded
+historical TypeScript quote oracle passed six cases. Image and selected-host
+checks have their own receipts. No capital, loss, drawdown, feed-age or journal
+limit is raised.
+
+## October 13, 2026 — optional CLOB fields and feed failure diagnostics
+
+The retained R9 engine log records a fatal CLOB `invalid_public_input` immediately
+before `feed relay stopped unexpectedly`. The rejected original wire frame was not
+retained, so its exact parser subtype cannot be established retrospectively.
+
+The official CLOB SDK permits missing, null and empty optional decimal metadata.
+The previous parser reproducibly rejected these forms for quote hints, trade fee
+metadata and old tick metadata. They now remain absent metadata. Required book
+levels, trade prices, present trade quantities, clocks, identity, frame bounds and
+atomic batch validation retain their strict checks. A trade without a quantity
+emits no execution witness; indicative BBO metadata never creates depth or fills.
+See the [official SDK schema](https://github.com/Polymarket/ts-sdk/blob/main/packages/bindings/src/subscriptions/clob.ts).
+
+Feed failures now log a fixed public parser detail, and relay exit reporting
+distinguishes a returned failure, unexpected completion, panic and cancellation
+without echoing rejected content. No strategy, capital, loss, feed-age or journal
+limits changed; startup still requires an explicit Resume.
+
+The previous code fails three new optional-field regressions. The candidate
+passes formatting, all-target Clippy with warnings denied and **315 Rust workspace
+tests**, including seven new regressions. Original R9 preservation, stopped-copy
+replay, exact-image checks, deployment and the new daily test have separate dated
+receipts under `output/feed-relay-fix-20261013`; local tests do not establish them
+or economic suitability.
+
+## October 12, 2026 — paper quote ordering and UTC risk windows
+
+The actor recalculates paper quotes on the candidate after fill/cancel acknowledgements,
+venue and fee rules, immediately before applying intents. Partial inventory therefore
+cannot retain an ordinary lot from the earlier position. Cancel races keep their
+possible-fill reservations until terminal acknowledgement.
+
+An explicit journaled `risk_window` input advances the daily gross-loss window from
+caller-supplied UTC before active admission, including idle ticks. Synthetic execution
+time used to drain rollover events cannot advance that window. Legacy `advance` inputs
+retain their original accounting semantics, and a day change preserves drawdown, old
+inventory, reservations and latched halts. Late resolutions are charged at their recorded
+processing time without rewinding the risk clock. No configured limits were increased.
+
+Offline locked workspace formatting, Clippy with warnings denied, and **308 Rust tests**
+passed, including seven new regressions. The retained first R8 journal segment replays
+with its original execution/accounting under the new code; this is compatibility evidence,
+not a new forward run or economic holdout. Full stopped-journal recovery, exact-image
+container checks, selected-host installation and a fresh one-day run have separate receipts
+under `output/simulation-restart-20261012`; do not infer their completion from unit tests.
+
+The prior additional Telegram operator code is included in this release. The primary
+owner and additional allowlist must be retained when migrating from the console overlay.
+
+## October 12, 2026 — additional Telegram operator access
+
+The optional bounded Telegram allowlist preserves the primary owner and signed
+Mini App authentication. Both operators receive private replies; charts go to the
+requesting chat. A pending command, including an older owner-only record, cannot
+be taken over by another operator. Session TTL, launch-data age, replay fences,
+aggregate rate limits and all execution risk limits retain their existing bounds.
+
+The local Python console suite passed **126 tests**. The existing operations suite
+passed **148 tests with 13 platform skips** on Windows. The final Linux operations
+suite passed **157 tests without skips** offline. Nine console overlay tests also
+passed on Windows, covering an unchanged
+engine/proxy, exact IDs/images, safe no-op and refusal of unrelated deployments.
+These are local fixture checks; actual Telegram-client acceptance is a separate gate.
+
+A real isolated Compose fixture also verified that a never-started guard container
+degrades only console recovery in the original supervisor, stays outside Compose's
+managed-container filter, and is removed after a successful replacement. This
+prevents simultaneous recovery from restoring the previous console during an update.
+The engine supervisor continues polling throughout this procedure.
+
+The console-only recovery overlay uses an independently pinned image and never
+changes the current release, runtime secrets, active engine profile or engine
+container. Its source/profile/image gates stop applying it after an unrelated
+deployment. A later full release must carry the configured additional IDs forward.
+
+## Simulation inventory cost and prospective loss admission: October 11, 2026
+
+R7 stopped after a partial 18-minute run at the unchanged gross realized-loss
+guard. Exact journal replay identifies new lots on the already overweight side
+and complement quotes whose combined price with owned inventory exceeded $1.
+The simulation policy now quotes only the lagging hedge, caps it by exact BUY
+fill costs and the retained portfolio basis, and checks unresolved positions and
+all possible fills against the original daily-loss/drawdown headroom before new
+intents. See [STRATEGY.md](STRATEGY.md). No risk, capital, feed or journal limit,
+realized accounting policy, old receipt, or funded quote policy was changed.
+
+Formatting, all-target Clippy with `-D warnings` and **301 Rust workspace tests**
+passed, including **87 engine library tests**. Thirteen new regressions exercise
+partial/cancel-race costs, unknown legacy checkpoints, symmetric conservative
+price caps, dust, old unresolved risk, retained-order deduplication, independent
+possible fills, strict unchanged loss thresholds, drawdown and actual merge/
+redemption of admitted partial-fill batches for either final outcome.
+
+All **499 Python tests** passed in dependency-complete Linux, with no skips.
+The unchanged historical strategy/reference **25 Node checks** passed. Simulation
+inventory management is a separate contract from the historical quote oracle.
+Timing-sensitive journal tests initially failed on Docker Desktop's slow temporary
+filesystem; the successful complete suite and production image build use temporary
+test journals on tmpfs, preserving all production freshness and timeout rules.
+Selected-host durable ledger recovery remains a separate deployment check.
+
+On the same short observed R7 tape, a synthetic counterfactual with the new rules
+did not trip the loss guard. It remained negative and spent most quote opportunities
+abstaining on a below-minimum imbalance. This is a regression diagnostic fitted to
+the incident, not an independent holdout, a full day, profitability, real PnL or ROI.
+Runtime image/browser integration and the fresh 24-hour experiment have separate
+dated receipts; waiting due to `loss_budget` or `inventory_dust` must not be presented
+as continuous active quoting or economic acceptance.
+
+## Public simulation resolution and inspectable rollover failure: October 10, 2026
+
+R6 exhausted 64 held unresolved markets because public rollover had no outcome
+worker. The fix reads exact standard binary CTF payouts at one canonical finalized
+Polygon block, journals checked evidence before synthetic credit, retains unknown
+positions and preserves all original capital/risk/storage limits. A failed paper
+rollover now remains paused with its diagnostic API available. See
+[the resolution and rollback contract](PAPER_RESOLUTION.md).
+
+Formatting, all-target Clippy with `-D warnings` and **288 Rust workspace tests**
+passed, including **84 engine library tests**. Ten new regressions cover finalized
+outcome/token identity, unfinalized/split/foreign/reorganized observations, more than
+64 windows with unchanged capacity and finite cash, exact replay/idempotency,
+delayed settlement across a complete-set merge, durable credit/sync failure, and
+the retained capacity-faulted actor with Pause acknowledgement and blocked Resume.
+Two existing batching tests now admit fresh timestamps and drain from the current
+logical clock, preserving the production freshness policy on slow storage.
+
+All **499 Python tests** passed in dependency-complete Linux (console 118, data 21,
+latency 34, ops 148, research 178), with no skips. The strategy/reference **25 Node
+checks** passed; the unchanged dashboard's 30 checks and production build are also
+validated by the console image build. Initial Windows sandbox and read-only Linux
+fixture attempts failed because their temporary directories were unavailable;
+the successful run used an isolated writable Linux project copy.
+
+The read-only production diagnostic verified a real completed R6 market against
+the public CTF payout vector and independently derived both token IDs. This proves
+the public observation path for that market; no engine ledger or funded wallet was
+changed. Exact-image smoke, stopped-ledger recovery and the repeat forward run
+remain separately recorded deployment receipts. A running repeat is not a completed
+24-hour acceptance or economic result.
+
 ## Automated maker fee evidence and live reconciliation: October 9, 2026
 
 Public quote readiness now requires strict current-market fee metadata, refreshed off

@@ -1,0 +1,370 @@
+{
+  "source_revision": "8e852e0ae6dab40ce7e14af22cb39b618404ee0e",
+  "operations": [
+    {
+      "condition_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "end_ms": 300000,
+      "kind": "market",
+      "start_ms": 0
+    },
+    {
+      "at_ms": 1000,
+      "kind": "risk_window"
+    },
+    {
+      "ahead_micros": 0,
+      "ask": 540000,
+      "bid": 520000,
+      "kind": "book",
+      "now_ms": 1000,
+      "outcome": "up"
+    },
+    {
+      "kind": "quotes",
+      "now_ms": 1000,
+      "quotes": [
+        {
+          "outcome": "up",
+          "price_micros": 520000,
+          "quantity_micros": 5000000,
+          "slot": "up:lot"
+        }
+      ]
+    },
+    {
+      "kind": "advance",
+      "now_ms": 1050
+    },
+    {
+      "kind": "trade",
+      "now_ms": 1060,
+      "outcome": "up",
+      "quantity_micros": 5000000,
+      "worst_price_micros": 520000
+    },
+    {
+      "kind": "advance",
+      "now_ms": 1100
+    },
+    {
+      "kind": "cancel_all",
+      "now_ms": 1110
+    },
+    {
+      "kind": "advance",
+      "now_ms": 300010
+    },
+    {
+      "condition_id": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "end_ms": 600000,
+      "kind": "market",
+      "start_ms": 300000
+    },
+    {
+      "at_ms": 300010,
+      "condition_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": "demo_resolution",
+      "winning_outcome": "down"
+    },
+    {
+      "ahead_micros": 0,
+      "ask": 540000,
+      "bid": 520000,
+      "kind": "book",
+      "now_ms": 301000,
+      "outcome": "up"
+    },
+    {
+      "kind": "quotes",
+      "now_ms": 301000,
+      "quotes": [
+        {
+          "outcome": "up",
+          "price_micros": 520000,
+          "quantity_micros": 5000000,
+          "slot": "up:lot"
+        }
+      ]
+    },
+    {
+      "kind": "advance",
+      "now_ms": 301050
+    },
+    {
+      "kind": "trade",
+      "now_ms": 301060,
+      "outcome": "up",
+      "quantity_micros": 5000000,
+      "worst_price_micros": 520000
+    },
+    {
+      "kind": "advance",
+      "now_ms": 301100
+    },
+    {
+      "kind": "cancel_all",
+      "now_ms": 301110
+    },
+    {
+      "kind": "advance",
+      "now_ms": 600010
+    },
+    {
+      "condition_id": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "end_ms": 900000,
+      "kind": "market",
+      "start_ms": 600000
+    },
+    {
+      "at_ms": 600010,
+      "condition_id": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "demo_resolution",
+      "winning_outcome": "down"
+    },
+    {
+      "ahead_micros": 0,
+      "ask": 820000,
+      "bid": 800000,
+      "kind": "book",
+      "now_ms": 620000,
+      "outcome": "up"
+    },
+    {
+      "ahead_micros": 0,
+      "ask": 120000,
+      "bid": 100000,
+      "kind": "book",
+      "now_ms": 620000,
+      "outcome": "down"
+    },
+    {
+      "kind": "quotes",
+      "now_ms": 620000,
+      "quotes": [
+        {
+          "outcome": "up",
+          "price_micros": 800000,
+          "quantity_micros": 5000000,
+          "slot": "up:lot"
+        },
+        {
+          "outcome": "down",
+          "price_micros": 100000,
+          "quantity_micros": 5000000,
+          "slot": "down:lot"
+        }
+      ]
+    },
+    {
+      "kind": "advance",
+      "now_ms": 620050
+    },
+    {
+      "kind": "trade",
+      "now_ms": 620060,
+      "outcome": "up",
+      "quantity_micros": 5000000,
+      "worst_price_micros": 800000
+    },
+    {
+      "kind": "trade",
+      "now_ms": 620061,
+      "outcome": "down",
+      "quantity_micros": 5000000,
+      "worst_price_micros": 100000
+    },
+    {
+      "kind": "advance",
+      "now_ms": 620100
+    },
+    {
+      "kind": "quotes",
+      "now_ms": 620110,
+      "quotes": [
+        {
+          "outcome": "up",
+          "price_micros": 800000,
+          "quantity_micros": 5000000,
+          "slot": "up:lot"
+        },
+        {
+          "outcome": "down",
+          "price_micros": 100000,
+          "quantity_micros": 5000000,
+          "slot": "down:lot"
+        }
+      ]
+    },
+    {
+      "kind": "advance",
+      "now_ms": 620160
+    },
+    {
+      "kind": "trade",
+      "now_ms": 620170,
+      "outcome": "up",
+      "quantity_micros": 1000000,
+      "worst_price_micros": 800000
+    },
+    {
+      "kind": "advance",
+      "now_ms": 620210
+    },
+    {
+      "kind": "cancel_all",
+      "now_ms": 620220
+    },
+    {
+      "kind": "advance",
+      "now_ms": 900010
+    },
+    {
+      "condition_id": "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "end_ms": 1200000,
+      "kind": "market",
+      "start_ms": 900000
+    }
+  ],
+  "legacy_after_rollover": {
+    "available_cash_micros": 994500000,
+    "available_pico": "994500000000000",
+    "cash_pico": "994500000000000",
+    "daily_loss_pico": "5200000000000",
+    "drawdown_pico": "4991666666666",
+    "fees_pico": "0",
+    "halted": null,
+    "held_market_count": 1,
+    "initial_cash_pico": "1000000000000000",
+    "open_cost_pico": "508333333334",
+    "position_count": 4,
+    "positions": [
+      {
+        "down": {
+          "cost_pico": "0",
+          "quantity_micros": 0
+        },
+        "execution_down_micros": 0,
+        "execution_fee_pico": "0",
+        "execution_spent_pico": "2600000000000",
+        "execution_up_micros": 5000000,
+        "market": {
+          "end_ms": 300000,
+          "id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "start_ms": 0
+        },
+        "resolution": {
+          "at_ms": 300010,
+          "fee_pico": "0",
+          "finality_confirmed": true,
+          "id": "demo-resolution:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "market_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "provenance": "synthetic",
+          "winning_outcome": "down"
+        },
+        "totals_imported": true,
+        "up": {
+          "cost_pico": "0",
+          "quantity_micros": 0
+        }
+      },
+      {
+        "down": {
+          "cost_pico": "0",
+          "quantity_micros": 0
+        },
+        "execution_down_micros": 0,
+        "execution_fee_pico": "0",
+        "execution_spent_pico": "2600000000000",
+        "execution_up_micros": 5000000,
+        "market": {
+          "end_ms": 600000,
+          "id": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "start_ms": 300000
+        },
+        "resolution": {
+          "at_ms": 600010,
+          "fee_pico": "0",
+          "finality_confirmed": true,
+          "id": "demo-resolution:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "market_id": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "provenance": "synthetic",
+          "winning_outcome": "down"
+        },
+        "totals_imported": true,
+        "up": {
+          "cost_pico": "0",
+          "quantity_micros": 0
+        }
+      },
+      {
+        "down": {
+          "cost_pico": "0",
+          "quantity_micros": 0
+        },
+        "execution_down_micros": 5000000,
+        "execution_fee_pico": "0",
+        "execution_spent_pico": "5300000000000",
+        "execution_up_micros": 6000000,
+        "market": {
+          "end_ms": 900000,
+          "id": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "start_ms": 600000
+        },
+        "resolution": null,
+        "totals_imported": true,
+        "up": {
+          "cost_pico": "508333333334",
+          "quantity_micros": 1000000
+        }
+      },
+      {
+        "down": {
+          "cost_pico": "0",
+          "quantity_micros": 0
+        },
+        "execution_down_micros": 0,
+        "execution_fee_pico": "0",
+        "execution_spent_pico": "0",
+        "execution_up_micros": 0,
+        "market": {
+          "end_ms": 1200000,
+          "id": "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "start_ms": 900000
+        },
+        "resolution": null,
+        "totals_imported": false,
+        "up": {
+          "cost_pico": "0",
+          "quantity_micros": 0
+        }
+      }
+    ],
+    "positions_truncated": 0,
+    "realized_pnl_pico": "-4991666666666",
+    "reservations": [],
+    "reserved_pico": "0",
+    "returned_pico": "5000000000000",
+    "risk_clock_ms": 900000,
+    "risk_day_utc": 0,
+    "spent_pico": "10500000000000"
+  },
+  "strategy_decision": {
+    "center_micros": 856605,
+    "half_width_micros": 10000,
+    "quotes": [
+      {
+        "outcome": "up",
+        "price_micros": 850000,
+        "quantity_micros": 5000000,
+        "slot": "up:lot"
+      },
+      {
+        "outcome": "down",
+        "price_micros": 100000,
+        "quantity_micros": 5000000,
+        "slot": "down:lot"
+      }
+    ],
+    "reason": "quote"
+  }
+}

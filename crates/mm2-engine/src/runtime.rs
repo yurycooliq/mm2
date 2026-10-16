@@ -20,6 +20,47 @@ pub fn wall_ms() -> u64 {
 pub fn mono_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
+fn valid_feed_prefix(core: &Core, batch: &[FeedEvent]) -> usize {
+    let mut checked = core.clone();
+    batch
+        .iter()
+        .position(|event| checked.apply(event.clone()).is_err())
+        .unwrap_or(batch.len())
+}
+fn valid_feed_prefix_with_recovery(
+    core: &Core,
+    batch: &[FeedEvent],
+    mut native_snapshots: Option<[bool; 2]>,
+) -> usize {
+    let mut checked = core.clone();
+    for (index, event) in batch.iter().enumerate() {
+        if native_snapshots.is_some() && matches!(event, FeedEvent::Delta { .. }) {
+            continue;
+        }
+        if let Err(error) = checked.apply(event.clone()) {
+            if matches!(event, FeedEvent::Delta { .. })
+                && error == "crossed or oversized batch result"
+            {
+                native_snapshots = Some([false; 2]);
+                continue;
+            }
+            return index;
+        }
+        match event {
+            FeedEvent::Snapshot { outcome, .. } => {
+                if let Some(seen) = &mut native_snapshots {
+                    seen[usize::from(*outcome == crate::domain::Outcome::Down)] = true;
+                    if seen.iter().all(|seen| *seen) {
+                        native_snapshots = None;
+                    }
+                }
+            }
+            FeedEvent::Disconnect { .. } => native_snapshots = None,
+            _ => {}
+        }
+    }
+    batch.len()
+}
 pub fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Paused => "paused",
@@ -49,6 +90,11 @@ enum Operation {
     Command(Command, oneshot::Sender<Reply>),
     Mirror(Command),
     Market(Market, oneshot::Sender<Result<(), String>>),
+    ResolutionTargets(oneshot::Sender<Vec<crate::paper_resolution::Target>>),
+    PublicResolution(
+        crate::paper_resolution::Evidence,
+        oneshot::Sender<Result<(), String>>,
+    ),
     SourceStatus(&'static str, Option<String>, Option<u64>),
 }
 
@@ -62,6 +108,36 @@ pub struct Handle {
     fee_policy: watch::Sender<Option<mm2_live::fees::FeePolicy>>,
 }
 impl Handle {
+    pub fn simulation_handle(&self) -> Option<Handle> {
+        if self.state.borrow()["execution_mode"] == "simulation" {
+            Some(self.clone())
+        } else {
+            self.paper.as_deref().cloned()
+        }
+    }
+    pub async fn resolution_targets(&self) -> Result<Vec<crate::paper_resolution::Target>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .try_send(Operation::ResolutionTargets(tx))
+            .map_err(|_| "resolution target queue unavailable")?;
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| "resolution target request timed out")?
+            .map_err(|_| "resolution actor unavailable".into())
+    }
+    pub async fn resolve_paper(
+        &self,
+        evidence: crate::paper_resolution::Evidence,
+    ) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .try_send(Operation::PublicResolution(evidence, tx))
+            .map_err(|_| "paper resolution queue unavailable")?;
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| "paper resolution acknowledgement unknown")?
+            .map_err(|_| "paper resolution actor unavailable")?
+    }
     pub fn fee_policy(&self, policy: Option<mm2_live::fees::FeePolicy>) {
         let policy = policy.filter(|p| p.validate().is_ok() && p.maker_zero());
         self.fee_policy.send_replace(policy.clone());
@@ -165,6 +241,9 @@ pub struct Actor {
     coalesced_publications: u64,
     publication_duration_ns: u64,
     simulation_books: [(u64, u64); 2],
+    simulation_depth: [Vec<mm2_emulator::Level>; 2],
+    source_refresh_failures: VecDeque<Instant>,
+    native_snapshot_recovery: Option<(Instant, [bool; 2])>,
     execution_noop_ticks: u64,
     execution_periodic_overruns: u64,
     execution_feed_batches: u64,
@@ -200,6 +279,7 @@ struct Publication {
     source_status: Value,
     fee_check: Value,
     awaiting_source_refresh: bool,
+    awaiting_native_snapshots: bool,
     fatal: Option<String>,
     committing: bool,
     closing: bool,
@@ -224,6 +304,7 @@ struct Publication {
     live: Option<Arc<mm2_live::LiveSnapshot>>,
     journal_metrics: Option<crate::journal::JournalMetrics>,
     paper_portfolio: Option<mm2_portfolio::Snapshot>,
+    paper_resolution: Option<Value>,
     paper: Option<Arc<Value>>,
     paper_error: Option<String>,
 }
@@ -354,6 +435,9 @@ pub fn prepare(
         coalesced_publications: 0,
         publication_duration_ns: 0,
         simulation_books: [(0, 0); 2],
+        simulation_depth: [Vec::new(), Vec::new()],
+        source_refresh_failures: VecDeque::new(),
+        native_snapshot_recovery: None,
         execution_noop_ticks: 0,
         execution_periodic_overruns: 0,
         execution_feed_batches: 0,
@@ -459,9 +543,13 @@ impl Actor {
     }
 
     fn evaluate(&mut self) {
+        self.evaluate_with_paper(None);
+    }
+    fn evaluate_with_paper(&mut self, advanced: Option<&simulation::MultiMarketPaper>) {
         let began = Instant::now();
         let now = wall_ms();
         let mono = mono_ms(self.start);
+        let paper = advanced.or(self.simulation.as_ref());
         self.last_decision = self.core.evaluate(now, mono);
         self.desired_quotes.clear();
         self.live_quotes.clear();
@@ -472,17 +560,14 @@ impl Actor {
                 StopReason::NoLegalQuote(_) | StopReason::BudgetExceeded
             )
         });
-        let paper_halted = self
-            .simulation
-            .as_ref()
-            .is_some_and(|paper| paper.portfolio_halt().is_some());
+        let paper_halted = paper.is_some_and(|paper| paper.portfolio_halt().is_some());
         if paper_halted {
             self.strategy_gate = Some(mm2_strategy::Gate::InsufficientCapital);
         }
         if self.last_decision.stop_reasons.is_empty() && !paper_halted {
             let snapshot = self.core.snapshot();
             if let Some(market) = &snapshot.market {
-                let account = self.simulation.as_ref().map(|s| s.snapshot().account);
+                let account = paper.map(|s| s.snapshot().account);
                 let mut rules = self.strategy.clone();
                 rules.half_width_micros = snapshot.config.half_width_micro;
                 rules.lot_full_micros = snapshot.config.lot_micro;
@@ -518,7 +603,26 @@ impl Actor {
                     min_order_micros: 5_000_000,
                     signals: mm2_strategy::Signals::default(),
                 };
-                match mm2_strategy::decide(&rules, &input) {
+                let decision = if self.execution_mode == "simulation"
+                    && let Some(account) = &account
+                {
+                    let costs = account
+                        .outcome_spent_pico
+                        .as_ref()
+                        .and_then(|costs| Some([costs[0].parse().ok()?, costs[1].parse().ok()?]));
+                    mm2_strategy::decide_inventory_aware(&rules, &input, costs)
+                } else {
+                    mm2_strategy::decide(&rules, &input)
+                };
+                let decision = decision.and_then(|mut decision| {
+                    if self.execution_mode == "simulation"
+                        && let Some(paper) = paper
+                    {
+                        paper.guard_strategy_quotes(&rules, &mut decision)?;
+                    }
+                    Ok(decision)
+                });
+                match decision {
                     Ok(decision) => {
                         self.strategy_gate = Some(decision.reason);
                         self.desired_quotes = decision.quotes;
@@ -634,7 +738,8 @@ impl Actor {
             && live.snapshot().phase == mm2_live::LivePhase::Running
             && self.fatal.is_none()
             && !self.closing
-            && !self.awaiting_source_refresh;
+            && !self.awaiting_source_refresh
+            && self.native_snapshot_recovery.is_none();
         let quotes = if active {
             snapshot.market.as_ref().map_or_else(Vec::new, |market| {
                 self.live_quotes
@@ -691,6 +796,7 @@ impl Actor {
             source_status: self.source_status.clone(),
             fee_check: self.fee_check(wall_ms()),
             awaiting_source_refresh: self.awaiting_source_refresh,
+            awaiting_native_snapshots: self.native_snapshot_recovery.is_some(),
             fatal: self.fatal.clone(),
             committing: self.committing,
             closing: self.closing,
@@ -718,6 +824,10 @@ impl Actor {
                 .simulation
                 .as_ref()
                 .map(|session| session.telemetry_portfolio_snapshot()),
+            paper_resolution: self
+                .simulation
+                .as_ref()
+                .map(|paper| paper.resolution_status()),
             paper: self
                 .paper
                 .as_ref()
@@ -782,52 +892,27 @@ impl Actor {
             .simulation_origin_ms
             .saturating_add(mono_ms(self.start))
             .max(session.snapshot().now_ms);
-        let mut operations = vec![SimulationOperation::Advance { now_ms: now }];
-        if active && snapshot.pending_events == 0 && snapshot.orders.is_empty() {
-            let minimum_cost = self
-                .last_decision
-                .intents
-                .iter()
-                .map(|intent| u128::from(intent.price_micro) * 5_000_000u128 / 1_000_000u128)
-                .min();
-            if minimum_cost
-                .is_some_and(|cost| cost > u128::from(snapshot.account.available_micros_floor))
-            {
-                let _ = self.core.control(Action::Pause);
-                self.evaluate();
-                active = false;
-                self.simulation_error =
-                    Some("finite simulated collateral exhausted; session is paused".into());
-            }
-        }
+        let mut operations = Vec::new();
+        operations.push(SimulationOperation::Advance { now_ms: now });
         if !active || settling {
             operations.push(SimulationOperation::CancelAll { now_ms: now });
-        }
-        if active && !settling {
-            let snapshot = self.core.snapshot();
-            for (index, (outcome, book)) in
-                [("up", &snapshot.up_book), ("down", &snapshot.down_book)]
-                    .into_iter()
-                    .enumerate()
-            {
-                if let (Some(bid), Some(ask)) = (book.best_bid_micro, book.best_ask_micro)
-                    && self.simulation_books[index] != (bid, ask)
-                {
-                    operations.push(SimulationOperation::Book {
-                        now_ms: now,
-                        outcome: outcome.into(),
-                        bid,
-                        ask,
-                        ahead_micros: 100_000_000,
-                    });
-                }
-            }
         }
         for operation in &operations {
             if let Err(error) = simulation::apply(&mut candidate, operation) {
                 self.latch(format!("simulation invariant: {error}"));
                 return;
             }
+        }
+        // Execution time may run ahead while draining cancels at rollover. Risk
+        // days use separately recorded UTC, never that synthetic future clock.
+        let risk_at = wall_ms().max(candidate.risk_clock_ms());
+        if active && !settling && candidate.risk_window_due(risk_at) {
+            let operation = SimulationOperation::RiskWindow { at_ms: risk_at };
+            if let Err(error) = simulation::apply(&mut candidate, &operation) {
+                self.latch(format!("simulation risk window invariant: {error}"));
+                return;
+            }
+            operations.push(operation);
         }
         if active && !settling {
             let books = self.core.snapshot();
@@ -880,6 +965,105 @@ impl Actor {
             }
         }
         if active && !settling {
+            // Advance has confirmed fills/cancels and changed inventory, costs
+            // and possible fills. Only this candidate may authorize the quote.
+            self.evaluate_with_paper(Some(&candidate));
+            let current = candidate.snapshot();
+            let minimum_cost = self
+                .last_decision
+                .intents
+                .iter()
+                .map(|intent| u128::from(intent.price_micro) * 5_000_000u128 / 1_000_000u128)
+                .min();
+            if current.pending_events == 0
+                && current.orders.is_empty()
+                && minimum_cost
+                    .is_some_and(|cost| cost > u128::from(current.account.available_micros_floor))
+            {
+                let _ = self.core.control(Action::Pause);
+                self.evaluate_with_paper(Some(&candidate));
+                self.simulation_error =
+                    Some("finite simulated collateral exhausted; session is paused".into());
+                active = false;
+            }
+        }
+        if active && !settling {
+            let snapshot = self.core.snapshot();
+            let current = candidate.snapshot();
+            let new_quote = self.desired_quotes.iter().any(|quote| {
+                !current.orders.iter().any(|order| {
+                    order.quote.slot == quote.slot
+                        && order.quote.outcome == quote.outcome
+                        && order.quote.price_micros == quote.price_micros
+                        && order.requested_quantity_micros == quote.quantity_micros
+                })
+            });
+            let needs_depth = new_quote
+                || current
+                    .orders
+                    .iter()
+                    .any(|order| order.phase == mm2_core::OrderPhase::Posting);
+            for (index, (name, outcome, book)) in [
+                ("up", mm2_core::Outcome::Up, &snapshot.up_book),
+                ("down", mm2_core::Outcome::Down, &snapshot.down_book),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let (Some(bid), Some(ask)) = (book.best_bid_micro, book.best_ask_micro)
+                    && candidate.exact_execution_costs()
+                    && needs_depth
+                {
+                    let prices: Vec<_> = std::iter::once(bid)
+                        .chain(
+                            self.desired_quotes
+                                .iter()
+                                .filter(|q| q.outcome == outcome)
+                                .map(|q| q.price_micros),
+                        )
+                        .chain(
+                            current
+                                .orders
+                                .iter()
+                                .filter(|o| o.quote.outcome == outcome)
+                                .map(|o| o.quote.price_micros),
+                        )
+                        .collect();
+                    let depth: Vec<_> = self
+                        .core
+                        .bid_depth_at(
+                            if index == 0 {
+                                crate::domain::Outcome::Up
+                            } else {
+                                crate::domain::Outcome::Down
+                            },
+                            &prices,
+                        )
+                        .into_iter()
+                        .map(|level| mm2_emulator::Level {
+                            price_micros: level.price_micro,
+                            quantity_micros: level.quantity_micro,
+                        })
+                        .collect();
+                    if new_quote
+                        || self.simulation_books[index] != (bid, ask)
+                        || self.simulation_depth[index] != depth
+                    {
+                        let operation = SimulationOperation::DepthBook {
+                            now_ms: now,
+                            outcome: name.into(),
+                            bid,
+                            ask,
+                            bid_levels: depth,
+                        };
+                        if let Err(error) = simulation::apply(&mut candidate, &operation) {
+                            self.latch(format!("simulation depth invariant: {error}"));
+                            return;
+                        }
+                        operations.push(operation);
+                    }
+                }
+            }
             let quote = SimulationOperation::Quotes {
                 now_ms: now,
                 quotes: simulation::from_core_quotes(&self.desired_quotes),
@@ -975,6 +1159,18 @@ impl Actor {
                     {
                         self.simulation_books[usize::from(outcome == "down")] = (*bid, *ask);
                     }
+                    if let SimulationOperation::DepthBook {
+                        outcome,
+                        bid,
+                        ask,
+                        bid_levels,
+                        ..
+                    } = operation
+                    {
+                        let index = usize::from(outcome == "down");
+                        self.simulation_books[index] = (*bid, *ask);
+                        self.simulation_depth[index] = bid_levels.clone();
+                    }
                 }
             }
             Err(_) => {
@@ -993,6 +1189,9 @@ impl Actor {
         let now = candidate.now_ms();
         let market = self.core.snapshot().market;
         let mut operations = Vec::new();
+        if session.can_enable_exact_costs() {
+            operations.push(SimulationOperation::ExactAccounting {});
+        }
         if self.simulation_condition.is_some() {
             operations.push(SimulationOperation::CancelAll { now_ms: now });
             operations.push(SimulationOperation::Advance {
@@ -1016,7 +1215,10 @@ impl Actor {
                 .market;
             operations.push(SimulationOperation::DemoResolution {
                 condition_id: previous.clone(),
-                at_ms: previous_market.end_ms,
+                at_ms: previous_market
+                    .end_ms
+                    .max(wall_ms())
+                    .max(candidate.risk_clock_ms()),
                 winning_outcome: if (previous_market.start_ms / 300_000).is_multiple_of(2) {
                     "up"
                 } else {
@@ -1047,10 +1249,207 @@ impl Actor {
                 self.simulation_last_trade_ms = candidate.now_ms();
                 self.simulation = Some(candidate);
                 self.simulation_books = [(0, 0); 2];
+                self.simulation_depth = [Vec::new(), Vec::new()];
                 Ok(())
             }
             Err(_) => Err("market identity journal writer stopped".into()),
         }
+    }
+    async fn admit_public_resolution(
+        &mut self,
+        evidence: crate::paper_resolution::Evidence,
+    ) -> Result<(), String> {
+        if self.source != "public" || self.execution_mode != "simulation" {
+            return Err("public outcome admission requires the independent simulation lane".into());
+        }
+        let Some(session) = &self.simulation else {
+            return Err("no paper ledger".into());
+        };
+        let mut candidate = session.clone();
+        let operation = SimulationOperation::PublicResolution {
+            at_ms: wall_ms()
+                .max(evidence.observed_at_ms)
+                .max(candidate.risk_clock_ms()),
+            evidence,
+        };
+        simulation::apply(&mut candidate, &operation)?;
+        candidate.validate()?;
+        if simulation::same_state_without_clock(session, &candidate)? {
+            return Ok(());
+        }
+        let values = simulation::values(&[operation])?;
+        let Some(mut journal) = self.journal.take() else {
+            return Err("paper journal unavailable".into());
+        };
+        match tokio::task::spawn_blocking(move || {
+            let result = journal.commit_execution(values);
+            (journal, result)
+        })
+        .await
+        {
+            Ok((journal, result)) => {
+                self.journal_bytes = journal.bytes();
+                self.journal = Some(journal);
+                if let Err(error) = result {
+                    self.latch(error.clone());
+                    return Err(error);
+                }
+                self.simulation = Some(candidate);
+                self.evaluate();
+                // A newly realized loss must cancel existing possible fills immediately.
+                self.simulation_step(false).await;
+                self.publish();
+                Ok(())
+            }
+            Err(_) => {
+                self.latch("paper resolution journal writer stopped".into());
+                Err("paper resolution journal writer stopped".into())
+            }
+        }
+    }
+    async fn select_market(&mut self, market: Market) -> Result<(), String> {
+        // A failed paper rollover is an inspectable paused actor, not a dead source/API.
+        if self.fatal.is_some() && self.simulation.is_some() {
+            return Ok(());
+        }
+        let mut candidate = self.core.clone();
+        candidate.set_market(market.clone())?;
+        let previous = std::mem::replace(&mut self.core, candidate);
+        if let Err(error) = self.bind_simulation_market(&market.condition_id).await {
+            self.core = previous;
+            self.simulation_error = Some(error.clone());
+            self.latch(error.clone());
+            self.simulation_step(true).await;
+            self.publish();
+            return if self.simulation.is_some() {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        self.condition = Some(market.condition_id);
+        self.observation_barrier = Some(mono_ms(self.start));
+        self.awaiting_source_refresh = false;
+        self.native_snapshot_recovery = None;
+        self.evaluate();
+        self.publish();
+        Ok(())
+    }
+    fn apply_feed_event(&mut self, event: FeedEvent) -> bool {
+        self.feed_events = self.feed_events.saturating_add(1);
+        let delta = matches!(&event, FeedEvent::Delta { .. });
+        if delta && self.native_snapshot_recovery.is_some() {
+            // A split price update must not initialize a cleared book. Wait for
+            // independently validated full native snapshots; trades still flow.
+            return true;
+        }
+        let snapshot_outcome = match &event {
+            FeedEvent::Snapshot { outcome, .. } => {
+                Some(usize::from(*outcome == crate::domain::Outcome::Down))
+            }
+            FeedEvent::Disconnect { .. } => {
+                self.native_snapshot_recovery = None;
+                None
+            }
+            _ => None,
+        };
+        let clock_context = self.core.feed_clock_context(&event);
+        if let Err(error) = self.core.apply(event)
+            && self.source == "public"
+        {
+            if error == "CLOB receive clock regressed" || error == "CLOB exchange clock regressed" {
+                tracing::warn!(
+                    validation_detail = crate::feeds::input_failure_detail(&error),
+                    clock_context = ?clock_context,
+                    "public clock validation failed"
+                );
+            }
+            if delta && error == "crossed or oversized batch result" {
+                // Public updates can add a new best price before removing the
+                // opposite old price in a separate frame. Never trade that
+                // intermediate book, or infer an atomic cross-frame ordering.
+                self.native_snapshot_recovery = Some((Instant::now(), [false; 2]));
+                // This is the same FIFO source generation. A processing-time
+                // barrier would discard already queued recovery snapshots and
+                // trade witnesses, although they arrived after the split delta.
+                self.simulation_books = [(0, 0); 2];
+                self.simulation_depth = [Vec::new(), Vec::new()];
+                tracing::warn!(
+                    validation_detail = "crossed_or_oversized_delta",
+                    "public book waiting for native snapshots"
+                );
+                self.source_status = json!({"phase":"resynchronizing","message":"waiting for validated full native books","validation_detail":"crossed_or_oversized_delta","at_ms":wall_ms()});
+                self.evaluate();
+                self.drive_live();
+                self.publish();
+                // Keep the rest of this bounded batch: it may already contain
+                // both native snapshots. Admission remains blocked until then.
+                return true;
+            }
+            self.refresh_after_validation_failure(&error);
+            return false;
+        }
+        if let (Some(outcome), Some((_, seen))) =
+            (snapshot_outcome, &mut self.native_snapshot_recovery)
+        {
+            seen[outcome] = true;
+            if seen.iter().all(|seen| *seen) {
+                self.native_snapshot_recovery = None;
+                tracing::info!(
+                    "native book snapshots restored; freshness admission still required"
+                );
+                self.source_status = json!({"phase":"streaming","message":"validated native books restored; freshness admission still required","at_ms":wall_ms()});
+            }
+        }
+        self.evaluate();
+        self.drive_live();
+        true
+    }
+    fn expire_native_snapshot_recovery(&mut self) {
+        let maximum = Duration::from_millis(self.core.snapshot().config.max_feed_age_ms);
+        if self
+            .native_snapshot_recovery
+            .is_some_and(|(started, _)| started.elapsed() >= maximum)
+        {
+            self.native_snapshot_recovery = None;
+            self.refresh_after_validation_failure("native snapshot recovery deadline exceeded");
+        }
+    }
+    fn refresh_after_validation_failure(&mut self, error: &str) {
+        self.native_snapshot_recovery = None;
+        // Join the old source generation before accepting a new snapshot. This
+        // is an internal refresh, not an owner Reset/Resume or a risk reset.
+        let _ = self.core.apply(FeedEvent::Disconnect {
+            source: crate::domain::FeedSource::Clob,
+            reason: "book validation requires source refresh".into(),
+        });
+        let now = Instant::now();
+        while self
+            .source_refresh_failures
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60))
+        {
+            self.source_refresh_failures.pop_front();
+        }
+        self.source_refresh_failures.push_back(now);
+        self.awaiting_source_refresh = true;
+        self.observation_barrier = Some(mono_ms(self.start));
+        self.simulation_books = [(0, 0); 2];
+        self.simulation_depth = [Vec::new(), Vec::new()];
+        let class = crate::feeds::input_failure_class(error);
+        let detail = crate::feeds::input_failure_detail(error);
+        tracing::warn!(
+            validation_class = class,
+            validation_detail = detail,
+            "public input validation requested source refresh"
+        );
+        self.source_status = json!({"phase":"refreshing","message":"book validation requires fresh source snapshots","validation_class":class,"validation_detail":detail,"at_ms":wall_ms()});
+        if self.source_refresh_failures.len() >= 3 {
+            self.latch("repeated public input validation failure; inspection required".into());
+        }
+        self.evaluate();
+        self.drive_live();
+        self.publish();
     }
     async fn observed_trades(&mut self, events: &[FeedEvent]) {
         let Some(session) = &self.simulation else {
@@ -1081,15 +1480,28 @@ impl Actor {
                 continue;
             }
             let candidate = candidate.get_or_insert_with(|| session.clone());
-            let operation = SimulationOperation::ObservedTrade {
-                now_ms: self
-                    .simulation_origin_ms
-                    .saturating_add(mono)
-                    .max(candidate.now_ms()),
-                outcome: outcome_name(*outcome).into(),
-                price_micros: *price_micro,
-                quantity_micros: *quantity_micro,
-                fingerprint: fingerprint.clone(),
+            let operation = if candidate.exact_execution_costs() {
+                SimulationOperation::ObservedTradeV2 {
+                    now_ms: self
+                        .simulation_origin_ms
+                        .saturating_add(mono)
+                        .max(candidate.now_ms()),
+                    outcome: outcome_name(*outcome).into(),
+                    price_micros: *price_micro,
+                    quantity_micros: *quantity_micro,
+                    fingerprint: fingerprint.clone(),
+                }
+            } else {
+                SimulationOperation::ObservedTrade {
+                    now_ms: self
+                        .simulation_origin_ms
+                        .saturating_add(mono)
+                        .max(candidate.now_ms()),
+                    outcome: outcome_name(*outcome).into(),
+                    price_micros: *price_micro,
+                    quantity_micros: *quantity_micro,
+                    fingerprint: fingerprint.clone(),
+                }
             };
             let duplicate = candidate.has_public_trade(fingerprint);
             if let Err(error) = simulation::apply(candidate, &operation) {
@@ -1162,7 +1574,9 @@ impl Actor {
                 json!({"receipt":receipt,"state":self.state.borrow().as_ref(),"replayed":true}),
             );
         }
-        if self.fatal.is_some() || self.closing {
+        let stopping_command =
+            matches!(&command,Command::Control {action,..} if action=="pause" || action=="kill");
+        if (self.fatal.is_some() && !stopping_command) || self.closing {
             return Err(Failure::new(
                 "unavailable",
                 "fault latched; restart required",
@@ -1294,6 +1708,7 @@ impl Actor {
             let _ = self.core.control(Action::Pause);
         }
         if resets {
+            self.native_snapshot_recovery = None;
             self.reset_epoch += 1;
             self.observation_barrier = Some(mono_ms(self.start));
             // Public Reset requires the source owner to join its old socket and acknowledge
@@ -1346,10 +1761,15 @@ impl Actor {
                         Some(Operation::Market(market, reply)) => {
                             // The source owner joins the old stream first. Drain its queued generation.
                             while self.feeds.try_recv().is_ok() {}
-                            let mut result = self.core.set_market(market.clone());
-                            if result.is_ok() && let Err(error)=self.bind_simulation_market(&market.condition_id).await {self.latch(error.clone());result=Err(error);}
-                            if result.is_ok() { self.condition = Some(market.condition_id); self.observation_barrier = Some(mono_ms(self.start)); self.awaiting_source_refresh = false; }
-                            self.evaluate(); self.publish(); let _ = reply.send(result);
+                            let result = self.select_market(market).await;
+                            let _ = reply.send(result);
+                        }
+                        Some(Operation::ResolutionTargets(reply)) => {
+                            let _ = reply.send(self.simulation.as_ref().map_or_else(Vec::new, |s|s.resolution_targets()));
+                        }
+                        Some(Operation::PublicResolution(evidence,reply)) => {
+                            let result = self.admit_public_resolution(evidence).await;
+                            let _ = reply.send(result);
                         }
                         Some(Operation::SourceStatus(phase,message,retry)) => {
                             self.source_status=json!({"phase":phase,"message":message.map(|m|m.chars().take(256).collect::<String>()),"retry_in_ms":retry,"at_ms":wall_ms()});self.publish();
@@ -1359,6 +1779,7 @@ impl Actor {
                 }
                 _ = timer.tick() => {
                     let began = tokio::time::Instant::now();
+                    self.expire_native_snapshot_recovery();
                     self.evaluate(); self.drive_live(); self.simulation_step(false).await;
                     #[cfg(test)]
                     tokio::time::sleep(self.timer_work_delay).await;
@@ -1389,15 +1810,20 @@ impl Actor {
                                 !self.observation_barrier.is_some_and(|barrier| observed.is_some_and(|rx|rx<=barrier))
                             });
                             self.execution_feed_batches = self.execution_feed_batches.saturating_add(1);
-                            self.observed_trades(&batch).await;
+                            // Genuine invalid input cuts the suffix. A recoverable
+                            // split delta blocks quote admission while preserving
+                            // independently validated trade witnesses and native books.
+                            let valid_prefix = if self.source == "public" {
+                                valid_feed_prefix_with_recovery(&self.core, &batch, self.native_snapshot_recovery.map(|(_,seen)|seen))
+                            } else { valid_feed_prefix(&self.core, &batch) };
+                            self.observed_trades(&batch[..valid_prefix]).await;
                             // A fault/stop received during sync must inhibit effects before
                             // processing the next input, even though this batch is durable.
                             let fault = self.fault.borrow().clone();
                             if let Some(reason) = fault { self.latch(reason); }
                             if *self.shutdown.borrow() { self.closing = true; let _ = self.core.control(Action::Pause); }
                             for event in batch {
-                                self.feed_events = self.feed_events.saturating_add(1);
-                                let _ = self.core.apply(event); self.evaluate(); self.drive_live();
+                                if !self.apply_feed_event(event) { break; }
                             }
                         }
                         None => { self.latch("feed owner stopped".into()); break; }
@@ -1428,6 +1854,12 @@ impl Actor {
                 }
                 Operation::SourceStatus(..) => {}
                 Operation::Mirror(_) => {}
+                Operation::ResolutionTargets(reply) => {
+                    let _ = reply.send(Vec::new());
+                }
+                Operation::PublicResolution(_, reply) => {
+                    let _ = reply.send(Err("service shutting down".into()));
+                }
             }
         }
     }
@@ -1440,6 +1872,7 @@ impl Publication {
             && !self.committing
             && !self.closing
             && !self.awaiting_source_refresh
+            && !self.awaiting_native_snapshots
         {
             self.desired_quotes
                 .iter()
@@ -1454,6 +1887,7 @@ impl Publication {
         let now = self.now;
         let mono = self.mono;
         let feed_ready = !self.awaiting_source_refresh
+            && !self.awaiting_native_snapshots
             && snapshot
                 .market
                 .as_ref()
@@ -1519,6 +1953,8 @@ impl Publication {
             "decision_ns_p50":percentile(50),"decision_ns_p99":if ordered.len()>=1000 {percentile(99)} else {None},
             "measurement":"core and strategy evaluation; excludes transport, parsing, queue wait, execution durability and snapshot publication"});
         let diagnostics = json!({
+            "awaiting_native_snapshots":self.awaiting_native_snapshots,
+            "paper_resolution":self.paper_resolution.or_else(||self.paper.as_ref().map(|paper|paper["paper_resolution"].clone())),
             "fee_check":self.fee_check,
             "feed_diagnostics":self.feed_diagnostics,
             "feed_diagnostics_policy":"bounded atomic counters sampled independently; local boot scope, not a durable event stream",
@@ -1634,6 +2070,217 @@ fn reason_name(reason: &StopReason) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn invalid_book_refresh_preserves_owner_and_portfolio_and_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = batch_config(directory.path());
+        let (_tx, rx) = mpsc::channel(16);
+        let (_fault, fault) = watch::channel(None);
+        let (_stop, shutdown) = watch::channel(false);
+        let (handle, mut actor) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+        let now = wall_ms();
+        let market = Market {
+            slug: "offline-refresh".into(),
+            condition_id: format!("0x{}", "a".repeat(64)),
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: now - 1000,
+            window_end_ms: now + 299_000,
+            tick_micro: 10_000,
+        };
+        actor.select_market(market.clone()).await.unwrap();
+        actor.core.control(Action::Resume).unwrap();
+        let finance = actor.simulation.as_ref().unwrap().portfolio_snapshot();
+        let seed = |outcome| FeedEvent::Snapshot {
+            condition_id: market.condition_id.clone(),
+            outcome,
+            exchange_ms: now,
+            observed_mono_ms: 1,
+            bids: vec![crate::domain::Level {
+                price_micro: 490_000,
+                quantity_micro: 10_000_000,
+            }],
+            asks: vec![crate::domain::Level {
+                price_micro: 510_000,
+                quantity_micro: 10_000_000,
+            }],
+        };
+        let adverse = || FeedEvent::Snapshot {
+            condition_id: market.condition_id.clone(),
+            outcome: Outcome::Up,
+            exchange_ms: now + 1,
+            observed_mono_ms: 2,
+            bids: vec![crate::domain::Level {
+                price_micro: 520_000,
+                quantity_micro: 1_000_000,
+            }],
+            asks: vec![crate::domain::Level {
+                price_micro: 510_000,
+                quantity_micro: 1_000_000,
+            }],
+        };
+        for attempt in 0..3 {
+            if attempt > 0 {
+                actor.select_market(market.clone()).await.unwrap();
+            }
+            actor.core.apply(seed(Outcome::Up)).unwrap();
+            actor.core.apply(seed(Outcome::Down)).unwrap();
+            let print = FeedEvent::Trade {
+                condition_id: market.condition_id.clone(),
+                outcome: Outcome::Up,
+                exchange_ms: now + 1,
+                observed_mono_ms: 2,
+                price_micro: 490_000,
+                quantity_micro: 5_000_000,
+                fingerprint: "f".repeat(64),
+            };
+            assert_eq!(valid_feed_prefix(&actor.core, &[adverse(), print]), 0);
+            assert!(!actor.apply_feed_event(adverse()));
+            let state = handle.state.borrow().clone();
+            assert_eq!(state["command_version"], 0);
+            assert_eq!(state["reset_epoch"], 0);
+            assert_eq!(state["awaiting_source_refresh"], true);
+            assert_eq!(
+                actor.simulation.as_ref().unwrap().portfolio_snapshot(),
+                finance
+            );
+            if attempt < 2 {
+                assert_eq!(state["mode"], "shadow");
+                assert!(state["fault"].is_null());
+            } else {
+                assert_eq!(state["mode"], "paused");
+                assert!(
+                    state["fault"]
+                        .as_str()
+                        .unwrap()
+                        .contains("repeated public input validation")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn split_delta_preserves_queued_native_recovery_and_source_clock_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = batch_config(directory.path());
+        let (_tx, rx) = mpsc::channel(16);
+        let (_fault, fault) = watch::channel(None);
+        let (_stop, shutdown) = watch::channel(false);
+        let (handle, mut actor) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+        let now = wall_ms();
+        let market = Market {
+            slug: "split-public-update".into(),
+            condition_id: format!("0x{}", "a".repeat(64)),
+            up_token: "1".into(),
+            down_token: "2".into(),
+            window_start_ms: now - 1000,
+            window_end_ms: now + 299_000,
+            tick_micro: 10_000,
+        };
+        actor.select_market(market.clone()).await.unwrap();
+        actor.core.control(Action::Resume).unwrap();
+        let finance = actor.simulation.as_ref().unwrap().portfolio_snapshot();
+        let seed = |outcome, at| FeedEvent::Snapshot {
+            condition_id: market.condition_id.clone(),
+            outcome,
+            exchange_ms: now + at,
+            observed_mono_ms: at,
+            bids: vec![crate::domain::Level {
+                price_micro: 490_000,
+                quantity_micro: 10_000_000,
+            }],
+            asks: vec![crate::domain::Level {
+                price_micro: 510_000,
+                quantity_micro: 10_000_000,
+            }],
+        };
+        let crossed = |at| FeedEvent::Delta {
+            condition_id: market.condition_id.clone(),
+            exchange_ms: now + at,
+            observed_mono_ms: at,
+            changes: vec![crate::domain::Change {
+                outcome: Outcome::Up,
+                side: crate::domain::BookSide::Bid,
+                level: crate::domain::Level {
+                    price_micro: 510_000,
+                    quantity_micro: 5_000_000,
+                },
+            }],
+        };
+        actor.core.apply(seed(Outcome::Up, 1)).unwrap();
+        actor.core.apply(seed(Outcome::Down, 1)).unwrap();
+        let print = FeedEvent::Trade {
+            condition_id: market.condition_id.clone(),
+            outcome: Outcome::Up,
+            exchange_ms: now,
+            observed_mono_ms: 0,
+            price_micro: 490_000,
+            quantity_micro: 5_000_000,
+            fingerprint: "f".repeat(64),
+        };
+        let queued = [
+            crossed(2),
+            print.clone(),
+            seed(Outcome::Up, 3),
+            seed(Outcome::Down, 3),
+        ];
+        assert_eq!(valid_feed_prefix(&actor.core, &queued), 0);
+        assert_eq!(
+            valid_feed_prefix_with_recovery(&actor.core, &queued, None),
+            queued.len()
+        );
+        let barrier = actor.observation_barrier;
+        assert!(actor.apply_feed_event(queued[0].clone()));
+        assert!(actor.native_snapshot_recovery.is_some());
+        assert_eq!(actor.observation_barrier, barrier);
+        let recovering = actor.publication().render();
+        assert_eq!(recovering["awaiting_native_snapshots"], true);
+        assert_eq!(recovering["feed_ready"], false);
+        assert!(recovering["shadow_intents"].as_array().unwrap().is_empty());
+        assert!(actor.apply_feed_event(crossed(2))); // still waiting: a delta cannot initialize
+        actor.observed_trades(&queued).await;
+        assert!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .has_public_trade(&"f".repeat(64))
+        );
+        assert!(actor.apply_feed_event(print));
+        assert!(actor.apply_feed_event(queued[2].clone()));
+        assert!(actor.native_snapshot_recovery.is_some());
+        assert!(actor.apply_feed_event(queued[3].clone()));
+        assert!(actor.native_snapshot_recovery.is_none());
+        assert!(!actor.awaiting_source_refresh && actor.source_refresh_failures.is_empty());
+        assert_eq!(actor.observation_barrier, barrier);
+        assert_eq!(
+            actor.simulation.as_ref().unwrap().portfolio_snapshot(),
+            finance
+        );
+        assert_eq!(actor.version, 0);
+        assert_eq!(actor.reset_epoch, 0);
+        // Genuine invalid input still cuts its trade suffix and requests a refresh.
+        let mut invalid = seed(Outcome::Up, 4);
+        if let FeedEvent::Snapshot { bids, .. } = &mut invalid {
+            bids[0].price_micro = 520_000;
+        }
+        assert_eq!(
+            valid_feed_prefix_with_recovery(&actor.core, &[invalid], None),
+            0
+        );
+        assert!(actor.apply_feed_event(crossed(4)));
+        actor.native_snapshot_recovery.as_mut().unwrap().0 =
+            Instant::now() - Duration::from_millis(config.limits.max_feed_age_ms + 1);
+        actor.expire_native_snapshot_recovery();
+        assert!(actor.awaiting_source_refresh && actor.native_snapshot_recovery.is_none());
+        assert_eq!(actor.source_refresh_failures.len(), 1);
+        assert_eq!(handle.state.borrow()["command_version"], 0);
+        assert_eq!(
+            actor.simulation.as_ref().unwrap().portfolio_snapshot(),
+            finance
+        );
+    }
+
     fn batch_config(directory: &std::path::Path) -> Config {
         Config {
             mode: "simulation".into(),
@@ -1655,6 +2302,170 @@ mod tests {
                 half_width: "0.01".into(),
                 max_feed_age_ms: 1000,
             },
+        }
+    }
+
+    fn retained_windows(config: &Config, count: u64) {
+        let mut journal = Journal::open_streaming(
+            &config.state_dir,
+            crate::journal::JournalOptions::default(),
+            config.limits.canonical().unwrap(),
+        )
+        .unwrap();
+        for i in 0..count {
+            let now = i * 20_000;
+            let inputs = vec![
+                SimulationOperation::Market {
+                    condition_id: format!("0x{:064x}", i + 1),
+                    start_ms: Some(i * 300_000),
+                    end_ms: Some((i + 1) * 300_000),
+                },
+                SimulationOperation::Book {
+                    now_ms: now,
+                    outcome: "up".into(),
+                    bid: 400_000,
+                    ask: 500_000,
+                    ahead_micros: 0,
+                },
+                SimulationOperation::Quotes {
+                    now_ms: now,
+                    quotes: vec![simulation::Quote {
+                        slot: "up".into(),
+                        outcome: "up".into(),
+                        price_micros: 400_000,
+                        quantity_micros: 5_000_000,
+                    }],
+                },
+                SimulationOperation::Advance { now_ms: now + 50 },
+                SimulationOperation::Trade {
+                    now_ms: now + 60,
+                    outcome: "up".into(),
+                    worst_price_micros: 400_000,
+                    quantity_micros: 5_000_000,
+                },
+                SimulationOperation::Advance { now_ms: now + 100 },
+                SimulationOperation::CancelAll { now_ms: now + 100 },
+                SimulationOperation::Advance { now_ms: now + 1000 },
+            ];
+            journal
+                .commit_execution(simulation::values(&inputs).unwrap())
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_cap_pauses_without_killing_actor_and_retains_readable_state_and_owner_receipt()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = batch_config(directory.path());
+        config.limits.initial_collateral_usd = "1000".into();
+        retained_windows(&config, 64);
+        let (_tx, rx) = mpsc::channel(16);
+        let (_fault, fault) = watch::channel(None);
+        let (stop, shutdown) = watch::channel(false);
+        let (handle, actor) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+        let task = tokio::spawn(actor.run());
+        let market = Market {
+            slug: "offline-cap-regression".into(),
+            condition_id: format!("0x{:064x}", 65),
+            up_token: "11".into(),
+            down_token: "12".into(),
+            window_start_ms: 64 * 300_000,
+            window_end_ms: 65 * 300_000,
+            tick_micro: 1000,
+        };
+        handle.select_market(market).await.unwrap();
+        let state = handle.state.borrow().clone();
+        assert_eq!(state["mode"], "paused");
+        assert!(
+            state["fault"]
+                .as_str()
+                .unwrap()
+                .contains("unresolved market capacity")
+        );
+        assert_eq!(state["paper_portfolio"]["held_market_count"], 64);
+        assert_eq!(
+            state["paper_portfolio"]["initial_cash_pico"],
+            "1000000000000000"
+        );
+        assert_eq!(
+            state["simulation_market_condition"],
+            format!("0x{:064x}", 64)
+        );
+        assert!(!task.is_finished());
+        let reply = handle
+            .command(Command::Control {
+                id: "capacity-pause".into(),
+                expected_version: 0,
+                action: "pause".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply["receipt"]["applied_version"], 1);
+        assert!(
+            handle
+                .command(Command::Control {
+                    id: "capacity-resume".into(),
+                    expected_version: 1,
+                    action: "resume".into()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(handle.resolution_targets().await.unwrap().len(), 63);
+        stop.send_replace(true);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalized_paper_credit_is_durable_and_sync_failure_does_not_publish_candidate_cash() {
+        for fail_sync in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = batch_config(directory.path());
+            retained_windows(&config, 2);
+            let (_tx, rx) = mpsc::channel(16);
+            let (_fault, fault) = watch::channel(None);
+            let (_stop, shutdown) = watch::channel(false);
+            let (_, mut actor) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+            let before = actor.simulation.as_ref().unwrap().portfolio_snapshot();
+            let target = crate::paper_resolution::Target {
+                condition_id: format!("0x{:064x}", 1),
+                start_ms: 0,
+                end_ms: 300_000,
+            };
+            let proof = crate::paper_resolution::tests::evidence(target, true, 300_000);
+            if fail_sync {
+                actor.journal.as_mut().unwrap().inject_sync_failure();
+            }
+            let result = actor.admit_public_resolution(proof).await;
+            let after = actor.simulation.as_ref().unwrap().portfolio_snapshot();
+            if fail_sync {
+                assert!(result.is_err());
+                assert_eq!(before.cash_pico, after.cash_pico);
+                assert!(actor.fatal.is_some());
+            } else {
+                result.unwrap();
+                assert_eq!(after.held_market_count, Some(1));
+                assert_eq!(after.realized_pnl_pico, "3000000000000");
+                drop(actor);
+                let (_tx, rx) = mpsc::channel(16);
+                let (_fault, fault) = watch::channel(None);
+                let (_stop, shutdown) = watch::channel(false);
+                let (_, recovered) = prepare(&config, Instant::now(), rx, fault, shutdown).unwrap();
+                assert_eq!(
+                    recovered
+                        .simulation
+                        .as_ref()
+                        .unwrap()
+                        .portfolio_snapshot()
+                        .cash_pico,
+                    after.cash_pico
+                );
+                assert_eq!(
+                    recovered.simulation.as_ref().unwrap().resolution_status()["completed"],
+                    1
+                );
+            }
         }
     }
 
@@ -1680,6 +2491,73 @@ mod tests {
         actor.bind_simulation_market(&condition).await.unwrap();
         actor.condition = Some(condition);
         actor
+    }
+    #[tokio::test]
+    async fn paper_actor_uses_exact_fill_basis_before_proposing_a_complement() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = batch_config(directory.path());
+        config.feed_source = crate::config::FeedSource::Demo;
+        let mut actor = batch_actor(&config).await;
+        let now = actor.simulation.as_ref().unwrap().now_ms();
+        for operation in [
+            SimulationOperation::Book {
+                now_ms: now,
+                outcome: "down".into(),
+                bid: 640_000,
+                ask: 650_000,
+                ahead_micros: 0,
+            },
+            SimulationOperation::Quotes {
+                now_ms: now,
+                quotes: vec![simulation::Quote {
+                    slot: "down:lot".into(),
+                    outcome: "down".into(),
+                    price_micros: 640_000,
+                    quantity_micros: 5_000_000,
+                }],
+            },
+            SimulationOperation::Advance { now_ms: now + 100 },
+            SimulationOperation::Trade {
+                now_ms: now + 101,
+                outcome: "down".into(),
+                worst_price_micros: 640_000,
+                quantity_micros: 5_000_000,
+            },
+            SimulationOperation::Advance { now_ms: now + 1000 },
+        ] {
+            simulation::apply(actor.simulation.as_mut().unwrap(), &operation).unwrap();
+        }
+        let condition = actor.condition.clone().unwrap();
+        for (outcome, bid, ask) in [
+            (Outcome::Up, 600_000, 610_000),
+            (Outcome::Down, 390_000, 400_000),
+        ] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: condition.clone(),
+                    outcome,
+                    exchange_ms: wall_ms(),
+                    observed_mono_ms: mono_ms(actor.start),
+                    bids: vec![crate::domain::Level {
+                        price_micro: bid,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: ask,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::Quote));
+        assert_eq!(actor.desired_quotes.len(), 1);
+        assert_eq!(actor.desired_quotes[0].slot, "up:hedge");
+        assert_eq!(actor.desired_quotes[0].price_micros, 360_000);
+        assert_eq!(actor.desired_quotes[0].quantity_micros, 5_000_000);
+        assert_eq!(actor.limits, config.limits.canonical().unwrap());
     }
     #[tokio::test]
     async fn public_fee_gate_requires_current_market_and_fresh_evidence() {
@@ -1712,6 +2590,182 @@ mod tests {
         assert_eq!(
             actor.fee_check(now)["status"],
             "BLOCKED_MISSING_STALE_OR_UNSUPPORTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_is_recomputed_after_pending_partial_fill_and_cancel_keeps_possible_fills() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = batch_config(directory.path());
+        config.feed_source = crate::config::FeedSource::Demo;
+        let mut actor = batch_actor(&config).await;
+        let now = actor.simulation.as_ref().unwrap().now_ms();
+        let setup = [
+            SimulationOperation::Book {
+                now_ms: now,
+                outcome: "up".into(),
+                bid: 600_000,
+                ask: 610_000,
+                ahead_micros: 0,
+            },
+            SimulationOperation::Quotes {
+                now_ms: now,
+                quotes: vec![simulation::Quote {
+                    slot: "up:lot".into(),
+                    outcome: "up".into(),
+                    price_micros: 600_000,
+                    quantity_micros: 5_000_000,
+                }],
+            },
+            SimulationOperation::Advance { now_ms: now + 100 },
+            SimulationOperation::Trade {
+                now_ms: now + 101,
+                outcome: "up".into(),
+                worst_price_micros: 600_000,
+                quantity_micros: 50_000,
+            },
+        ];
+        for operation in &setup {
+            simulation::apply(actor.simulation.as_mut().unwrap(), operation).unwrap();
+        }
+        actor
+            .journal
+            .as_mut()
+            .unwrap()
+            .commit_execution(simulation::values(&setup).unwrap())
+            .unwrap();
+        assert_eq!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .account
+                .up_inventory_micros,
+            0
+        );
+        let condition = actor.condition.clone().unwrap();
+        for (outcome, bid, ask) in [
+            (Outcome::Up, 600_000, 610_000),
+            (Outcome::Down, 390_000, 400_000),
+        ] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: condition.clone(),
+                    outcome,
+                    exchange_ms: wall_ms(),
+                    observed_mono_ms: mono_ms(actor.start),
+                    bids: vec![crate::domain::Level {
+                        price_micro: bid,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: ask,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::Quote));
+        assert!(
+            actor
+                .desired_quotes
+                .iter()
+                .any(|quote| quote.slot == "up:lot")
+        );
+        actor.simulation_origin_ms = (now + 1000).saturating_sub(mono_ms(actor.start));
+        actor.simulation_last_trade_ms = now + 1000;
+        actor.simulation_step(false).await;
+        assert!(actor.fatal.is_none());
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::InventoryDust));
+        assert!(actor.desired_quotes.is_empty());
+        let cancelling = actor.simulation.as_ref().unwrap().snapshot();
+        assert_eq!(cancelling.account.up_inventory_micros, 50_000);
+        assert!(cancelling.pending_events > 0);
+        assert!(cancelling.account.reserved_micros_ceil > 0);
+        actor.simulation_step(true).await;
+        let terminal = actor.simulation.as_ref().unwrap().snapshot();
+        assert_eq!(terminal.pending_events, 0);
+        assert_eq!(terminal.account.reserved_micros_ceil, 0);
+        assert!(terminal.orders.is_empty());
+        assert_eq!(terminal.account.up_inventory_micros, 50_000);
+        let journal = actor.journal.as_ref().unwrap();
+        let mut replayed = simulation::new(journal.bootstrap()).unwrap();
+        journal
+            .visit_execution(|entries| simulation::replay(&mut replayed, entries))
+            .unwrap();
+        assert!(
+            simulation::same_state_without_clock(&replayed, actor.simulation.as_ref().unwrap())
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn simulation_actor_gates_new_risk_against_old_unresolved_positions() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = batch_config(directory.path());
+        {
+            let mut journal = Journal::open_streaming(
+                &config.state_dir,
+                crate::journal::JournalOptions::default(),
+                config.limits.canonical().unwrap(),
+            )
+            .unwrap();
+            journal
+                .commit_execution(
+                    simulation::values(&[SimulationOperation::ExactAccounting {}]).unwrap(),
+                )
+                .unwrap();
+        }
+        retained_windows(&config, 4);
+        let mut actor = batch_actor(&config).await;
+        let condition = actor.condition.clone().unwrap();
+        for (outcome, bid, ask) in [
+            (Outcome::Up, 600_000, 610_000),
+            (Outcome::Down, 390_000, 400_000),
+        ] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: condition.clone(),
+                    outcome,
+                    exchange_ms: wall_ms(),
+                    observed_mono_ms: mono_ms(actor.start),
+                    bids: vec![crate::domain::Level {
+                        price_micro: bid,
+                        quantity_micro: 5_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: ask,
+                        quantity_micro: 5_000_000,
+                    }],
+                })
+                .unwrap();
+        }
+        actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        assert_eq!(actor.strategy_gate, Some(mm2_strategy::Gate::LossBudget));
+        assert!(actor.desired_quotes.is_empty());
+        assert!(actor.fatal.is_none());
+        assert_eq!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .portfolio_snapshot()
+                .held_market_count,
+            Some(4)
+        );
+        assert!(
+            actor
+                .simulation
+                .as_ref()
+                .unwrap()
+                .portfolio_halt()
+                .is_none()
         );
     }
 
@@ -1779,7 +2833,9 @@ mod tests {
             FEED_BATCH_LIMIT + operations_before
         );
         // Apply fill notices before comparing exact cash, inventory and reservations.
-        let drain = SimulationOperation::Advance { now_ms: now + 1000 };
+        let drain = SimulationOperation::Advance {
+            now_ms: actor.simulation.as_ref().unwrap().now_ms() + 1000,
+        };
         simulation::apply(actor.simulation.as_mut().unwrap(), &drain).unwrap();
         actor
             .journal
@@ -1816,6 +2872,12 @@ mod tests {
             ..Default::default()
         });
         let mut actor = batch_actor(&config).await;
+        let operations_before = actor
+            .journal
+            .as_ref()
+            .unwrap()
+            .metrics()
+            .execution_operations;
         let before = serde_json::to_value(actor.simulation.as_ref().unwrap()).unwrap();
         actor.observed_trades(&trades(&actor, 3)).await;
         assert!(actor.fatal.as_deref().unwrap().contains("capacity"));
@@ -1827,7 +2889,7 @@ mod tests {
                 .unwrap()
                 .metrics()
                 .execution_operations,
-            1
+            operations_before
         );
         assert_eq!(
             before,
@@ -1840,6 +2902,12 @@ mod tests {
     async fn delayed_and_future_trade_clocks_cannot_become_fresh_during_batching() {
         let directory = tempfile::tempdir().unwrap();
         let mut actor = batch_actor(&batch_config(directory.path())).await;
+        let operations_before = actor
+            .journal
+            .as_ref()
+            .unwrap()
+            .metrics()
+            .execution_operations;
         let mut events = trades(&actor, 2);
         if let FeedEvent::Trade { exchange_ms, .. } = &mut events[0] {
             *exchange_ms -= 1001;
@@ -1859,7 +2927,7 @@ mod tests {
                 .unwrap()
                 .metrics()
                 .execution_operations,
-            1
+            operations_before
         );
     }
 
@@ -1867,6 +2935,12 @@ mod tests {
     async fn failed_batch_sync_withholds_finance_and_poisoned_writer_cannot_continue() {
         let directory = tempfile::tempdir().unwrap();
         let mut actor = batch_actor(&batch_config(directory.path())).await;
+        let operations_before = actor
+            .journal
+            .as_ref()
+            .unwrap()
+            .metrics()
+            .execution_operations;
         let before = serde_json::to_value(actor.simulation.as_ref().unwrap()).unwrap();
         actor.journal.as_mut().unwrap().inject_sync_failure();
         actor
@@ -1881,7 +2955,7 @@ mod tests {
                 .unwrap()
                 .metrics()
                 .execution_operations,
-            1
+            operations_before
         );
         assert_eq!(
             before,
@@ -1912,9 +2986,21 @@ mod tests {
             ..Default::default()
         });
         let mut actor = batch_actor(&config).await;
+        let operations_before = actor
+            .journal
+            .as_ref()
+            .unwrap()
+            .metrics()
+            .execution_operations;
         assert_eq!(actor.feed_batch_limit, 1);
-        for chunk in trades(&actor, FEED_BATCH_LIMIT).chunks(actor.feed_batch_limit) {
-            actor.observed_trades(chunk).await;
+        for index in 0..FEED_BATCH_LIMIT {
+            // Each durable write may exceed the source freshness window on a slow disk.
+            // Admit a freshly observed, distinct trade for each supported one-event batch.
+            let mut event = trades(&actor, 1).remove(0);
+            if let FeedEvent::Trade { fingerprint, .. } = &mut event {
+                *fingerprint = format!("{index:064x}");
+            }
+            actor.observed_trades(&[event]).await;
         }
         assert!(actor.fatal.is_none(), "{:?}", actor.fatal);
         assert_eq!(actor.execution_trade_commits, FEED_BATCH_LIMIT as u64);
@@ -1929,7 +3015,7 @@ mod tests {
                 .unwrap()
                 .metrics()
                 .execution_operations,
-            FEED_BATCH_LIMIT + 1
+            FEED_BATCH_LIMIT + operations_before
         );
     }
     #[tokio::test(start_paused = true)]
@@ -2192,6 +3278,30 @@ mod tests {
                 .unwrap();
         }
         actor.core.control(Action::Resume).unwrap();
+        actor.evaluate();
+        actor.simulation_step(false).await;
+        // Wide books produce no orders, so unused depth is not journal churn.
+        let unused = serde_json::to_value(actor.simulation.as_ref().unwrap()).unwrap();
+        assert!(unused["session"]["books"]["up"].is_null());
+        for outcome in [Outcome::Up, Outcome::Down] {
+            actor
+                .core
+                .apply(FeedEvent::Snapshot {
+                    condition_id: condition.clone(),
+                    outcome,
+                    exchange_ms: wall_ms(),
+                    observed_mono_ms: mono_ms(actor.start),
+                    bids: vec![crate::domain::Level {
+                        price_micro: 400_000,
+                        quantity_micro: 100_000_000,
+                    }],
+                    asks: vec![crate::domain::Level {
+                        price_micro: 410_000,
+                        quantity_micro: 100_000_000,
+                    }],
+                })
+                .unwrap();
+        }
         actor.evaluate();
         actor.simulation_step(false).await;
         let restored = serde_json::to_value(actor.simulation.as_ref().unwrap()).unwrap();

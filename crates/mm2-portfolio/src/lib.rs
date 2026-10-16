@@ -91,6 +91,9 @@ pub struct MarketPosition {
     pub execution_down_micros: u64,
     #[serde(with = "u128_decimal")]
     pub execution_fee_pico: u128,
+    /// Present only for versioned imports with exact, fee-inclusive side costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_outcome_spent_pico: Option<[String; 2]>,
     pub totals_imported: bool,
 }
 
@@ -176,6 +179,10 @@ pub struct Snapshot {
     pub returned_pico: String,
     pub realized_pnl_pico: String,
     pub daily_loss_pico: String,
+    #[serde(default)]
+    pub risk_day_utc: Option<u64>,
+    #[serde(default)]
+    pub risk_clock_ms: u64,
     pub drawdown_pico: String,
     pub open_cost_pico: String,
     pub available_cash_micros: u64,
@@ -218,6 +225,21 @@ pub struct Portfolio {
     retired_orders: BTreeSet<String>,
     receipts: BTreeMap<String, Receipt>,
     halted: Option<String>,
+}
+
+fn gross_loss_bound(quantities: [u64; 2], costs: [u128; 2]) -> u128 {
+    let matched = quantities[0].min(quantities[1]);
+    let owned = usize::from(quantities[1] > quantities[0]);
+    let residual = if quantities[owned] == 0 {
+        0
+    } else {
+        let quantity = u128::from(quantities[owned]);
+        let difference = u128::from(quantities[owned] - matched);
+        (costs[owned] / quantity) * difference
+            + ((costs[owned] % quantity) * difference).div_ceil(quantity)
+    };
+    // Matched profit cannot offset a later negative redemption under gross-loss policy.
+    residual.max((costs[0] + costs[1]).saturating_sub(u128::from(matched) * u128::from(SCALE)))
 }
 
 fn check_id(id: &str) -> Result<()> {
@@ -293,6 +315,7 @@ impl Portfolio {
                 execution_up_micros: 0,
                 execution_down_micros: 0,
                 execution_fee_pico: 0,
+                execution_outcome_spent_pico: None,
                 totals_imported: false,
             },
         );
@@ -304,6 +327,74 @@ impl Portfolio {
     }
     pub fn policy(&self) -> &RiskPolicy {
         &self.policy
+    }
+
+    pub fn risk_window_due(&self, at_ms: u64) -> bool {
+        self.day != Some(at_ms / 86_400_000)
+    }
+
+    pub fn risk_clock_ms(&self) -> u64 {
+        self.last_event_ms
+    }
+
+    /// Caller-supplied UTC, persisted by the execution actor before new risk.
+    /// Advancing a day never releases reservations, old inventory or a latched halt.
+    pub fn advance_risk_window(&mut self, at_ms: u64) -> Result<()> {
+        self.advance_day(at_ms)
+    }
+
+    /// Admission before execution, including every retained unresolved market.
+    /// Positive realized returns never replenish the configured gross loss budget.
+    pub fn permits_execution_risk(
+        &self,
+        market_id: &str,
+        possible_fills: [u64; 2],
+        max_fill_price_micros: u64,
+    ) -> Result<bool> {
+        if max_fill_price_micros >= SCALE
+            || possible_fills.iter().any(|q| *q > MAX_QUANTITY)
+            || (max_fill_price_micros == 0 && possible_fills != [0, 0])
+        {
+            return Err("invalid prospective execution risk".into());
+        }
+        let current = self.market(market_id).ok_or("unknown execution market")?;
+        let remaining = (u128::from(self.policy.max_daily_loss_micros) * u128::from(SCALE))
+            .saturating_sub(self.daily_loss_pico)
+            .min(
+                (u128::from(self.policy.max_drawdown_micros) * u128::from(SCALE))
+                    .saturating_sub(self.drawdown_pico()),
+            );
+        let retained: u128 = self
+            .markets
+            .values()
+            .filter(|p| p.market.id != market_id)
+            .map(|p| {
+                gross_loss_bound(
+                    [p.up.quantity_micros, p.down.quantity_micros],
+                    [p.up.cost_pico, p.down.cost_pico],
+                )
+            })
+            .sum();
+        let mut worst = 0;
+        for mask in 0..4 {
+            let mut quantities = [current.up.quantity_micros, current.down.quantity_micros];
+            let mut costs = [current.up.cost_pico, current.down.cost_pico];
+            for side in 0..2 {
+                if mask & (1 << side) != 0 {
+                    quantities[side] = quantities[side]
+                        .checked_add(possible_fills[side])
+                        .filter(|q| *q <= MAX_QUANTITY)
+                        .ok_or("prospective inventory bound")?;
+                    // The aggregate adapter may allocate a batch's cost between sides.
+                    // Its allocated unit cost cannot exceed the highest possible fill price.
+                    costs[side] +=
+                        u128::from(possible_fills[side]) * u128::from(max_fill_price_micros);
+                }
+            }
+            worst = worst.max(gross_loss_bound(quantities, costs));
+        }
+        // Equality trips the existing realized guard; admit strictly below it.
+        Ok(self.halted.is_none() && retained + worst < remaining)
     }
     pub fn halt(&mut self, reason: impl Into<String>) {
         self.halted = Some(reason.into());
@@ -559,6 +650,9 @@ impl Portfolio {
             .markets
             .get(market_id)
             .ok_or("unknown execution market")?;
+        if market.execution_outcome_spent_pico.is_some() {
+            return Err("cannot mix aggregate and exact outcome accounting".into());
+        }
         if market.resolution.is_some()
             || up_micros > MAX_QUANTITY
             || down_micros > MAX_QUANTITY
@@ -614,6 +708,68 @@ impl Portfolio {
         self.fees_pico += delta_fee;
         self.check_cash_invariant()?;
         Ok(true)
+    }
+
+    /// Exact cumulative maker execution costs. Never reinterpret an aggregate history.
+    /// The current paper execution core has no maker fees; nonzero fee history is rejected.
+    pub fn record_execution_outcome_totals(
+        &mut self,
+        market_id: &str,
+        costs: [u128; 2],
+        quantities: [u64; 2],
+    ) -> Result<bool> {
+        let prior = self.market(market_id).ok_or("unknown execution market")?;
+        let previous = match &prior.execution_outcome_spent_pico {
+            Some(value) => [
+                value[0]
+                    .parse::<u128>()
+                    .map_err(|_| "invalid exact outcome cost")?,
+                value[1]
+                    .parse::<u128>()
+                    .map_err(|_| "invalid exact outcome cost")?,
+            ],
+            None if prior.execution_spent_pico == 0 => [0, 0],
+            None => return Err("legacy outcome cost uncertainty blocks exact import".into()),
+        };
+        if prior.execution_fee_pico != 0 {
+            return Err("exact maker accounting cannot import fee uncertainty".into());
+        }
+        for side in 0..2 {
+            let old_quantity = [prior.execution_up_micros, prior.execution_down_micros][side];
+            if quantities[side] < old_quantity || costs[side] < previous[side] {
+                return Err("exact execution totals regressed".into());
+            }
+            let quantity = quantities[side] - old_quantity;
+            let cost = costs[side] - previous[side];
+            if (quantity == 0) != (cost == 0) || cost > u128::from(quantity) * u128::from(SCALE) {
+                return Err("exact outcome cost contradicts quantity".into());
+            }
+        }
+        let total = costs[0]
+            .checked_add(costs[1])
+            .ok_or("exact cost overflow")?;
+        let old_basis = [prior.up.cost_pico, prior.down.cost_pico];
+        let was_exact = prior.execution_outcome_spent_pico.is_some();
+        // Reuse the aggregate import's capital, quantity, reservation and identity
+        // validation on a private candidate, then replace only its side allocation.
+        let mut candidate = self.clone();
+        candidate
+            .markets
+            .get_mut(market_id)
+            .expect("checked market")
+            .execution_outcome_spent_pico = None;
+        let changed =
+            candidate.record_execution_totals(market_id, total, quantities[0], quantities[1], 0)?;
+        let position = candidate
+            .markets
+            .get_mut(market_id)
+            .expect("checked market");
+        position.up.cost_pico = old_basis[0] + costs[0] - previous[0];
+        position.down.cost_pico = old_basis[1] + costs[1] - previous[1];
+        position.execution_outcome_spent_pico = Some(costs.map(|cost| cost.to_string()));
+        candidate.validate()?;
+        *self = candidate;
+        Ok(changed || !was_exact)
     }
 
     pub fn merge_complete_sets(
@@ -805,6 +961,19 @@ impl Portfolio {
         }
         for (id, market) in &self.markets {
             market.market.validate()?;
+            if let Some(costs) = &market.execution_outcome_spent_pico {
+                let up = costs[0]
+                    .parse::<u128>()
+                    .map_err(|_| "invalid exact outcome cost")?;
+                let down = costs[1]
+                    .parse::<u128>()
+                    .map_err(|_| "invalid exact outcome cost")?;
+                if up.checked_add(down) != Some(market.execution_spent_pico)
+                    || market.execution_fee_pico != 0
+                {
+                    return Err("exact outcome cost invariant failed".into());
+                }
+            }
             if id != &market.market.id
                 || market.up.quantity_micros > MAX_QUANTITY
                 || market.down.quantity_micros > MAX_QUANTITY
@@ -889,6 +1058,8 @@ impl Portfolio {
             returned_pico: self.returned_pico.to_string(),
             realized_pnl_pico: self.realized_pnl_pico.to_string(),
             daily_loss_pico: self.daily_loss_pico.to_string(),
+            risk_day_utc: self.day,
+            risk_clock_ms: self.last_event_ms,
             drawdown_pico: self.drawdown_pico().to_string(),
             open_cost_pico: self.open_cost_pico().to_string(),
             available_cash_micros: self.available_cash_micros(),

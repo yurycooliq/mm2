@@ -182,7 +182,8 @@ class Handler(BaseHTTPRequestHandler):
                         if not isinstance(body, dict) or set(body) != {"init_data"}:
                             raise ValueError("invalid Telegram authentication")
                         token = telegram_session(app.sessions, existing, body["init_data"],
-                                                 app.config.telegram_token, app.config.telegram_owner)
+                                                 app.config.telegram_token, app.config.telegram_owner,
+                                                 allowed_ids=app.config.telegram_allowed_ids)
                     except ValueError:
                         # A switched Telegram account must not keep an earlier
                         # owner's cookie usable in a shared browser/WebView.

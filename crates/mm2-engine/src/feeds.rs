@@ -412,6 +412,67 @@ pub(crate) fn input_failure_class(reason: &str) -> &'static str {
     failure_name(failure_code(reason, true)).unwrap_or("invalid_public_input")
 }
 
+/// Fixed public categories only: a rejected message or arbitrary error must not
+/// enter process logs. Keep enough detail to distinguish parser failures.
+pub fn input_failure_detail(reason: &str) -> &'static str {
+    match reason {
+        "invalid decimal length" | "decimal must be an unsigned fixed string" => "invalid_decimal",
+        "CLOB price outside unit interval" => "price_outside_unit_interval",
+        "invalid public BBO spread" => "inconsistent_bbo_spread",
+        "crossed or oversized batch result" => "crossed_or_oversized_delta",
+        "crossed or oversized book" => "crossed_or_oversized_snapshot",
+        "delta before snapshot or invalid price" => "delta_without_snapshot_or_invalid_price",
+        "invalid or incompatible tick transition" => "incompatible_tick_transition",
+        "native snapshot recovery deadline exceeded" => "native_snapshot_timeout",
+        "CLOB receive clock regressed" => "clob_receive_clock_regressed",
+        "CLOB exchange clock regressed" => "clob_exchange_clock_regressed",
+        "zero trade quantity" => "zero_trade_quantity",
+        "unsupported CLOB event type" => "unsupported_clob_event_type",
+        "invalid CLOB JSON" => "invalid_clob_json",
+        "missing price changes" | "invalid price-change member count" => {
+            "invalid_price_change_members"
+        }
+        "feed member must be an object" => "non_object_member",
+        "missing string price" => "missing_price_string",
+        "missing string size" => "missing_size_string",
+        "missing string best_bid" => "missing_best_bid_string",
+        "missing string best_ask" => "missing_best_ask_string",
+        "missing string spread" => "missing_spread_string",
+        "missing string fee_rate_bps" => "missing_fee_string",
+        "invalid optional decimal field" => "invalid_optional_decimal_type",
+        "invalid book side" => "invalid_order_side",
+        "missing string timestamp" | "invalid CLOB timestamp" => "invalid_clob_timestamp",
+        "missing lifecycle assets" | "invalid lifecycle asset count" => "invalid_lifecycle_assets",
+        "invalid lifecycle token" | "duplicate lifecycle token" => "invalid_lifecycle_token",
+        "feed backpressure deadline exceeded" => "feed_backpressure_timeout",
+        "feed consumer closed" => "feed_consumer_closed",
+        _ => "unclassified_feed_failure",
+    }
+}
+
+#[cfg(test)]
+mod clock_detail_tests {
+    #[test]
+    fn clock_failures_have_distinct_fixed_public_details() {
+        assert_eq!(
+            super::input_failure_class("CLOB receive clock regressed"),
+            "invalid_exchange_clock"
+        );
+        assert_eq!(
+            super::input_failure_detail("CLOB receive clock regressed"),
+            "clob_receive_clock_regressed"
+        );
+        assert_eq!(
+            super::input_failure_detail("CLOB exchange clock regressed"),
+            "clob_exchange_clock_regressed"
+        );
+        assert_eq!(
+            super::input_failure_detail("provider payload must not be echoed"),
+            "unclassified_feed_failure"
+        );
+    }
+}
+
 fn validate_decimal(value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 128 {
         return Err("invalid decimal length".into());
@@ -494,6 +555,35 @@ fn micro_field(value: &Map<String, Value>, name: &str) -> Result<u64, String> {
 fn price_field(value: &Map<String, Value>, name: &str) -> Result<u64, String> {
     let price = micro_field(value, name)?;
     if price > 1_000_000 {
+        return Err("CLOB price outside unit interval".into());
+    }
+    Ok(price)
+}
+
+/// Native CLOB optional decimals use empty strings (and nullable SDK fields).
+/// Absence is metadata absence, never a fabricated zero price or quantity.
+fn optional_decimal<'a>(
+    value: &'a Map<String, Value>,
+    name: &str,
+) -> Result<Option<&'a str>, String> {
+    match value.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.is_empty() => Ok(None),
+        Some(Value::String(text)) => {
+            validate_decimal(text)?;
+            Ok(Some(text))
+        }
+        _ => Err("invalid optional decimal field".into()),
+    }
+}
+
+fn optional_micro_field(value: &Map<String, Value>, name: &str) -> Result<Option<u64>, String> {
+    optional_decimal(value, name)?.map(parse_micro).transpose()
+}
+
+fn optional_price_field(value: &Map<String, Value>, name: &str) -> Result<Option<u64>, String> {
+    let price = optional_micro_field(value, name)?;
+    if price.is_some_and(|price| price > 1_000_000) {
         return Err("CLOB price outside unit interval".into());
     }
     Ok(price)
@@ -779,10 +869,13 @@ async fn rest_recovery(
 }
 
 fn side(value: &Map<String, Value>) -> Result<BookSide, String> {
-    match string(value, "side")? {
-        "BUY" => Ok(BookSide::Bid),
-        "SELL" => Ok(BookSide::Ask),
-        _ => Err("invalid book side".into()),
+    let side = string(value, "side")?;
+    if side.eq_ignore_ascii_case("BUY") {
+        Ok(BookSide::Bid)
+    } else if side.eq_ignore_ascii_case("SELL") {
+        Ok(BookSide::Ask)
+    } else {
+        Err("invalid book side".into())
     }
 }
 
@@ -794,9 +887,14 @@ fn clob_member(
     let value = object(value)?;
     let event_type = string(value, "event_type")?;
     let identity = condition(string(value, "market")?)?;
-    let exchange_ms = if matches!(event_type, "new_market" | "market_resolved") {
+    let informational = matches!(
+        event_type,
+        "best_bid_ask" | "new_market" | "market_resolved"
+    );
+    let exchange_ms = if informational {
         value
             .get("timestamp")
+            .filter(|value| !value.is_null())
             .map(|_| clob_clock(value))
             .transpose()?
             .unwrap_or(0)
@@ -837,9 +935,7 @@ fn clob_member(
                 let quantity_micro = micro_field(entry, "size")?;
                 let side = side(entry)?;
                 for name in ["best_bid", "best_ask"] {
-                    if entry.contains_key(name) {
-                        price_field(entry, name)?;
-                    }
+                    optional_price_field(entry, name)?;
                 }
                 if let Some(outcome) = outcome {
                     changes.push(Change {
@@ -865,10 +961,7 @@ fn clob_member(
         }
         "tick_size_change" => {
             let outcome = token_outcome(string(value, "asset_id")?, &identity, market)?;
-            let old_tick_micro = value
-                .get("old_tick_size")
-                .map(|_| micro_field(value, "old_tick_size"))
-                .transpose()?;
+            let old_tick_micro = optional_micro_field(value, "old_tick_size")?;
             let new_tick_micro = micro_field(value, "new_tick_size")?;
             if !valid_tick_micro(new_tick_micro)
                 || old_tick_micro.is_some_and(|tick| !valid_tick_micro(tick))
@@ -891,19 +984,30 @@ fn clob_member(
         "last_trade_price" => {
             let outcome = token_outcome(string(value, "asset_id")?, &identity, market)?;
             let price_micro = price_field(value, "price")?;
-            let quantity_micro = micro_field(value, "size")?;
-            if quantity_micro == 0 {
+            let quantity_micro = optional_micro_field(value, "size")?;
+            if quantity_micro == Some(0) {
                 return Err("zero trade quantity".into());
             }
             let trade_side = side(value)?;
-            if value.contains_key("fee_rate_bps") {
-                unsigned_string(string(value, "fee_rate_bps")?)?;
-            }
+            optional_decimal(value, "fee_rate_bps")?;
+            let Some(quantity_micro) = quantity_micro else {
+                // A price-only trade notification is not evidence of executable
+                // volume. Do not invent a size for the paper execution lane.
+                return Ok(Vec::new());
+            };
             // No native unique trade ID is supplied. Equal witnesses are deduplicated
             // conservatively in the paper lane; they never update the real account.
             use sha2::{Digest, Sha256};
             let fingerprint = hex::encode(Sha256::digest(
-                serde_json::to_vec(value).map_err(|_| "cannot fingerprint public trade")?,
+                serde_json::to_vec(&(
+                    &identity,
+                    string(value, "asset_id")?,
+                    exchange_ms,
+                    price_micro,
+                    quantity_micro,
+                    trade_side == BookSide::Ask,
+                ))
+                .map_err(|_| "cannot fingerprint public trade")?,
             ));
             Ok(outcome
                 .filter(|_| trade_side == BookSide::Ask)
@@ -921,15 +1025,44 @@ fn clob_member(
         }
         "best_bid_ask" => {
             token_outcome(string(value, "asset_id")?, &identity, market)?;
-            let bid = price_field(value, "best_bid")?;
-            let ask = price_field(value, "best_ask")?;
-            let spread = price_field(value, "spread")?;
-            if ask.checked_sub(bid) != Some(spread) {
+            let bid = optional_price_field(value, "best_bid")?;
+            let ask = optional_price_field(value, "best_ask")?;
+            let spread = optional_price_field(value, "spread")?;
+            if let (Some(bid), Some(ask), Some(spread)) = (bid, ask, spread)
+                && ask.checked_sub(bid) != Some(spread)
+            {
                 return Err("invalid public BBO spread".into());
             }
             Ok(Vec::new())
         }
         "market_resolved" | "new_market" => {
+            // Lifecycle metadata is not a book update or settlement receipt. Missing
+            // optional assets cannot change token mappings or create execution volume.
+            if value.get("assets_ids").is_none_or(Value::is_null) {
+                if identity != market.condition_id || event_type == "new_market" {
+                    if identity == market.condition_id
+                        && value.get("slug").is_some()
+                        && string(value, "slug")? != market.slug
+                    {
+                        return Err("selected lifecycle slug changed".into());
+                    }
+                    return Ok(Vec::new());
+                }
+                let winner = string(value, "winning_asset_id")?;
+                token_outcome(winner, &identity, market)?;
+                let expected = if winner == market.up_token {
+                    "Up"
+                } else {
+                    "Down"
+                };
+                if string(value, "winning_outcome")? != expected {
+                    return Err("selected winner mapping changed".into());
+                }
+                return Ok(vec![FeedEvent::Disconnect {
+                    source: FeedSource::Clob,
+                    reason: "selected market resolved".into(),
+                }]);
+            }
             let assets = value
                 .get("assets_ids")
                 .and_then(Value::as_array)
@@ -1636,6 +1769,7 @@ fn record_failure(
             "binance"
         },
         code = failure_name(code).unwrap_or("unclassified"),
+        detail = input_failure_detail(reason),
         fatal,
         "public feed session ended"
     );
