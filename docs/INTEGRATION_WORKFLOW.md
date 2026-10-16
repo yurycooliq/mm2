@@ -43,6 +43,12 @@ Result: PASS
 Describe the reviewed boundaries, actual validation and remaining limitations.
 ```
 
+Agent COMMENT receipts are accepted only from the configured repository-owner
+publisher, currently `yurycooliq`; the PR author or reviewer name in comment text
+does not confer that authority. Use the latest bound receipt per named agent;
+FAIL/HOLD blocks until that agent records reconciliation on the same head/base.
+Another agent's PASS cannot dismiss the negative conclusion.
+
 The authenticated account can be the owner, but the reviewer must really be a
 separate contributor/agent. Do not label self-review as independent or a COMMENT
 as a human approval. Human APPROVED reviews also record exact Head/Base/Result

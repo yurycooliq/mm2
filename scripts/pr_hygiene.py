@@ -8,6 +8,7 @@ import re
 import subprocess
 
 REPOSITORY = "yurycooliq/mm2"
+TRUSTED_AGENT_PUBLISHERS = {"yurycooliq"}
 REQUIRED_CHECKS = {"rust", "python", "strategy-parity", "frontend", "containers"}
 HOLD_LABELS = {"experimental", "merge-hold"}
 MAX_STACK_DEPTH = 2  # At most three open PRs including the root.
@@ -99,8 +100,13 @@ def inventory(prs, main_at, now):
     return issues
 
 
+def trusted_agent_publisher(review):
+    login = (review.get("author") or {}).get("login")
+    return isinstance(login, str) and login.casefold() in TRUSTED_AGENT_PUBLISHERS
+
+
 def review_receipt(review, head, base):
-    if review.get("commit", {}).get("oid") != head:
+    if (review.get("commit") or {}).get("oid") != head:
         return None
     # Single-owner repositories can record a separate agent's review using the
     # owner's account. This is a named agent receipt, never a human approval.
@@ -128,8 +134,8 @@ def independent_review(review, head, base, author):
     if fields is None or fields["Result"] != "PASS":
         return False
     if review.get("state") == "APPROVED":
-        return review.get("author", {}).get("login") not in {None, author}
-    return bool(re.fullmatch(r"agent:[A-Za-z0-9_/-]{1,128}", fields["Reviewer"]))
+        return (review.get("author") or {}).get("login") not in {None, author}
+    return trusted_agent_publisher(review) and bool(re.fullmatch(r"agent:[A-Za-z0-9_/-]{1,128}", fields["Reviewer"]))
 
 
 def readiness(pr, main_sha):
@@ -157,13 +163,14 @@ def readiness(pr, main_sha):
     if isinstance(reviews, list):
         for review in sorted((row for row in reviews if row.get("state") in {"APPROVED", "CHANGES_REQUESTED"}),
                              key=lambda row: timestamp(row["submittedAt"])):
-            decisions[review.get("author", {}).get("login")] = review["state"]
+            decisions[(review.get("author") or {}).get("login")] = review["state"]
     if "CHANGES_REQUESTED" in decisions.values():
         errors.append("A contributor still requests changes.")
     agents = {}
     human_pass = False
     if isinstance(reviews, list):
-        for review in sorted((row for row in reviews if row.get("state") in {"COMMENTED", "APPROVED"}),
+        for review in sorted((row for row in reviews if row.get("state") == "APPROVED"
+                              or (row.get("state") == "COMMENTED" and trusted_agent_publisher(row))),
                              key=lambda row: timestamp(row["submittedAt"])):
             fields = review_receipt(review, head, base)
             if fields is None:
@@ -171,7 +178,7 @@ def readiness(pr, main_sha):
             if review["state"] == "COMMENTED" and re.fullmatch(r"agent:[A-Za-z0-9_/-]{1,128}", fields["Reviewer"]):
                 agents[fields["Reviewer"]] = fields["Result"]
             elif review["state"] == "APPROVED":
-                human_pass |= independent_review(review, head, base, pr.get("author", {}).get("login"))
+                human_pass |= independent_review(review, head, base, (pr.get("author") or {}).get("login"))
     if any(result != "PASS" for result in agents.values()):
         errors.append("A named agent's latest bound review is FAIL or HOLD.")
     if not (human_pass or "PASS" in agents.values()):

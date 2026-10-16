@@ -19,9 +19,9 @@ def pr(number=1, base="main", draft=True, names=()):
 
 def ready_pr():
     return {"number": 1, "state": "OPEN", "isDraft": False, "baseRefName": "main", "baseRefOid": BASE,
-            "headRefOid": HEAD, "labels": [], "author": {"login": "owner"},
+            "headRefOid": HEAD, "labels": [], "author": {"login": "yurycooliq"},
             "statusCheckRollup": [{"name": name, "status": "COMPLETED", "conclusion": "SUCCESS"} for name in policy.REQUIRED_CHECKS],
-            "reviews": [{"state": "COMMENTED", "commit": {"oid": HEAD}, "author": {"login": "owner"}, "submittedAt": STAMP,
+            "reviews": [{"state": "COMMENTED", "commit": {"oid": HEAD}, "author": {"login": "yurycooliq"}, "submittedAt": STAMP,
                          "body": f"MM2 independent review\nHead: {HEAD}\nBase: {BASE}\nReviewer: agent:/root/independent_reviewer\nResult: PASS\n"}]}
 
 
@@ -78,7 +78,7 @@ class ReadinessTests(unittest.TestCase):
         item = ready_pr()
         item["reviews"][0].update(state="APPROVED", author={"login": "reviewer"})
         self.assertEqual(policy.readiness(item, BASE)["status"], "READY")
-        item["reviews"][0]["author"]["login"] = "owner"
+        item["reviews"][0]["author"]["login"] = item["author"]["login"]
         self.assertEqual(policy.readiness(item, BASE)["status"], "HOLD")
 
     def test_requested_changes_are_not_erased_by_an_agent_comment(self):
@@ -108,6 +108,24 @@ class ReadinessTests(unittest.TestCase):
             item["reviews"].append(dict(prior, body=prior["body"] + suffix, submittedAt="2026-10-16T11:00:00Z"))
             with self.assertRaises(policy.PolicyError):
                 policy.readiness(item, BASE)
+
+    def test_untrusted_publisher_cannot_spoof_agent_reconciliation(self):
+        item = ready_pr()
+        original = item["reviews"][0]
+        item["reviews"].append(dict(original, body=original["body"].replace("Result: PASS", "Result: FAIL"), submittedAt="2026-10-16T11:00:00Z"))
+        for publisher in ({"login": "unrelated-commenter"}, None, {}):
+            spoof = dict(original, author=publisher, submittedAt="2026-10-16T12:00:00Z")
+            with self.subTest(publisher=publisher):
+                candidate = copy.deepcopy(item)
+                candidate["reviews"].append(spoof)
+                self.assertEqual(policy.readiness(candidate, BASE)["status"], "HOLD")
+
+    def test_fork_author_or_missing_author_is_not_a_trusted_agent_publisher(self):
+        for publisher in ({"login": "fork-author"}, None, {}):
+            item = ready_pr()
+            item["author"]["login"] = "fork-author"
+            item["reviews"][0]["author"] = publisher
+            self.assertEqual(policy.readiness(item, BASE)["status"], "HOLD")
 
     def test_missing_failed_pending_skipped_or_billing_blocked_checks_hold(self):
         for change in ("missing", "FAILURE", "SKIPPED", "pending"):
